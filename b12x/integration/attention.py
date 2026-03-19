@@ -10,6 +10,7 @@ import cutlass
 import cutlass.cute as cute
 import torch
 
+from b12x.attention.combine import PagedAttentionCombineKernel
 from b12x.attention.forward import SM120ForwardKernel
 from b12x.cute.utils import current_cuda_stream, make_ptr
 
@@ -429,6 +430,7 @@ class PagedAttentionPlan:
 
     key: PagedAttentionPlanKey
     compiled: object = field(repr=False, compare=False)
+    compiled_combine: object | None = field(default=None, repr=False, compare=False)
     cutlass_dtype: type[cutlass.Numeric] = field(repr=False, compare=False)
 
     def __getattr__(self, name: str):
@@ -689,6 +691,84 @@ class _PagedAttentionForwardLaunch:
         )
 
 
+class _PagedAttentionCombineLaunch:
+    def __init__(
+        self,
+        *,
+        split_output_shape: tuple[int, ...],
+        split_lse_shape: tuple[int, ...],
+        output_shape: tuple[int, ...],
+        lse_shape: tuple[int, ...],
+        dtype: torch.dtype,
+        num_splits: int,
+        tile_k: int = 32,
+    ):
+        self._split_output_shape = split_output_shape
+        self._split_lse_shape = split_lse_shape
+        self._output_shape = output_shape
+        self._lse_shape = lse_shape
+        self._split_output_stride = _contiguous_stride(split_output_shape)
+        self._split_lse_stride = _contiguous_stride(split_lse_shape)
+        self._output_stride = _contiguous_stride(output_shape)
+        self._lse_stride = _contiguous_stride(lse_shape)
+        self._dtype = _torch_to_cutlass_dtype(dtype)
+        _, _, _, head_dim = split_output_shape
+        if not PagedAttentionCombineKernel.can_implement(
+            self._dtype,
+            self._dtype,
+            head_dim=head_dim,
+            num_splits=num_splits,
+            tile_k=tile_k,
+            num_threads=32,
+        ):
+            raise TypeError(
+                "b12x paged attention combine launch is unsupported with "
+                f"dtype={dtype}, split_output_shape={split_output_shape}, "
+                f"split_lse_shape={split_lse_shape}, output_shape={output_shape}, "
+                f"lse_shape={lse_shape}, num_splits={num_splits}, tile_k={tile_k}"
+            )
+        self._kernel = PagedAttentionCombineKernel(
+            self._dtype,
+            self._dtype,
+            head_dim=head_dim,
+            num_splits=num_splits,
+            tile_k=tile_k,
+        )
+
+    @cute.jit
+    def __call__(
+        self,
+        split_output_ptr: cute.Pointer,
+        split_lse_ptr: cute.Pointer,
+        output_ptr: cute.Pointer,
+        lse_ptr: cute.Pointer,
+        current_stream: cuda.CUstream,
+    ):
+        split_output_tensor = cute.make_tensor(
+            split_output_ptr,
+            layout=cute.make_layout(self._split_output_shape, stride=self._split_output_stride),
+        )
+        split_lse_tensor = cute.make_tensor(
+            split_lse_ptr,
+            layout=cute.make_layout(self._split_lse_shape, stride=self._split_lse_stride),
+        )
+        output_tensor = cute.make_tensor(
+            output_ptr,
+            layout=cute.make_layout(self._output_shape, stride=self._output_stride),
+        )
+        lse_tensor = cute.make_tensor(
+            lse_ptr,
+            layout=cute.make_layout(self._lse_shape, stride=self._lse_stride),
+        )
+        self._kernel(
+            split_output_tensor,
+            split_lse_tensor,
+            output_tensor,
+            lse_tensor,
+            stream=current_stream,
+        )
+
+
 @functools.cache
 def _compile_attention(
     q_shape: tuple[int, ...],
@@ -760,6 +840,34 @@ def _compile_paged_attention(
         make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=4),
         1.0,
+        current_cuda_stream(),
+    )
+
+
+@functools.cache
+def _compile_paged_attention_combine(
+    split_output_shape: tuple[int, ...],
+    split_lse_shape: tuple[int, ...],
+    output_shape: tuple[int, ...],
+    lse_shape: tuple[int, ...],
+    dtype: torch.dtype,
+    num_splits: int,
+):
+    cutlass_dtype = _torch_to_cutlass_dtype(dtype)
+    launch = _PagedAttentionCombineLaunch(
+        split_output_shape=split_output_shape,
+        split_lse_shape=split_lse_shape,
+        output_shape=output_shape,
+        lse_shape=lse_shape,
+        dtype=dtype,
+        num_splits=num_splits,
+    )
+    return cute.compile(
+        launch,
+        make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=4),
+        make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=4),
         current_cuda_stream(),
     )
 
@@ -842,6 +950,18 @@ def _get_paged_attention_plan(
             tile_n,
             num_splits,
         ),
+        compiled_combine=(
+            _compile_paged_attention_combine(
+                _split_paged_output_shape(q_shape, num_splits=num_splits),
+                _split_paged_lse_storage_shape(q_shape, num_splits=num_splits),
+                q_shape,
+                _paged_lse_storage_shape(q_shape),
+                dtype,
+                num_splits,
+            )
+            if num_splits > 1
+            else None
+        ),
         cutlass_dtype=_torch_to_cutlass_dtype(dtype),
     )
 
@@ -850,6 +970,7 @@ def clear_attention_caches() -> None:
     """Clear global compile caches owned by the b12x attention integration."""
     _compile_attention.cache_clear()
     _compile_paged_attention.cache_clear()
+    _compile_paged_attention_combine.cache_clear()
     _get_attention_plan.cache_clear()
     _get_paged_attention_plan.cache_clear()
 
@@ -1168,15 +1289,41 @@ def allocate_paged_attention_workspace(
     return allocate_paged_attention_workspace_for_plan(plan)
 
 
-def _reduce_split_partials(workspace: PagedAttentionWorkspace) -> None:
+def _combine_split_partials(
+    workspace: PagedAttentionWorkspace,
+    *,
+    plan: PagedAttentionPlan,
+) -> None:
     assert workspace.split_output is not None
     assert workspace.split_lse is not None
-    split_lse_token_major = workspace.split_lse.permute(0, 2, 1)
-    final_lse = torch.logsumexp(split_lse_token_major, dim=0)
-    weights = torch.exp(split_lse_token_major - final_lse.unsqueeze(0)).unsqueeze(-1)
-    reduced_out = torch.sum(workspace.split_output.to(torch.float32) * weights, dim=0)
-    workspace.output.copy_(reduced_out.to(workspace.dtype))
-    workspace.lse.copy_(final_lse.transpose(0, 1))
+    assert plan.compiled_combine is not None
+    plan.compiled_combine(
+        make_ptr(
+            plan.cutlass_dtype,
+            workspace.split_output.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            cutlass.Float32,
+            workspace.split_lse.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=4,
+        ),
+        make_ptr(
+            plan.cutlass_dtype,
+            workspace.output.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            cutlass.Float32,
+            workspace.lse.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=4,
+        ),
+        current_cuda_stream(),
+    )
 
 
 def b12x_attention_forward(
@@ -1326,7 +1473,7 @@ def b12x_paged_attention_forward(
         current_cuda_stream(),
     )
     if workspace.num_splits > 1:
-        _reduce_split_partials(workspace)
+        _combine_split_partials(workspace, plan=resolved_plan)
     return workspace.output, workspace.lse.transpose(0, 1)
 
 
