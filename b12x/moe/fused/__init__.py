@@ -1,6 +1,5 @@
 from .dynamic import MoEDynamicKernel
-from .static import MoEStaticKernel
-from .static_scheduler import StaticScheduler, StaticSchedulerParams, WorkTileInfo
+from .static import MoEStaticKernel, StaticScheduler, StaticSchedulerParams, WorkTileInfo
 from .reference import OracleMetrics, compare_to_reference, moe_reference_f32, moe_reference_nvfp4
 
 __all__ = [
