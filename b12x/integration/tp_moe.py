@@ -39,13 +39,15 @@ class TPMoEWorkspace:
     active_row_counts: torch.Tensor   # [E] int32 compact row counts aligned with active_experts
     weight_expert_ids: torch.Tensor   # [E] int32 local expert id -> global weight expert id
     global_to_local_expert: torch.Tensor  # [weight_E] int32 global -> local id map
-    token_map: torch.Tensor           # [E, max_rows] int32
-    token_weights_map: torch.Tensor   # [E, max_rows] float32
-    # Packed FP4 activation buffers consumed by static compute
-    packed_input: torch.Tensor        # [E, max_rows, k//2] uint8
-    packed_input_scale: torch.Tensor  # [E, rows_pad, cols_pad] uint8
-    # Dummy output tensor used only to define the grouped scheduler shape.
-    scheduler_out: torch.Tensor       # [max_rows, n, E] bf16
+    expert_write_rows: torch.Tensor | None  # [E] int32 dynamic-only route/pack cursors
+    expert_tile_base: torch.Tensor | None   # [E + 1] int32 dynamic-only compact tile prefix
+    token_map: torch.Tensor           # static: [E, max_rows], dynamic: [rows_padded]
+    token_weights_map: torch.Tensor   # static: [E, max_rows], dynamic: [rows_padded]
+    # Packed FP4 activation buffers consumed by compute
+    packed_input: torch.Tensor        # static: [E, max_rows, k//2], dynamic: [1, rows_padded, k//2]
+    packed_input_scale: torch.Tensor  # static: [E, rows_pad, cols_pad], dynamic: [rows_padded, cols_pad]
+    # Static-only scheduler proxy tensor. Dynamic does not use this scratch.
+    scheduler_out: torch.Tensor | None
     # Pre-expanded scale tensors (filled at allocation time)
     input_gs: torch.Tensor            # [weight_E] float32
     down_input_scale: torch.Tensor    # [weight_E] float32
@@ -58,11 +60,11 @@ class TPMoEWorkspace:
     task_tail: torch.Tensor           # [1] int32 — dynamic task producer tail
     task_ready: torch.Tensor          # [max_tasks] int32 — per-task publication flags
     task_expert: torch.Tensor         # [max_tasks] int32
-    task_m_tile: torch.Tensor         # [max_tasks] int32
+    task_m_tile: torch.Tensor         # [max_tasks] int32 (dynamic: physical tile index)
     task_slice_begin: torch.Tensor    # [max_tasks] int32
     task_slice_count: torch.Tensor    # [max_tasks] int32
     task_valid_rows: torch.Tensor     # [max_tasks] int32
-    tile_write_count: torch.Tensor    # [E * max_m_tiles] int32
+    tile_write_count: torch.Tensor    # static: [E * max_m_tiles], dynamic: [max_phys_tiles]
     # Pre-computed views (cached to avoid per-call Python overhead)
     packed_a_view: object = None      # packed_input permuted + fp4 view
     sfa_ptr: object = None            # CuTe pointer for scale factors
@@ -180,7 +182,7 @@ def _get_static_chunk_multiplier() -> int:
 def _get_dynamic_chunk_multiplier() -> int:
     global _DYNAMIC_CHUNK_MULTIPLIER_CACHE
     if _DYNAMIC_CHUNK_MULTIPLIER_CACHE is None:
-        mult_env = os.environ.get("B12X_DYNAMIC_CHUNK_MULTIPLIER", "2")
+        mult_env = os.environ.get("B12X_DYNAMIC_CHUNK_MULTIPLIER", "1")
         _DYNAMIC_CHUNK_MULTIPLIER_CACHE = max(1, int(mult_env))
     return _DYNAMIC_CHUNK_MULTIPLIER_CACHE
 
@@ -330,6 +332,46 @@ def _safe_token_chunk(E: int, k: int, n: int, num_topk: int) -> int:
     return max_tokens
 
 
+def _safe_dynamic_max_rows_per_launch(E: int, k: int, _n: int) -> int:
+    """Largest routed-row budget for the compact dynamic workspace.
+
+    Dynamic now stores routed activations in a compact physical-tile pool, so
+    the dominant CuTe memref extents scale with `rows_padded` rather than
+    `E * max_rows`. The compact pool still needs `E - 1` extra 128-row tiles
+    to account for the per-expert prefix upper bound.
+    """
+    cols_pad_k = align_up(k // _NVFP4_BLOCK_SIZE, 4)
+    extra_rows = max(0, E - 1) * _LEVEL_TILE_M
+    rows_padded_limit = min(
+        _RUNTIME_MEMREF_LIMIT // max(1, k // 2),
+        _RUNTIME_MEMREF_LIMIT // max(1, cols_pad_k),
+    )
+    rows_padded_limit -= rows_padded_limit % _LEVEL_TILE_M
+    safe_rows = rows_padded_limit - extra_rows
+    if safe_rows <= 0:
+        return _LEVEL_TILE_M
+    return max(_LEVEL_TILE_M, safe_rows - (safe_rows % _LEVEL_TILE_M))
+
+
+def _safe_dynamic_token_chunk(E: int, k: int, n: int, num_topk: int) -> int:
+    """Largest token chunk that fits the compact dynamic launch ABI."""
+    safe_rows = _safe_dynamic_max_rows_per_launch(E, k, n)
+    max_tokens = max(1, safe_rows // max(1, num_topk))
+    while max_tokens > 1 and align_up(max_tokens * num_topk, _LEVEL_TILE_M) > safe_rows:
+        max_tokens -= 1
+    return max_tokens
+
+
+def _dynamic_token_chunk_limit(E: int, k: int, n: int, num_topk: int) -> int:
+    """Dynamic chunk limit with a compatibility clamp for the old multiplier knob."""
+    compact_limit = _safe_dynamic_token_chunk(E, k, n, num_topk)
+    legacy_env = os.environ.get("B12X_DYNAMIC_CHUNK_MULTIPLIER")
+    if legacy_env is None:
+        return compact_limit
+    legacy_limit = _safe_token_chunk(E, k, n, num_topk) * _get_dynamic_chunk_multiplier()
+    return min(compact_limit, legacy_limit)
+
+
 def _normalize_impl(implementation: str | None) -> str:
     impl = implementation or "static"
     if impl == "level9":
@@ -342,10 +384,10 @@ def _normalize_impl(implementation: str | None) -> str:
 
 
 def _dynamic_task_geometry(E: int, n: int, max_rows: int) -> tuple[int, int, int]:
-    max_m_tiles = max(1, max_rows // _LEVEL_TILE_M)
+    max_m_tiles = max(1, align_up(max_rows, _LEVEL_TILE_M) // _LEVEL_TILE_M + E - 1)
     gate_tile_cnt = max(1, (n + _LEVEL_TILE_N - 1) // _LEVEL_TILE_N)
     slice_groups = max(1, (gate_tile_cnt + _DYNAMIC_SLICE_CHUNK - 1) // _DYNAMIC_SLICE_CHUNK)
-    max_tasks = E * max_m_tiles * slice_groups
+    max_tasks = max_m_tiles * slice_groups
     return max_m_tiles, gate_tile_cnt, max_tasks
 
 
@@ -370,6 +412,7 @@ def _refresh_workspace_scales(
 
 
 def _alloc_workspace(
+    implementation: str,
     state_E: int,
     weight_E: int,
     k: int,
@@ -383,9 +426,14 @@ def _alloc_workspace(
     max_rows: int,
     input_scales_static: bool,
 ) -> TPMoEWorkspace:
-    rows_pad_k = align_up(max_rows, 128)
     cols_pad_k = align_up(k // _NVFP4_BLOCK_SIZE, 4)
-    max_m_tiles, _, max_tasks = _dynamic_task_geometry(state_E, n, max_rows)
+    dynamic_tiles, _, dynamic_max_tasks = _dynamic_task_geometry(state_E, n, max_rows)
+    dynamic_rows_padded = dynamic_tiles * _LEVEL_TILE_M
+    static_rows_pad_k = align_up(max_rows, 128)
+    static_max_m_tiles = max(1, max_rows // _LEVEL_TILE_M)
+    static_gate_tile_cnt = max(1, (n + _LEVEL_TILE_N - 1) // _LEVEL_TILE_N)
+    static_slice_groups = max(1, (static_gate_tile_cnt + _DYNAMIC_SLICE_CHUNK - 1) // _DYNAMIC_SLICE_CHUNK)
+    static_max_tasks = state_E * static_max_m_tiles * static_slice_groups
 
     workspace = TPMoEWorkspace(
         state_E=state_E,
@@ -402,11 +450,41 @@ def _alloc_workspace(
         active_row_counts=torch.zeros(state_E, dtype=torch.int32, device=device),
         weight_expert_ids=torch.arange(state_E, dtype=torch.int32, device=device),
         global_to_local_expert=torch.empty(weight_E, dtype=torch.int32, device=device),
-        token_map=torch.zeros(state_E, max_rows, dtype=torch.int32, device=device),
-        token_weights_map=torch.zeros(state_E, max_rows, dtype=torch.float32, device=device),
-        packed_input=torch.empty(state_E, max_rows, k // 2, dtype=torch.uint8, device=device),
-        packed_input_scale=torch.empty(state_E, rows_pad_k, cols_pad_k, dtype=torch.uint8, device=device),
-        scheduler_out=_alloc_unique_ld_tensor((max_rows, n, state_E), dtype=dtype, device=device),
+        expert_write_rows=(
+            torch.zeros(state_E, dtype=torch.int32, device=device)
+            if implementation == "dynamic"
+            else None
+        ),
+        expert_tile_base=(
+            torch.zeros(state_E + 1, dtype=torch.int32, device=device)
+            if implementation == "dynamic"
+            else None
+        ),
+        token_map=(
+            torch.zeros(dynamic_rows_padded, dtype=torch.int32, device=device)
+            if implementation == "dynamic"
+            else torch.zeros(state_E, max_rows, dtype=torch.int32, device=device)
+        ),
+        token_weights_map=(
+            torch.zeros(dynamic_rows_padded, dtype=torch.float32, device=device)
+            if implementation == "dynamic"
+            else torch.zeros(state_E, max_rows, dtype=torch.float32, device=device)
+        ),
+        packed_input=(
+            torch.empty(1, dynamic_rows_padded, k // 2, dtype=torch.uint8, device=device)
+            if implementation == "dynamic"
+            else torch.empty(state_E, max_rows, k // 2, dtype=torch.uint8, device=device)
+        ),
+        packed_input_scale=(
+            torch.empty(dynamic_rows_padded, cols_pad_k, dtype=torch.uint8, device=device)
+            if implementation == "dynamic"
+            else torch.empty(state_E, static_rows_pad_k, cols_pad_k, dtype=torch.uint8, device=device)
+        ),
+        scheduler_out=(
+            _alloc_unique_ld_tensor((max_rows, n, state_E), dtype=dtype, device=device)
+            if implementation == "static"
+            else None
+        ),
         input_gs=torch.empty(weight_E, dtype=torch.float32, device=device),
         down_input_scale=torch.empty(weight_E, dtype=torch.float32, device=device),
         barrier_count=torch.zeros(1, dtype=torch.int32, device=device),
@@ -416,13 +494,41 @@ def _alloc_workspace(
         all_work_published=torch.zeros(1, dtype=torch.int32, device=device),
         task_head=torch.zeros(1, dtype=torch.int32, device=device),
         task_tail=torch.zeros(1, dtype=torch.int32, device=device),
-        task_ready=torch.zeros(max_tasks, dtype=torch.int32, device=device),
-        task_expert=torch.zeros(max_tasks, dtype=torch.int32, device=device),
-        task_m_tile=torch.zeros(max_tasks, dtype=torch.int32, device=device),
-        task_slice_begin=torch.zeros(max_tasks, dtype=torch.int32, device=device),
-        task_slice_count=torch.zeros(max_tasks, dtype=torch.int32, device=device),
-        task_valid_rows=torch.zeros(max_tasks, dtype=torch.int32, device=device),
-        tile_write_count=torch.zeros(state_E * max_m_tiles, dtype=torch.int32, device=device),
+        task_ready=torch.zeros(
+            dynamic_max_tasks if implementation == "dynamic" else static_max_tasks,
+            dtype=torch.int32,
+            device=device,
+        ),
+        task_expert=torch.zeros(
+            dynamic_max_tasks if implementation == "dynamic" else static_max_tasks,
+            dtype=torch.int32,
+            device=device,
+        ),
+        task_m_tile=torch.zeros(
+            dynamic_max_tasks if implementation == "dynamic" else static_max_tasks,
+            dtype=torch.int32,
+            device=device,
+        ),
+        task_slice_begin=torch.zeros(
+            dynamic_max_tasks if implementation == "dynamic" else static_max_tasks,
+            dtype=torch.int32,
+            device=device,
+        ),
+        task_slice_count=torch.zeros(
+            dynamic_max_tasks if implementation == "dynamic" else static_max_tasks,
+            dtype=torch.int32,
+            device=device,
+        ),
+        task_valid_rows=torch.zeros(
+            dynamic_max_tasks if implementation == "dynamic" else static_max_tasks,
+            dtype=torch.int32,
+            device=device,
+        ),
+        tile_write_count=torch.zeros(
+            dynamic_tiles if implementation == "dynamic" else state_E * static_max_m_tiles,
+            dtype=torch.int32,
+            device=device,
+        ),
     )
     _refresh_workspace_scales(
         workspace,
@@ -652,6 +758,7 @@ def _resolve_workspace(
     resolved = workspace.workspaces.get(key)
     if resolved is None:
         resolved = _alloc_workspace(
+            implementation,
             state_E,
             weight_E,
             k,
@@ -710,6 +817,7 @@ def allocate_tp_moe_workspace(
         or (a1_gscale.numel() == 1 and a2_gscale.numel() == 1)
     )
     return _alloc_workspace(
+        impl,
         state_E,
         weight_E,
         k,
@@ -918,6 +1026,8 @@ def _get_dynamic_kernel(
 ):
     sf_vec_size = 16
     mac = mac_override if mac_override is not None else _get_impl_mac("dynamic")
+    max_phys_tiles, _, max_tasks = _dynamic_task_geometry(E, n, max_rows)
+    rows_padded = max_phys_tiles * _LEVEL_TILE_M
 
     global _LAST_KERNEL
     cache_key = (
@@ -941,7 +1051,6 @@ def _get_dynamic_kernel(
     sf_dtype = cutlass.Float8E4M3FN
     a_dtype = cutlass.BFloat16
     alpha_dtype = cutlass.Float32
-    max_m_tiles, _, max_tasks = _dynamic_task_geometry(E, n, max_rows)
 
     kernel = MoEDynamicKernel(
         sf_vec_size=sf_vec_size,
@@ -950,7 +1059,7 @@ def _get_dynamic_kernel(
         fast_math=fast_math,
     )
 
-    rows_pad_k = align_up(max_rows, 128)
+    rows_pad_k = rows_padded
     cols_pad_k = align_up(k // _NVFP4_BLOCK_SIZE, 4)
 
     a_input_fake = cute.runtime.make_fake_compact_tensor(
@@ -965,14 +1074,14 @@ def _get_dynamic_kernel(
         cutlass.Float32, (m * num_topk,), assumed_align=4,
     )
     packed_a_fake = cute.runtime.make_fake_compact_tensor(
-        ab_dtype, (max_rows, k, E), stride_order=(1, 0, 2), assumed_align=16,
+        ab_dtype, (rows_padded, k, 1), stride_order=(1, 0, 2), assumed_align=16,
     )
     sfa_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     packed_a_storage_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Uint8, (E * max_rows * (k // 2),), assumed_align=16,
+        cutlass.Uint8, (rows_padded * (k // 2),), assumed_align=16,
     )
     scale_storage_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Uint8, (E * rows_pad_k * cols_pad_k,), assumed_align=16,
+        cutlass.Uint8, (rows_pad_k * cols_pad_k,), assumed_align=16,
     )
     barrier_count_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32, (1,), assumed_align=4,
@@ -1014,7 +1123,7 @@ def _get_dynamic_kernel(
         cutlass.Int32, (max_tasks,), assumed_align=4,
     )
     tile_write_count_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (E * max_m_tiles,), assumed_align=4,
+        cutlass.Int32, (max_phys_tiles,), assumed_align=4,
     )
     b_w13_fake = cute.runtime.make_fake_compact_tensor(
         ab_dtype, (2 * n, k, E), stride_order=(1, 0, 2), assumed_align=16,
@@ -1024,11 +1133,14 @@ def _get_dynamic_kernel(
         ab_dtype, (k, n, E), stride_order=(1, 0, 2), assumed_align=16,
     )
     sfb_down_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
-    c_fake = cute.runtime.make_fake_compact_tensor(
-        a_dtype, (max_rows, n, E), stride_order=(1, 0, 2), assumed_align=16,
-    )
     row_counts_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32, (E,), assumed_align=4,
+    )
+    expert_write_rows_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32, (E,), assumed_align=4,
+    )
+    expert_tile_base_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32, (E + 1,), assumed_align=4,
     )
     input_gs_fake = cute.runtime.make_fake_compact_tensor(
         alpha_dtype, (E,), assumed_align=16,
@@ -1046,10 +1158,10 @@ def _get_dynamic_kernel(
         a_dtype, (m, k), stride_order=(1, 0), assumed_align=16,
     )
     token_map_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (E, max_rows), stride_order=(1, 0), assumed_align=4,
+        cutlass.Int32, (rows_padded,), assumed_align=4,
     )
     token_weights_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype, (E, max_rows), stride_order=(1, 0), assumed_align=16,
+        alpha_dtype, (rows_padded,), assumed_align=16,
     )
     compiled = cute.compile(
         kernel,
@@ -1064,7 +1176,7 @@ def _get_dynamic_kernel(
         tile_write_count_fake,
         b_w13_fake, sfb_w13_fake,
         b_down_fake, sfb_down_fake,
-        c_fake, row_counts_fake,
+        row_counts_fake, expert_write_rows_fake, expert_tile_base_fake,
         input_gs_fake, alpha_fake, down_alpha_fake, global_scale_fake,
         scatter_fake, token_map_fake, token_weights_fake,
         mac, current_cuda_stream(),
@@ -1131,11 +1243,11 @@ def b12x_moe_fp4(
         num_topk=num_topk,
     )
     max_rows = ((routed_rows + 127) // 128) * 128
-    max_tokens_per_launch = _safe_token_chunk(E, k, n, num_topk)
     if impl == "static":
+        max_tokens_per_launch = _safe_token_chunk(E, k, n, num_topk)
         max_tokens_per_launch *= _get_static_chunk_multiplier()
-    if impl == "dynamic":
-        max_tokens_per_launch *= _get_dynamic_chunk_multiplier()
+    else:
+        max_tokens_per_launch = _dynamic_token_chunk_limit(E, k, n, num_topk)
     if m > max_tokens_per_launch:
         if isinstance(workspace, TPMoEWorkspace):
             raise ValueError(
@@ -1263,7 +1375,7 @@ def b12x_moe_fp4(
             s.tile_write_count,
             wv.w13_fp4, wv.sfb_w13_ptr,
             wv.down_fp4, wv.sfb_down_ptr,
-            s.scheduler_out, s.expert_counts,
+            s.expert_counts, s.expert_write_rows, s.expert_tile_base,
             s.input_gs, wv.w1_alpha, wv.w2_alpha, s.down_input_scale,
             scatter_output, s.token_map, s.token_weights_map,
             mac, stream,

@@ -155,3 +155,54 @@ def test_cuda_graph_capture_requires_output_buffer() -> None:
                 workspace=workspace,
                 input_scales_static=True,
             )
+
+
+def test_dynamic_chunk_limit_uses_compact_layout() -> None:
+    old_limit = tp_moe._safe_token_chunk(512, 4096, 256, 10)
+    compact_limit = tp_moe._safe_dynamic_token_chunk(512, 4096, 256, 10)
+
+    assert old_limit == 192
+    assert compact_limit == 98304
+    assert compact_limit > old_limit
+
+
+def test_dynamic_workspace_uses_compact_storage() -> None:
+    require_sm120()
+    _require_model_weights()
+
+    clear_tp_moe_caches()
+
+    device = torch.device("cuda")
+    spec = _make_spec()
+    weights = load_expert_weights(MODEL_PATH, spec, layer_idx=0)
+    x, topk_ids, _topk_weights = make_routed_inputs(spec, 1, seed=777, device=device)
+
+    workspace = allocate_tp_moe_workspace(
+        x,
+        weights.w13_input_scale_per_expert,
+        weights.w13_weight,
+        weights.w2_input_scale_per_expert,
+        weights.w2_weight,
+        topk_ids,
+        implementation="dynamic",
+        input_scales_static=True,
+    )
+
+    n = spec.intermediate_size // spec.tp_size
+    max_phys_tiles, _, max_tasks = tp_moe._dynamic_task_geometry(
+        spec.num_experts,
+        n,
+        spec.top_k,
+    )
+    rows_padded = max_phys_tiles * tp_moe._LEVEL_TILE_M
+    cols_pad_k = tp_moe.align_up(spec.hidden_size // tp_moe._NVFP4_BLOCK_SIZE, 4)
+
+    assert workspace.scheduler_out is None
+    assert workspace.expert_write_rows is not None
+    assert workspace.expert_tile_base is not None
+    assert tuple(workspace.token_map.shape) == (rows_padded,)
+    assert tuple(workspace.token_weights_map.shape) == (rows_padded,)
+    assert tuple(workspace.packed_input.shape) == (1, rows_padded, spec.hidden_size // 2)
+    assert tuple(workspace.packed_input_scale.shape) == (rows_padded, cols_pad_k)
+    assert tuple(workspace.tile_write_count.shape) == (max_phys_tiles,)
+    assert tuple(workspace.task_ready.shape) == (max_tasks,)

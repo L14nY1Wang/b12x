@@ -407,7 +407,7 @@ class MoEDynamicKernel:
         a_input: cute.Tensor,          # [num_tokens, K] bf16
         topk_ids: cute.Tensor,         # [num_tokens * topk] int32
         topk_weights: cute.Tensor,     # [num_tokens * topk] float32
-        packed_a: cute.Tensor,         # [max_rows, K, E] fp4x2 view for compute
+        packed_a: cute.Tensor,         # [rows_padded, K, 1] fp4x2 view for compute
         sfa_ptr: cute.Pointer,
         packed_a_storage: cute.Tensor,  # flat uint8 backing packed_a
         scale_storage: cute.Tensor,     # flat uint8 backing sfa_ptr
@@ -429,8 +429,9 @@ class MoEDynamicKernel:
         sfb_w13_ptr: cute.Pointer,     # scale factors for concatenated w13
         b_down: cute.Tensor,           # [K, I_tp, E]
         sfb_down_ptr: cute.Pointer,
-        c_out: cute.Tensor,            # [max_rows, I_tp, E] intermediate proxy/output layout
-        row_counts: cute.Tensor,       # expert_counts [E]
+        row_counts: cute.Tensor,       # expert row histogram [E]
+        expert_write_rows: cute.Tensor,  # route/pack write cursors [E]
+        expert_tile_base: cute.Tensor,   # compact physical-tile prefix [E + 1]
         input_global_scale: cute.Tensor,  # [E] per-expert FC1 input scale
         alpha: cute.Tensor,
         down_alpha: cute.Tensor,
@@ -446,7 +447,9 @@ class MoEDynamicKernel:
         self.sf_dtype = sfa_ptr.dtype
         self.a_layout = utils.LayoutEnum.from_tensor(packed_a)
         self.b_layout = utils.LayoutEnum.from_tensor(b_w13)
-        self.c_layout = utils.LayoutEnum.from_tensor(c_out)
+        # Dynamic never materializes the intermediate C tensor. Preserve the
+        # original row-major epilogue layout without carrying a dead memref.
+        self.c_layout = utils.LayoutEnum.ROW_MAJOR
 
         self._setup_attributes()
 
@@ -491,7 +494,7 @@ class MoEDynamicKernel:
             internal_type=cutlass.Int16,
         )
 
-        gate_tile_cnt = Int32(c_out.shape[1] // self.tile_shape_mnk[1])
+        gate_tile_cnt = Int32(b_w13.shape[0]) // (Int32(2) * Int32(self.tile_shape_mnk[1]))
         launch_params = DynamicLaunchParams(row_counts, gate_tile_cnt)
         grid = (*self.cluster_shape_mn, max_active_clusters)
         self.kernel(
@@ -509,7 +512,8 @@ class MoEDynamicKernel:
             self.a_smem_layout_staged, self.b_smem_layout_staged,
             self.sfa_smem_layout_staged, self.sfb_smem_layout_staged,
             self.epi_smem_layout_staged,
-            launch_params, input_global_scale, alpha, down_alpha, global_scale,
+            launch_params, expert_write_rows, expert_tile_base,
+            input_global_scale, alpha, down_alpha, global_scale,
             scatter_output, token_map, token_weights,
         ).launch(
             grid=grid,
@@ -552,6 +556,8 @@ class MoEDynamicKernel:
         sfa_smem_staged: cute.Layout, sfb_smem_staged: cute.Layout,
         epi_smem_staged: cute.ComposedLayout,
         launch_params: DynamicLaunchParams,
+        expert_write_rows: cute.Tensor,
+        expert_tile_base: cute.Tensor,
         input_global_scale: cute.Tensor,
         alpha: cute.Tensor,
         down_alpha: cute.Tensor,
@@ -688,12 +694,10 @@ class MoEDynamicKernel:
         row_counts = launch_params.row_counts
         num_experts = Int32(row_counts.shape[0])
         sf_blocks_per_row = cols // Int32(16)
-        padded_sf_cols = ((cols + Int32(63)) // Int32(64)) * Int32(4)
         output_bytes_per_row = cols // Int32(2)
-        max_rows = Int32(token_map.shape[1])
+        max_rows = Int32(token_map.shape[0])
         total_pairs = Int32(topk_ids.shape[0])
         num_topk = total_pairs // num_tokens
-        expert_scale_stride = Int32(scale_storage.shape[0]) // num_experts
         flat_tid = Int32(bidz) * Int32(self.threads_per_cta) + Int32(tidx)
         flat_stride = Int32(gdim_z) * Int32(self.threads_per_cta)
         num_k_tiles = (cols + Int32(63)) // Int32(64)
@@ -701,14 +705,16 @@ class MoEDynamicKernel:
         task_slice_chunk = Int32(_TASK_SLICE_CHUNK)
         full_tile_publish_enabled = total_pairs >= Int32(self.tile_shape_mnk[0])
 
-        # Phase 0: cooperative init — zero row_counts, queue state, and output
+        # Phase 0: cooperative init — zero routing state, queue state, and output
         task_capacity = Int32(task_ready.shape[0])
         tile_write_slots = Int32(tile_write_count.shape[0])
-        max_m_tiles = tile_write_slots // num_experts
         i = flat_tid
         while i < num_experts:
             row_counts[i] = Int32(0)
+            expert_write_rows[i] = Int32(0)
             i += flat_stride
+        if flat_tid < num_experts + Int32(1):
+            expert_tile_base[flat_tid] = Int32(0)
 
         scatter_total = num_tokens * cols
         j = flat_tid
@@ -744,7 +750,34 @@ class MoEDynamicKernel:
             barrier_count, barrier_epoch, Int32(gdim_z), is_cta_leader,
         )
 
-        # Phase 1: warp-private route/pack producers.
+        # Phase 1: histogram routed rows per expert.
+        hist_idx = flat_tid
+        while hist_idx < total_pairs:
+            expert_id = topk_ids[hist_idx].to(Int32)
+            atomic_add_global_i32(get_ptr_as_int64(row_counts, expert_id), Int32(1))
+            hist_idx += flat_stride
+
+        self._resident_grid_barrier(
+            barrier_count, barrier_epoch, Int32(gdim_z), is_cta_leader,
+        )
+
+        if flat_tid == Int32(0):
+            tile_acc = Int32(0)
+            expert_idx = Int32(0)
+            while expert_idx < num_experts:
+                expert_tile_base[expert_idx] = tile_acc
+                rows = row_counts[expert_idx]
+                tile_acc += (
+                    rows + Int32(self.tile_shape_mnk[0]) - Int32(1)
+                ) // Int32(self.tile_shape_mnk[0])
+                expert_idx += Int32(1)
+            expert_tile_base[num_experts] = tile_acc
+
+        self._resident_grid_barrier(
+            barrier_count, barrier_epoch, Int32(gdim_z), is_cta_leader,
+        )
+
+        # Phase 2: warp-private route/pack producers into compact physical tiles.
         lane_id = Int32(tidx) & Int32(31)
         num_cta_warps = Int32(self.num_mma_warps + 1)
         produce_active = Int32(1)
@@ -768,16 +801,19 @@ class MoEDynamicKernel:
                     weight = topk_weights[pair_idx].to(cutlass.Float32)
 
                     row = Int32(0)
+                    phys_tile = Int32(0)
                     if lane_id == Int32(0):
                         row = atomic_add_global_i32(
-                            get_ptr_as_int64(row_counts, expert_id),
+                            get_ptr_as_int64(expert_write_rows, expert_id),
                             Int32(1),
                         )
-                        map_idx = expert_id * max_rows + row
-                        st_global_i32(get_ptr_as_int64(token_map, map_idx), token_idx)
-                        st_global_f32(get_ptr_as_int64(token_weights, map_idx), weight)
+                        phys_tile = expert_tile_base[expert_id] + row // Int32(self.tile_shape_mnk[0])
+                        phys_row = phys_tile * Int32(self.tile_shape_mnk[0]) + row % Int32(self.tile_shape_mnk[0])
+                        st_global_i32(get_ptr_as_int64(token_map, phys_row), token_idx)
+                        st_global_f32(get_ptr_as_int64(token_weights, phys_row), weight)
 
                     row = cute.arch.shuffle_sync(row, Int32(0))
+                    phys_tile = cute.arch.shuffle_sync(phys_tile, Int32(0))
                     expert_id = cute.arch.shuffle_sync(expert_id, Int32(0))
                     token_idx = cute.arch.shuffle_sync(token_idx, Int32(0))
 
@@ -804,20 +840,17 @@ class MoEDynamicKernel:
                             packed64, scale_byte = quantize_block_fp4(values, block_max, gs_value)
 
                         output_offset = (
-                            expert_id * max_rows * output_bytes_per_row
-                            + row * output_bytes_per_row
+                            (phys_tile * Int32(self.tile_shape_mnk[0]) + row % Int32(self.tile_shape_mnk[0])) * output_bytes_per_row
                             + sf_idx * Int32(8)
                         )
                         st_global_u64(get_ptr_as_int64(packed_a_storage, output_offset), packed64)
 
-                        m_tile_idx = row // Int32(32 * 4)
                         k_tile_idx = sf_idx // Int32(4)
                         outer_m_idx = row % Int32(32)
                         inner_m_idx = (row % Int32(32 * 4)) // Int32(32)
                         inner_k_idx = sf_idx % Int32(4)
                         scale_offset = (
-                            expert_id * expert_scale_stride
-                            + m_tile_idx * num_k_tiles * Int32(32 * 4 * 4)
+                            phys_tile * num_k_tiles * Int32(32 * 4 * 4)
                             + k_tile_idx * Int32(32 * 4 * 4)
                             + outer_m_idx * Int32(4 * 4)
                             + inner_m_idx * Int32(4)
@@ -835,10 +868,8 @@ class MoEDynamicKernel:
                         cute.arch.sync_warp()
 
                         if lane_id == Int32(0):
-                            ready_tile = row // Int32(self.tile_shape_mnk[0])
-                            tile_linear = expert_id * max_m_tiles + ready_tile
                             completed = atomic_add_global_i32(
-                                get_ptr_as_int64(tile_write_count, tile_linear),
+                                get_ptr_as_int64(tile_write_count, phys_tile),
                                 Int32(1),
                             ) + Int32(1)
                             if completed == Int32(self.tile_shape_mnk[0]):
@@ -847,7 +878,7 @@ class MoEDynamicKernel:
                                     task_expert, task_m_tile,
                                     task_slice_begin, task_slice_count, task_valid_rows,
                                     route_gate_tile_cnt, task_slice_chunk,
-                                    expert_id, ready_tile, Int32(self.tile_shape_mnk[0]),
+                                    expert_id, phys_tile, Int32(self.tile_shape_mnk[0]),
                                 )
 
         cute.arch.sync_threads()
@@ -874,7 +905,7 @@ class MoEDynamicKernel:
                             task_expert, task_m_tile,
                             task_slice_begin, task_slice_count, task_valid_rows,
                             route_gate_tile_cnt, task_slice_chunk,
-                            expert_flush, Int32(0), rows,
+                            expert_flush, expert_tile_base[expert_flush], rows,
                         )
                     expert_flush += Int32(gdim_z)
 
@@ -897,7 +928,7 @@ class MoEDynamicKernel:
                     rows = row_counts[expert_flush]
                     rem = rows % Int32(self.tile_shape_mnk[0])
                     if rem != Int32(0):
-                        partial_m_tile = rows // Int32(self.tile_shape_mnk[0])
+                        partial_m_tile = expert_tile_base[expert_flush] + rows // Int32(self.tile_shape_mnk[0])
                         self._publish_ready_tasks(
                             task_tail, task_ready,
                             task_expert, task_m_tile,
@@ -1497,8 +1528,8 @@ class MoEDynamicKernel:
                                 tok = Int32(0)
                                 wv = cutlass.Float32(0.0)
                                 if lane_id == Int32(0):
-                                    tok = token_map[expert_idx, global_row].to(Int32)
-                                    wv = token_weights[expert_idx, global_row].to(cutlass.Float32)
+                                    tok = token_map[global_row].to(Int32)
+                                    wv = token_weights[global_row].to(cutlass.Float32)
                                 tok = cute.arch.shuffle_sync(tok, Int32(0))
                                 wv = cute.arch.shuffle_sync(wv, Int32(0))
                                 sc_v0 = cutlass.Float32(
@@ -1530,8 +1561,8 @@ class MoEDynamicKernel:
                 task_slice_begin_idx = _ld_shared_i32(ctrl_base_addr + Int32(16))
                 task_slice_count_val = _ld_shared_i32(ctrl_base_addr + Int32(20))
 
-                tAgA_mk = tAgA[(None, task_m_tile_idx, None, task_expert_idx)]
-                tAgSFA_mk = tAgSFA[(None, task_m_tile_idx, None, task_expert_idx)]
+                tAgA_mk = tAgA[(None, task_m_tile_idx, None, Int32(0))]
+                tAgSFA_mk = tAgSFA[(None, task_m_tile_idx, None, Int32(0))]
                 slice_idx = Int32(0)
                 while slice_idx < task_slice_count_val:
                     intermediate_slice = task_slice_begin_idx + slice_idx
