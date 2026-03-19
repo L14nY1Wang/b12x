@@ -43,7 +43,7 @@ python -m pip install -e '.[dev]'
 - `b12x.integration`
   - Public runtime entrypoints such as `b12x_moe_fp4`
 - `b12x.moe.fused`
-  - Static and dynamic fused MoE kernels, scheduler, and reference paths
+  - Static and dynamic fused MoE kernels and reference paths
 - `b12x.quant`
   - Torch-side NVFP4 packing and quantization helpers
 - `b12x.sglang`
@@ -56,7 +56,8 @@ python -m pip install -e '.[dev]'
   - compact routed workloads use the static backend
   - all larger routed workloads use dynamic
 - Use `allocate_tp_moe_workspace(...)` for one exact unchunked launch shape.
-- Use `allocate_tp_moe_workspace_pool()` for variable-size or chunked workloads, and keep one pool per active stream or captured CUDA graph.
+- Use `allocate_tp_moe_workspace_pool()` for variable-size or chunked workloads.
+- Keep one workspace pool per process/device, and let the pool partition scratch by CUDA stream internally.
 - During CUDA graph capture, `output=` must also be caller-owned and stable across replays.
 
 ## Benchmarks and tests
