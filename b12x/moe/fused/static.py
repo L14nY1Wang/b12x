@@ -36,7 +36,7 @@ Work decomposition
     row to row_counts[expert], writes the source token + router weight, then
     quantizes the source token row into that expert-major destination row.
   Compute:
-    StaticScheduler assigns work in (m_tile, intermediate_slice, expert).
+    The compact static work loop assigns (m_tile, intermediate_slice, expert).
     FC1 is computed once per slice, the slice is quantized into shared A, and
     FC2 sweeps all output tiles from that cached slice. FC1 cost is therefore
     amortized across every FC2 output tile.
@@ -64,12 +64,11 @@ Scale-contract note
   routed pair with input_global_scale[expert]. That is checkpoint-correct for
   models where gate/up input scales vary across experts.
 
-Current tradeoff
-  The static kernel is mainly a correctness/control-plane milestone. It removes the
-  launch boundary and keeps the whole MoE on-device, but it does not yet
-  overlap route/pack with compute. The next step ("dynamic") is to replace
-  the global phase barrier with a ready-chunk queue so compute can start as
-  soon as an expert tile is ready.
+Design boundary
+  The static kernel is the compact decode backend. It keeps route/pack and
+  compute in one resident launch for small routed working sets, and relies on
+  the resident-grid barrier between those phases instead of overlapping them.
+  Large routed workloads dispatch to the dynamic backend instead.
 """
 
 from __future__ import annotations
@@ -85,7 +84,7 @@ import cutlass.utils.blockscaled_layout as blockscaled_utils
 
 from cutlass.cutlass_dsl import (
     Int32, Int64, Uint8, Uint64, T, Integer,
-    dsl_user_op, extract_mlir_values, new_from_mlir_values,
+    dsl_user_op,
 )
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
@@ -116,246 +115,58 @@ from b12x.gemm.dense import (
     sm120_make_smem_layout_sfb,
 )
 from b12x.cute.fp4 import scatter_add_bf16x2
-from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
 
 
 _SF_VEC_SIZE = 16
+_COMPACT_STATIC_TILE_M = 128
 
 
-class StaticSchedulerParams:
-    """Compact static persistent-scheduler parameters.
+@cute.jit
+def _compact_static_get_work_tile(
+    row_counts: cute.Tensor,
+    active_expert_count: cute.Tensor,
+    *,
+    num_tiles_n: Int32,
+    cluster_shape_mn: Tuple[Int32, Int32],
+    current_work_linear_idx: Int32,
+    current_local_expert_idx: Int32,
+    accum_tile_m: Int32,
+    cta_id_in_cluster: cute.Coord,
+) -> Tuple[Tuple[Int32, Int32, Int32], Integer, Int32, Int32]:
+    num_active_experts = active_expert_count[Int32(0)]
+    scan_local_expert_idx = current_local_expert_idx
+    tile_m = Int32(_COMPACT_STATIC_TILE_M)
+    tile_m_minus_one = Int32(_COMPACT_STATIC_TILE_M - 1)
 
-    The compact static path only schedules over active experts and fixed FC2
-    output tiles, so the scheduler state is kept local to this module.
-    """
+    while scan_local_expert_idx < num_active_experts:
+        batch_rows = row_counts[scan_local_expert_idx]
+        batch_m_tiles = (batch_rows + tile_m_minus_one) // tile_m
+        if (accum_tile_m + batch_m_tiles) * num_tiles_n > current_work_linear_idx:
+            current_local_expert_idx = scan_local_expert_idx
+            scan_local_expert_idx = num_active_experts
+        else:
+            accum_tile_m += batch_m_tiles
+            scan_local_expert_idx += Int32(1)
+            current_local_expert_idx = scan_local_expert_idx
 
-    def __init__(
-        self,
-        row_counts: cute.Tensor,
-        active_expert_count: cute.Tensor,
-        c_tiler: Tuple[int, int],
-        num_tiles_n: Int32,
-        cluster_shape_mnk: cute.Shape,
-        *,
-        loc=None,
-        ip=None,
-    ):
-        if cluster_shape_mnk[2] != 1:
-            raise ValueError(f"unsupported cluster_shape_k {cluster_shape_mnk[2]}")
+    is_valid = current_local_expert_idx < num_active_experts
+    if is_valid:
+        batch_rows = row_counts[current_local_expert_idx]
+        is_valid = (
+            accum_tile_m + (batch_rows + tile_m_minus_one) // tile_m
+        ) * num_tiles_n > current_work_linear_idx
 
-        self.row_counts = row_counts
-        self.active_expert_count = active_expert_count
-        self.c_tiler = c_tiler
-        self.num_tiles_n = num_tiles_n
-        self._cluster_shape_mnk = cluster_shape_mnk
-        self.cluster_shape_mn = cluster_shape_mnk[:2]
-        self._loc = loc
-
-    def __extract_mlir_values__(self):
-        values, self._values_pos = [], []
-        for obj in [
-            self.row_counts,
-            self.active_expert_count,
-            self.c_tiler,
-            self.num_tiles_n,
-            self._cluster_shape_mnk,
-        ]:
-            obj_values = extract_mlir_values(obj)
-            values += obj_values
-            self._values_pos.append(len(obj_values))
-        return values
-
-    def __new_from_mlir_values__(self, values):
-        obj_list = []
-        for obj, n_items in zip(
-            [
-                self.row_counts,
-                self.active_expert_count,
-                self.c_tiler,
-                self.num_tiles_n,
-                self._cluster_shape_mnk,
-            ],
-            self._values_pos,
-            strict=True,
-        ):
-            obj_list.append(new_from_mlir_values(obj, values[:n_items]))
-            values = values[n_items:]
-        return StaticSchedulerParams(*(tuple(obj_list)), loc=self._loc)
-
-    @dsl_user_op
-    def get_grid_shape(
-        self, max_active_clusters: Int32, *, loc=None, ip=None
-    ) -> Tuple[Integer, Integer, Integer]:
-        return (*self.cluster_shape_mn, max_active_clusters)
-
-
-class StaticScheduler:
-    def __init__(
-        self,
-        params: StaticSchedulerParams,
-        num_persistent_clusters: Int32,
-        current_work_linear_idx: Int32,
-        current_batch_idx: Int32,
-        accum_tile_m: Int32,
-        cta_id_in_cluster: cute.Coord,
-        num_tiles_executed: Int32,
-    ):
-        self.params = params
-        self.num_persistent_clusters = num_persistent_clusters
-        self._current_work_linear_idx = current_work_linear_idx
-        self._current_batch_idx = current_batch_idx
-        self._accum_tile_m = accum_tile_m
-        self.cta_id_in_cluster = cta_id_in_cluster
-        self._num_tiles_executed = num_tiles_executed
-
-    def __extract_mlir_values__(self):
-        values = extract_mlir_values(self.num_persistent_clusters)
-        values.extend(extract_mlir_values(self._current_work_linear_idx))
-        values.extend(extract_mlir_values(self._current_batch_idx))
-        values.extend(extract_mlir_values(self._accum_tile_m))
-        values.extend(extract_mlir_values(self.cta_id_in_cluster))
-        values.extend(extract_mlir_values(self._num_tiles_executed))
-        return values
-
-    def __new_from_mlir_values__(self, values) -> "StaticScheduler":
-        assert len(values) == 8
-        new_num_persistent_clusters = new_from_mlir_values(
-            self.num_persistent_clusters, [values[0]]
-        )
-        new_current_work_linear_idx = new_from_mlir_values(
-            self._current_work_linear_idx, [values[1]]
-        )
-        new_current_batch_idx = new_from_mlir_values(
-            self._current_batch_idx, [values[2]]
-        )
-        new_accum_tile_m = new_from_mlir_values(self._accum_tile_m, [values[3]])
-        new_cta_id_in_cluster = new_from_mlir_values(
-            self.cta_id_in_cluster, values[4:7]
-        )
-        new_num_tiles_executed = new_from_mlir_values(
-            self._num_tiles_executed, [values[7]]
-        )
-        return StaticScheduler(
-            self.params,
-            new_num_persistent_clusters,
-            new_current_work_linear_idx,
-            new_current_batch_idx,
-            new_accum_tile_m,
-            new_cta_id_in_cluster,
-            new_num_tiles_executed,
-        )
-
-    @dsl_user_op
-    @staticmethod
-    def create(
-        params: StaticSchedulerParams,
-        block_idx: Tuple[Integer, Integer, Integer],
-        grid_dim: Tuple[Integer, Integer, Integer],
-        *,
-        loc=None,
-        ip=None,
-    ):
-        num_persistent_clusters = cute.size(grid_dim, loc=loc, ip=ip) // cute.size(
-            params.cluster_shape_mn, loc=loc, ip=ip
-        )
-
-        bidx, bidy, bidz = block_idx
-        current_work_linear_idx = Int32(bidz)
-        current_batch_idx = Int32(0)
-        accum_tile_m = Int32(0)
-        cta_id_in_cluster = (
-            Int32(bidx % params.cluster_shape_mn[0]),
-            Int32(bidy % params.cluster_shape_mn[1]),
-            Int32(0),
-        )
-        num_tiles_executed = Int32(0)
-        return StaticScheduler(
-            params,
-            num_persistent_clusters,
-            current_work_linear_idx,
-            current_batch_idx,
-            accum_tile_m,
-            cta_id_in_cluster,
-            num_tiles_executed,
-        )
-
-    @staticmethod
-    def get_grid_shape(
-        params: StaticSchedulerParams,
-        max_active_clusters: Int32,
-        *,
-        loc=None,
-        ip=None,
-    ) -> Tuple[Integer, Integer, Integer]:
-        return params.get_grid_shape(max_active_clusters, loc=loc, ip=ip)
-
-    @cute.jit
-    def _get_current_work_for_linear_idx(
-        self,
-        current_work_linear_idx: Int32,
-    ) -> WorkTileInfo:
-        num_tiles_n = self.params.num_tiles_n
-        accum_tile_m = self._accum_tile_m
-        batch_idx = self._current_batch_idx
-        num_active_experts = self.params.active_expert_count[Int32(0)]
-        scan_batch_idx = batch_idx
-
-        while scan_batch_idx < num_active_experts:
-            batch_rows = self.params.row_counts[scan_batch_idx]
-            batch_m_tiles = cute.ceil_div(batch_rows, self.params.c_tiler[0])
-            if (accum_tile_m + batch_m_tiles) * num_tiles_n > current_work_linear_idx:
-                batch_idx = scan_batch_idx
-                scan_batch_idx = num_active_experts
-            else:
-                accum_tile_m += batch_m_tiles
-                scan_batch_idx += Int32(1)
-                batch_idx = scan_batch_idx
-
-        self._accum_tile_m = accum_tile_m
-        self._current_batch_idx = batch_idx
-
-        is_valid = self._current_batch_idx < num_active_experts
-        if is_valid:
-            batch_rows = self.params.row_counts[self._current_batch_idx]
-            is_valid = (
-                self._accum_tile_m
-                + cute.ceil_div(batch_rows, self.params.c_tiler[0])
-            ) * num_tiles_n > current_work_linear_idx
-
-        cur_cluster_coord = (
-            current_work_linear_idx // num_tiles_n - self._accum_tile_m,
-            current_work_linear_idx % num_tiles_n,
-            self._current_batch_idx,
-        )
-        cur_tile_coord = tuple(
-            Int32(x) * Int32(z) + Int32(y)
-            for x, y, z in zip(
-                cur_cluster_coord,
-                self.cta_id_in_cluster,
-                (*self.params.cluster_shape_mn, Int32(1)),
-                strict=True,
-            )
-        )
-        return WorkTileInfo(cur_tile_coord, is_valid)
-
-    @dsl_user_op
-    def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
-        return self._get_current_work_for_linear_idx(self._current_work_linear_idx)
-
-    @dsl_user_op
-    def initial_work_tile_info(self, *, loc=None, ip=None) -> WorkTileInfo:
-        return self.get_current_work(loc=loc, ip=ip)
-
-    @dsl_user_op
-    def advance_to_next_work(self, *, advance_count: int = 1, loc=None, ip=None):
-        self._current_work_linear_idx += Int32(advance_count) * Int32(
-            self.num_persistent_clusters
-        )
-        self._num_tiles_executed += Int32(1)
-
-    @property
-    def num_tiles_executed(self) -> Int32:
-        return self._num_tiles_executed
+    cur_cluster_coord = (
+        current_work_linear_idx // num_tiles_n - accum_tile_m,
+        current_work_linear_idx % num_tiles_n,
+        current_local_expert_idx,
+    )
+    cur_tile_coord = (
+        Int32(cur_cluster_coord[0]) * cluster_shape_mn[0] + cta_id_in_cluster[0],
+        Int32(cur_cluster_coord[1]) * cluster_shape_mn[1] + cta_id_in_cluster[1],
+        Int32(cur_cluster_coord[2]),
+    )
+    return cur_tile_coord, is_valid, current_local_expert_idx, accum_tile_m
 
 
 @dsl_user_op
@@ -476,7 +287,7 @@ def _atomic_cas_global_i32(addr, compare, value, *, loc=None, ip=None):
 
 
 class MoEStaticKernel:
-    """Barrier-fused persistent MoE kernel."""
+    """Compact static MoE kernel for small routed working sets."""
 
     def __init__(
         self,
@@ -634,8 +445,7 @@ class MoEStaticKernel:
         self.sf_dtype = sfa_ptr.dtype
         self.a_layout = utils.LayoutEnum.from_tensor(packed_a)
         self.b_layout = utils.LayoutEnum.from_tensor(b_w13)
-        # Match the old scheduler proxy tensor layout without materializing
-        # the dummy global buffer.
+        # Compact static always scatters into token-major row-major output.
         self.c_layout = utils.LayoutEnum.ROW_MAJOR
 
         self._setup_attributes()
@@ -681,13 +491,8 @@ class MoEStaticKernel:
             internal_type=cutlass.Int16,
         )
 
-        # Scheduler tiles over (m_tile, intermediate_slice, expert).
-        c_tiler = (self.tile_shape_mnk[0], self.tile_shape_mnk[1])
-        tile_sched_params = StaticSchedulerParams(
-            row_counts, active_expert_count,
-            c_tiler, Int32(self.output_tile_count_n), (*self.cluster_shape_mn, 1),
-        )
-        grid = StaticScheduler.get_grid_shape(tile_sched_params, max_active_clusters)
+        # Compact static schedules over (m_tile, intermediate_slice, local_expert_idx).
+        grid = (*self.cluster_shape_mn, max_active_clusters)
         self.kernel(
             a_input, topk_ids, topk_weights,
             packed_a_storage, scale_storage,
@@ -699,7 +504,7 @@ class MoEStaticKernel:
             self.a_smem_layout_staged, self.b_smem_layout_staged,
             self.sfa_smem_layout_staged, self.sfb_smem_layout_staged,
             self.epi_smem_layout_staged,
-            tile_sched_params, weight_expert_ids, global_to_local_expert, input_global_scale, alpha, down_alpha, global_scale,
+            row_counts, active_expert_count, weight_expert_ids, global_to_local_expert, input_global_scale, alpha, down_alpha, global_scale,
             scatter_output, token_map, token_weights,
         ).launch(
             grid=grid,
@@ -729,7 +534,8 @@ class MoEStaticKernel:
         a_smem_staged: cute.ComposedLayout, b_smem_staged: cute.ComposedLayout,
         sfa_smem_staged: cute.Layout, sfb_smem_staged: cute.Layout,
         epi_smem_staged: cute.ComposedLayout,
-        tile_sched_params: StaticSchedulerParams,
+        row_counts: cute.Tensor,
+        active_expert_count: cute.Tensor,
         weight_expert_ids: cute.Tensor,
         global_to_local_expert: cute.Tensor,
         input_global_scale: cute.Tensor,
@@ -744,7 +550,7 @@ class MoEStaticKernel:
         from cutlass.cute.nvgpu.warp.mma import Field as WarpField
 
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, bidz = cute.arch.block_idx()
+        bidx, bidy, bidz = cute.arch.block_idx()
         _, _, gdim_z = cute.arch.grid_dim()
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -865,7 +671,6 @@ class MoEStaticKernel:
 
         num_tokens = Int32(a_input.shape[0])
         cols = Int32(a_input.shape[1])
-        row_counts = tile_sched_params.row_counts
         num_experts = Int32(row_counts.shape[0])
         sf_blocks_per_row = cols // Int32(16)
         padded_sf_cols = ((cols + Int32(63)) // Int32(64)) * Int32(4)
@@ -882,14 +687,14 @@ class MoEStaticKernel:
         # Phase 0: cooperative init — zero row_counts and scatter_output
         i = flat_tid
         while i < num_experts:
-            tile_sched_params.row_counts[i] = Int32(0)
+            row_counts[i] = Int32(0)
             i += flat_stride
         i = flat_tid
         while i < num_global_experts:
             global_to_local_expert[i] = Int32(-1)
             i += flat_stride
         if flat_tid == Int32(0):
-            tile_sched_params.active_expert_count[Int32(0)] = Int32(0)
+            active_expert_count[Int32(0)] = Int32(0)
         scatter_total = num_tokens * cols
         j = flat_tid
         while j < scatter_total:
@@ -916,7 +721,7 @@ class MoEStaticKernel:
                 )
                 if prior_local_expert_id == Int32(-1):
                     local_expert_id = atomic_add_global_i32(
-                        get_ptr_as_int64(tile_sched_params.active_expert_count, Int32(0)),
+                        get_ptr_as_int64(active_expert_count, Int32(0)),
                         Int32(1),
                     )
                     weight_expert_ids[local_expert_id] = expert_id
@@ -938,7 +743,7 @@ class MoEStaticKernel:
                         )
                     local_expert_id = prior_local_expert_id
                 row = atomic_add_global_i32(
-                    get_ptr_as_int64(tile_sched_params.row_counts, local_expert_id),
+                    get_ptr_as_int64(row_counts, local_expert_id),
                     Int32(1),
                 )
                 map_idx = local_expert_id * max_rows + row
@@ -1120,18 +925,36 @@ class MoEStaticKernel:
             csSFB_up = thr_ld_SFB.partition_S(sSFB_up)
             crSFB = thr_ld_SFB.retile(tCrSFB)
 
-            tile_sched = StaticScheduler.create(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim(),
+            num_persistent_clusters = Int32(gdim_z)
+            cluster_shape_mn = (
+                Int32(self.cluster_shape_mn[0]),
+                Int32(self.cluster_shape_mn[1]),
             )
-            work_tile = tile_sched.initial_work_tile_info()
+            cta_id_in_cluster = (
+                Int32(bidx % cluster_shape_mn[0]),
+                Int32(bidy % cluster_shape_mn[1]),
+                Int32(0),
+            )
+            current_work_linear_idx = Int32(bidz)
+            current_local_expert_idx = Int32(0)
+            accum_tile_m = Int32(0)
+            tile_coord, is_valid_tile, current_local_expert_idx, accum_tile_m = _compact_static_get_work_tile(
+                row_counts,
+                active_expert_count,
+                num_tiles_n=Int32(self.output_tile_count_n),
+                cluster_shape_mn=cluster_shape_mn,
+                current_work_linear_idx=current_work_linear_idx,
+                current_local_expert_idx=current_local_expert_idx,
+                accum_tile_m=accum_tile_m,
+                cta_id_in_cluster=cta_id_in_cluster,
+            )
 
-            while work_tile.is_valid_tile:
-                tile_coord = work_tile.tile_idx
+            while is_valid_tile:
                 # tile_coord = (m_tile, intermediate_slice, local_expert_idx)
                 local_expert_idx = tile_coord[2]
                 weight_expert_idx = weight_expert_ids[local_expert_idx]
                 alpha_value = alpha[weight_expert_idx].to(cutlass.Float32)
-                valid_rows = tile_sched_params.row_counts[local_expert_idx]
+                valid_rows = row_counts[local_expert_idx]
                 tile_m_base = tile_coord[0] * Int32(self.tile_shape_mnk[0])
                 intermediate_slice = tile_coord[1]
 
@@ -1545,8 +1368,17 @@ class MoEStaticKernel:
                 # DMA warp waits here too after finishing all B_down loads.
                 self.pass_sync_barrier.arrive_and_wait()
 
-                tile_sched.advance_to_next_work()
-                work_tile = tile_sched.get_current_work()
+                current_work_linear_idx += num_persistent_clusters
+                tile_coord, is_valid_tile, current_local_expert_idx, accum_tile_m = _compact_static_get_work_tile(
+                    row_counts,
+                    active_expert_count,
+                    num_tiles_n=Int32(self.output_tile_count_n),
+                    cluster_shape_mn=cluster_shape_mn,
+                    current_work_linear_idx=current_work_linear_idx,
+                    current_local_expert_idx=current_local_expert_idx,
+                    accum_tile_m=accum_tile_m,
+                    cta_id_in_cluster=cta_id_in_cluster,
+                )
 
         # ===================================================================
         # DMA WARP (warp 4)
@@ -1554,13 +1386,32 @@ class MoEStaticKernel:
         elif warp_idx == self.tma_load_warp_id:
             cute.arch.setmaxregister_decrease(self.load_register_requirement)
 
-            tile_sched = StaticScheduler.create(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim(),
+            num_persistent_clusters = Int32(gdim_z)
+            cluster_shape_mn = (
+                Int32(self.cluster_shape_mn[0]),
+                Int32(self.cluster_shape_mn[1]),
             )
-            work_tile = tile_sched.initial_work_tile_info()
+            cta_id_in_cluster = (
+                Int32(bidx % cluster_shape_mn[0]),
+                Int32(bidy % cluster_shape_mn[1]),
+                Int32(0),
+            )
+            current_work_linear_idx = Int32(bidz)
+            current_local_expert_idx = Int32(0)
+            accum_tile_m = Int32(0)
+            tile_coord, is_valid_tile, current_local_expert_idx, accum_tile_m = _compact_static_get_work_tile(
+                row_counts,
+                active_expert_count,
+                num_tiles_n=Int32(self.output_tile_count_n),
+                cluster_shape_mn=cluster_shape_mn,
+                current_work_linear_idx=current_work_linear_idx,
+                current_local_expert_idx=current_local_expert_idx,
+                accum_tile_m=accum_tile_m,
+                cta_id_in_cluster=cta_id_in_cluster,
+            )
 
-            while work_tile.is_valid_tile:
-                tc = work_tile.tile_idx
+            while is_valid_tile:
+                tc = tile_coord
                 intermediate_slice = tc[1]
                 local_expert_idx = tc[2]
                 weight_expert_idx = weight_expert_ids[local_expert_idx]
@@ -1619,8 +1470,17 @@ class MoEStaticKernel:
                 # Ensures MMA warps finish scatter before DMA starts next task's FC1.
                 self.pass_sync_barrier.arrive_and_wait()
 
-                tile_sched.advance_to_next_work()
-                work_tile = tile_sched.get_current_work()
+                current_work_linear_idx += num_persistent_clusters
+                tile_coord, is_valid_tile, current_local_expert_idx, accum_tile_m = _compact_static_get_work_tile(
+                    row_counts,
+                    active_expert_count,
+                    num_tiles_n=Int32(self.output_tile_count_n),
+                    cluster_shape_mn=cluster_shape_mn,
+                    current_work_linear_idx=current_work_linear_idx,
+                    current_local_expert_idx=current_local_expert_idx,
+                    accum_tile_m=accum_tile_m,
+                    cta_id_in_cluster=cta_id_in_cluster,
+                )
 
             ml_pipeline.producer_tail(prod_state)
             up_pipeline.producer_tail(up_prod_state)
