@@ -87,6 +87,9 @@ B12X_MODEL_PATH=/path/to/Qwen3.5-397B-A17B-NVFP4 python benchmarks/benchmark_moe
 # Use the recorded single-request sglang profile
 B12X_MODEL_PATH=/path/to/Qwen3.5-397B-A17B-NVFP4 python benchmarks/benchmark_moe.py --backend static --batch-size-profile sglang-single-request
 
+# Multi-layer CUDA-graph replay validation with real consecutive MoE layers
+B12X_MODEL_PATH=/path/to/Qwen3.5-397B-A17B-NVFP4 python benchmarks/benchmark_moe.py --backend static --graph-mode multi-layer --reference none --validate none
+
 # Dense GEMM microbenchmark
 python benchmarks/benchmark_dense_gemm.py
 

@@ -2,16 +2,31 @@
 
 from __future__ import annotations
 
+import functools
 import pathlib
 import sys
 
 import pytest
 import torch
-import torch.nn.functional as F
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from benchmarks.benchmark_moe import MODEL_PATH, TP_RANK, TP_SIZE, ModelSpec, load_expert_weights
+from benchmarks.benchmark_moe import (
+    GRAPH_REPLAY_TOLERANCES,
+    MODEL_PATH,
+    TP_RANK,
+    TP_SIZE,
+    ModelSpec,
+    compare_graph_replay_outputs,
+    capture_moe_layer_chain,
+    get_scale_contract_params,
+    load_expert_weight_stack,
+    load_expert_weights,
+    make_input_activations,
+    make_multilayer_routing_case,
+    make_routed_inputs,
+    run_moe_layer_chain,
+)
 
 
 def _skip_if_unavailable() -> None:
@@ -22,6 +37,29 @@ def _skip_if_unavailable() -> None:
         pytest.skip(f"Requires SM120, got sm_{major}{minor}")
     if not MODEL_PATH.exists():
         pytest.skip(f"Model not found at {MODEL_PATH}")
+
+
+def _make_spec() -> ModelSpec:
+    return ModelSpec(
+        hidden_size=4096,
+        intermediate_size=1024,
+        num_experts=512,
+        top_k=10,
+        tp_size=TP_SIZE,
+        tp_rank=TP_RANK,
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def _load_multilayer_weights() -> tuple:
+    return tuple(
+        load_expert_weight_stack(
+            MODEL_PATH,
+            _make_spec(),
+            layer_start=0,
+            num_layers=4,
+        )
+    )
 
 
 @pytest.mark.parametrize("m", [1, 2, 4, 8])
@@ -36,21 +74,10 @@ def test_moe_nonzero(m):
     _STATIC_KERNEL_CACHE.clear()
 
     device = torch.device("cuda")
-    spec = ModelSpec(
-        hidden_size=4096,
-        intermediate_size=1024,
-        num_experts=512,
-        top_k=10,
-        tp_size=TP_SIZE,
-        tp_rank=TP_RANK,
-    )
+    spec = _make_spec()
     weights = load_expert_weights(MODEL_PATH, spec)
 
-    torch.manual_seed(99)
-    x = torch.randn(m, spec.hidden_size, dtype=torch.bfloat16, device=device)
-    routing = torch.randn(m, spec.num_experts, device=device, dtype=torch.float32)
-    topk_logits, topk_ids = torch.topk(routing, 10, dim=-1)
-    topk_weights = torch.softmax(topk_logits, dim=-1)
+    x, topk_ids, topk_weights = make_routed_inputs(spec, m, seed=99, device=device)
 
     out = b12x_moe_fp4(
         x,
@@ -73,15 +100,6 @@ def test_moe_nonzero(m):
     assert out.shape == (m, spec.hidden_size)
 
 
-def _make_routed_inputs(spec: ModelSpec, m: int, seed: int, device: torch.device):
-    torch.manual_seed(seed)
-    x = torch.randn(m, spec.hidden_size, dtype=torch.bfloat16, device=device)
-    routing = torch.randn(m, spec.num_experts, device=device, dtype=torch.float32)
-    topk_logits, topk_ids = torch.topk(routing, 10, dim=-1)
-    topk_weights = torch.softmax(topk_logits, dim=-1)
-    return x, topk_ids, topk_weights
-
-
 @pytest.mark.parametrize("m", [1, 2])
 def test_moe_cuda_graph_replay_tracks_routing_updates(m):
     """Validate graph replay stays correct when routing contents change."""
@@ -94,17 +112,10 @@ def test_moe_cuda_graph_replay_tracks_routing_updates(m):
     _STATIC_KERNEL_CACHE.clear()
 
     device = torch.device("cuda")
-    spec = ModelSpec(
-        hidden_size=4096,
-        intermediate_size=1024,
-        num_experts=512,
-        top_k=10,
-        tp_size=TP_SIZE,
-        tp_rank=TP_RANK,
-    )
+    spec = _make_spec()
     weights = load_expert_weights(MODEL_PATH, spec)
 
-    x0, topk_ids0, topk_weights0 = _make_routed_inputs(spec, m, seed=123, device=device)
+    x0, topk_ids0, topk_weights0 = make_routed_inputs(spec, m, seed=123, device=device)
     x_buf = x0.clone()
     topk_ids_buf = topk_ids0.clone()
     topk_weights_buf = topk_weights0.clone()
@@ -147,7 +158,7 @@ def test_moe_cuda_graph_replay_tracks_routing_updates(m):
         )
 
     for seed in (123, 456):
-        x, topk_ids, topk_weights = _make_routed_inputs(spec, m, seed=seed, device=device)
+        x, topk_ids, topk_weights = make_routed_inputs(spec, m, seed=seed, device=device)
         x_buf.copy_(x)
         topk_ids_buf.copy_(topk_ids)
         topk_weights_buf.copy_(topk_weights)
@@ -172,13 +183,122 @@ def test_moe_cuda_graph_replay_tracks_routing_updates(m):
         )
         torch.cuda.synchronize()
 
-        diff = (replay_out.float() - eager_out.float()).abs()
-        max_abs = diff.max().item()
-        cos = F.cosine_similarity(
-            replay_out.float().reshape(m, -1),
-            eager_out.float().reshape(m, -1),
-            dim=1,
-        ).mean().item()
+        metrics = compare_graph_replay_outputs(replay_out, eager_out)
+        max_abs = metrics.max_abs
+        cos = metrics.cos
 
         assert max_abs < 5e-4, f"m={m} seed={seed}: max_abs={max_abs:.6f}"
         assert cos > 0.9999, f"m={m} seed={seed}: cos={cos:.6f}"
+
+
+@pytest.mark.parametrize("m", [1, 2, 4])
+def test_moe_cuda_graph_replay_multilayer_tracks_routing_updates(m):
+    """Validate a captured multi-layer graph stays correct under routing churn."""
+    _skip_if_unavailable()
+
+    from b12x.integration.tp_moe import _STATIC_KERNEL_CACHE, _STATE_CACHE, _WEIGHT_CACHE
+
+    _STATE_CACHE.clear()
+    _WEIGHT_CACHE.clear()
+    _STATIC_KERNEL_CACHE.clear()
+
+    device = torch.device("cuda")
+    spec = _make_spec()
+    weights_stack = list(_load_multilayer_weights())
+    params_stack = [get_scale_contract_params(weights, "shared") for weights in weights_stack]
+    num_layers = len(weights_stack)
+
+    x_buf = make_input_activations(spec, m, seed=10_000 + m, device=device)
+    initial_case = make_multilayer_routing_case(
+        spec,
+        m,
+        num_layers,
+        device,
+        pattern="disjoint",
+        seed=20_000 + m,
+    )
+    topk_ids_bufs = [topk_ids.clone() for topk_ids, _ in initial_case]
+    topk_weights_bufs = [topk_weights.clone() for _, topk_weights in initial_case]
+    graph_output_bufs = [torch.empty_like(x_buf) for _ in range(num_layers)]
+    eager_output_bufs = [torch.empty_like(x_buf) for _ in range(num_layers)]
+
+    run_moe_layer_chain(
+        weights_stack,
+        params_stack,
+        x_buf,
+        topk_ids_bufs,
+        topk_weights_bufs,
+        backend="static",
+        fast_math=True,
+        output_buffers=graph_output_bufs,
+    )
+    torch.cuda.synchronize()
+    graph = capture_moe_layer_chain(
+        weights_stack,
+        params_stack,
+        x_buf,
+        topk_ids_bufs,
+        topk_weights_bufs,
+        backend="static",
+        fast_math=True,
+        output_buffers=graph_output_bufs,
+    )
+
+    scenario_specs = [
+        ("disjoint", "disjoint", 1100),
+        ("overlap", "overlap", 2200),
+        ("random-a", "random", 3300),
+        ("random-b", "random", 4400),
+    ]
+    max_abs_tol = GRAPH_REPLAY_TOLERANCES["max_abs"]
+    cos_tol = GRAPH_REPLAY_TOLERANCES["cos_min"]
+
+    for scenario_name, pattern, seed in scenario_specs:
+        x_case = make_input_activations(
+            spec,
+            m,
+            seed=30_000 + m + seed,
+            device=device,
+        )
+        routing_case = make_multilayer_routing_case(
+            spec,
+            m,
+            num_layers,
+            device,
+            pattern=pattern,
+            seed=40_000 + m + seed,
+        )
+
+        x_buf.copy_(x_case)
+        for layer_idx, (topk_ids, topk_weights) in enumerate(routing_case):
+            topk_ids_bufs[layer_idx].copy_(topk_ids)
+            topk_weights_bufs[layer_idx].copy_(topk_weights)
+
+        graph.replay()
+        torch.cuda.synchronize()
+
+        run_moe_layer_chain(
+            weights_stack,
+            params_stack,
+            x_buf,
+            topk_ids_bufs,
+            topk_weights_bufs,
+            backend="static",
+            fast_math=True,
+            output_buffers=eager_output_bufs,
+        )
+        torch.cuda.synchronize()
+
+        for layer_idx, (replay_out, eager_out) in enumerate(
+            zip(graph_output_bufs, eager_output_bufs, strict=True)
+        ):
+            metrics = compare_graph_replay_outputs(replay_out, eager_out)
+            max_abs = metrics.max_abs
+            cos = metrics.cos
+
+            assert (
+                max_abs < max_abs_tol
+            ), f"m={m} scenario={scenario_name} layer={layer_idx}: max_abs={max_abs:.6f}"
+            assert (
+                cos > cos_tol
+            ), f"m={m} scenario={scenario_name} layer={layer_idx}: cos={cos:.6f}"

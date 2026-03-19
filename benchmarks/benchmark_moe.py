@@ -16,7 +16,7 @@ import pathlib
 import statistics
 import sys
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Sequence
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 sys.path.insert(0, "/home/luke/projects/flashinfer")
@@ -305,6 +305,120 @@ def load_expert_weights(
     )
 
 
+def load_expert_weight_stack(
+    model_path: pathlib.Path,
+    spec: ModelSpec,
+    *,
+    layer_start: int,
+    num_layers: int,
+) -> list[ExpertWeights]:
+    return [
+        load_expert_weights(
+            model_path,
+            spec,
+            layer_idx=layer_start + layer_offset,
+        )
+        for layer_offset in range(num_layers)
+    ]
+
+
+def make_input_activations(
+    spec: ModelSpec,
+    m: int,
+    seed: int,
+    device: torch.device,
+) -> torch.Tensor:
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed)
+    x = torch.randn(m, spec.hidden_size, generator=generator, dtype=torch.float32)
+    return x.to(device=device, dtype=torch.bfloat16)
+
+
+def make_routed_inputs(
+    spec: ModelSpec,
+    m: int,
+    seed: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    x = make_input_activations(spec, m, seed, device)
+    routing_generator = torch.Generator(device="cpu")
+    routing_generator.manual_seed(seed + 1)
+    routing_logits = torch.randn(
+        m,
+        spec.num_experts,
+        generator=routing_generator,
+        dtype=torch.float32,
+    ).to(device=device)
+    topk_logits, topk_ids = torch.topk(routing_logits, spec.top_k, dim=-1)
+    topk_weights = torch.softmax(topk_logits, dim=-1)
+    return x, topk_ids, topk_weights
+
+
+def _make_structured_routing_ids(
+    spec: ModelSpec,
+    m: int,
+    *,
+    layer_idx: int,
+    pattern: str,
+    seed: int,
+) -> torch.Tensor:
+    if pattern not in {"disjoint", "overlap", "random"}:
+        raise ValueError(f"unsupported routing pattern {pattern!r}")
+
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed + layer_idx * 101)
+    top_k = spec.top_k
+    expert_count = spec.num_experts
+
+    if pattern == "random":
+        ids = torch.empty(m, top_k, dtype=torch.int64)
+        for token_idx in range(m):
+            ids[token_idx] = torch.randperm(expert_count, generator=generator)[:top_k]
+        return ids
+
+    pool_size = min(expert_count, max(top_k, m * top_k))
+    layer_stride = pool_size if pattern == "disjoint" else max(top_k, pool_size // 2)
+    pool_start = (seed * 17 + layer_idx * layer_stride) % expert_count
+    pool = (torch.arange(pool_size, dtype=torch.int64) + pool_start) % expert_count
+    pool = pool[torch.randperm(pool_size, generator=generator)]
+
+    ids = torch.empty(m, top_k, dtype=torch.int64)
+    cursor = 0
+    for token_idx in range(m):
+        if cursor + top_k > pool_size:
+            pool = pool[torch.randperm(pool_size, generator=generator)]
+            cursor = 0
+        ids[token_idx] = pool[cursor:cursor + top_k]
+        cursor += top_k
+    return ids
+
+
+def make_multilayer_routing_case(
+    spec: ModelSpec,
+    m: int,
+    num_layers: int,
+    device: torch.device,
+    *,
+    pattern: str,
+    seed: int,
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    routing_case: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for layer_idx in range(num_layers):
+        topk_ids = _make_structured_routing_ids(
+            spec,
+            m,
+            layer_idx=layer_idx,
+            pattern=pattern,
+            seed=seed,
+        ).to(device=device)
+        weight_generator = torch.Generator(device="cpu")
+        weight_generator.manual_seed(seed + layer_idx * 1009 + 7)
+        topk_logits = torch.randn(m, spec.top_k, generator=weight_generator, dtype=torch.float32)
+        topk_weights = torch.softmax(topk_logits, dim=-1).to(device=device)
+        routing_case.append((topk_ids, topk_weights))
+    return routing_case
+
+
 def get_scale_contract_params(weights: ExpertWeights, scale_contract: str) -> ScaleContractParams:
     if scale_contract == "per-expert":
         return ScaleContractParams(
@@ -435,6 +549,320 @@ def _clear_b12x_caches() -> None:
     _DYNAMIC_KERNEL_CACHE.clear()
 
 
+GRAPH_REPLAY_TOLERANCES = {
+    "max_abs": 5e-4,
+    "rmse": 1e-4,
+    "mean_abs": 1e-4,
+    "cos_min": 0.9999,
+}
+
+
+def bench_repeated(
+    fn: Callable[[], None],
+    *,
+    warmup: int,
+    iters: int,
+    repeats: int,
+) -> TimingStats:
+    return summarize_timing_runs(
+        [bench_events(fn, warmup=warmup, iters=iters) for _ in range(repeats)]
+    )
+
+
+def compare_graph_replay_outputs(
+    actual: torch.Tensor,
+    reference: torch.Tensor,
+) -> OracleMetrics:
+    metrics = compare_to_reference(actual, reference)
+    actual_norm = actual.float().norm().item()
+    reference_norm = reference.float().norm().item()
+    if max(actual_norm, reference_norm) <= 1e-8:
+        return OracleMetrics(
+            max_abs=metrics.max_abs,
+            rmse=metrics.rmse,
+            mean_abs=metrics.mean_abs,
+            cos=1.0,
+        )
+    return metrics
+
+
+def run_moe_layer_chain(
+    weights_stack: Sequence[ExpertWeights],
+    params_stack: Sequence[ScaleContractParams],
+    x: torch.Tensor,
+    topk_ids_per_layer: Sequence[torch.Tensor],
+    topk_weights_per_layer: Sequence[torch.Tensor],
+    *,
+    backend: str,
+    fast_math: bool,
+    output_buffers: Sequence[torch.Tensor] | None = None,
+) -> list[torch.Tensor]:
+    from b12x.integration.tp_moe import b12x_moe_fp4
+
+    if not (
+        len(weights_stack)
+        == len(params_stack)
+        == len(topk_ids_per_layer)
+        == len(topk_weights_per_layer)
+    ):
+        raise ValueError("layer-chain inputs must all have the same length")
+    if output_buffers is not None and len(output_buffers) != len(weights_stack):
+        raise ValueError("output_buffers must match the number of layers")
+
+    layer_outputs: list[torch.Tensor] = []
+    current = x
+    for layer_idx, (weights, params, topk_ids, topk_weights) in enumerate(
+        zip(weights_stack, params_stack, topk_ids_per_layer, topk_weights_per_layer, strict=True)
+    ):
+        output = None if output_buffers is None else output_buffers[layer_idx]
+        current = b12x_moe_fp4(
+            current,
+            params.a1_gscale,
+            weights.w13_weight,
+            weights.w13_blockscale_swizzled,
+            params.g1_alphas,
+            params.a2_gscale,
+            weights.w2_weight,
+            weights.w2_blockscale_swizzled,
+            params.g2_alphas,
+            topk_weights,
+            topk_ids,
+            implementation=backend,
+            fast_math=fast_math,
+            output=output,
+        )
+        layer_outputs.append(current)
+    return layer_outputs
+
+
+def capture_moe_layer_chain(
+    weights_stack: Sequence[ExpertWeights],
+    params_stack: Sequence[ScaleContractParams],
+    x: torch.Tensor,
+    topk_ids_per_layer: Sequence[torch.Tensor],
+    topk_weights_per_layer: Sequence[torch.Tensor],
+    *,
+    backend: str,
+    fast_math: bool,
+    output_buffers: Sequence[torch.Tensor],
+) -> torch.cuda.CUDAGraph:
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run_moe_layer_chain(
+            weights_stack,
+            params_stack,
+            x,
+            topk_ids_per_layer,
+            topk_weights_per_layer,
+            backend=backend,
+            fast_math=fast_math,
+            output_buffers=output_buffers,
+        )
+    return graph
+
+
+def _check_graph_replay_metrics(
+    label: str,
+    metrics: OracleMetrics,
+) -> list[str]:
+    failures = []
+    tol = GRAPH_REPLAY_TOLERANCES
+    if metrics.max_abs > tol["max_abs"]:
+        failures.append(f"{label}: max_abs={metrics.max_abs:.6f} > {tol['max_abs']}")
+    if metrics.rmse > tol["rmse"]:
+        failures.append(f"{label}: rmse={metrics.rmse:.6f} > {tol['rmse']}")
+    if metrics.mean_abs > tol["mean_abs"]:
+        failures.append(f"{label}: mean_abs={metrics.mean_abs:.6f} > {tol['mean_abs']}")
+    if metrics.cos < tol["cos_min"]:
+        failures.append(f"{label}: cos={metrics.cos:.6f} < {tol['cos_min']}")
+    return failures
+
+
+def bench_multilayer_graph_mode(
+    args,
+    spec: ModelSpec,
+    batch_sizes: Sequence[int],
+    device: torch.device,
+) -> None:
+    graph_num_layers = args.graph_num_layers
+    if graph_num_layers < 2:
+        raise ValueError("--graph-num-layers must be at least 2 in multi-layer graph mode")
+
+    cfg = json.loads((MODEL_PATH / "config.json").read_text())["text_config"]
+    total_layers = cfg["num_hidden_layers"]
+    layer_start = args.graph_layer_start
+    if layer_start < 0 or layer_start + graph_num_layers > total_layers:
+        raise ValueError(
+            f"requested layers [{layer_start}, {layer_start + graph_num_layers}) exceed model depth {total_layers}"
+        )
+
+    if args.reference != "none" or args.validate != "none":
+        print("Note: multi-layer graph mode skips flashinfer/oracle checks and validates graph replay against an eager layer chain.")
+    print("Multi-layer graph mode")
+    print(f"Backend: {args.backend}")
+    print(f"Layers: {layer_start}..{layer_start + graph_num_layers - 1}")
+    print(f"Patterns: disjoint, overlap, random")
+    print()
+
+    _clear_b12x_caches()
+    weights_stack = load_expert_weight_stack(
+        MODEL_PATH,
+        spec,
+        layer_start=layer_start,
+        num_layers=graph_num_layers,
+    )
+    params_stack = [get_scale_contract_params(weights, args.scale_contract) for weights in weights_stack]
+
+    scenario_specs = [
+        ("disjoint", "disjoint", 1100),
+        ("overlap", "overlap", 2200),
+        ("random-a", "random", 3300),
+        ("random-b", "random", 4400),
+    ]
+    validation_failures: list[str] = []
+
+    for batch_size in batch_sizes:
+        print(f"\n{'=' * 70}")
+        print(
+            f"  batch_size={batch_size}  "
+            f"(layers={graph_num_layers}, tokens*top_k={batch_size * spec.top_k})"
+        )
+        print(f"{'=' * 70}")
+
+        x_buf = make_input_activations(spec, batch_size, 10_000 + batch_size, device)
+        initial_case = make_multilayer_routing_case(
+            spec,
+            batch_size,
+            graph_num_layers,
+            device,
+            pattern="disjoint",
+            seed=20_000 + batch_size,
+        )
+        topk_ids_bufs = [topk_ids.clone() for topk_ids, _ in initial_case]
+        topk_weights_bufs = [topk_weights.clone() for _, topk_weights in initial_case]
+        graph_output_bufs = [torch.empty_like(x_buf) for _ in range(graph_num_layers)]
+        eager_output_bufs = [torch.empty_like(x_buf) for _ in range(graph_num_layers)]
+
+        run_moe_layer_chain(
+            weights_stack,
+            params_stack,
+            x_buf,
+            topk_ids_bufs,
+            topk_weights_bufs,
+            backend=args.backend,
+            fast_math=args.fast_math,
+            output_buffers=graph_output_bufs,
+        )
+        torch.cuda.synchronize()
+        graph = capture_moe_layer_chain(
+            weights_stack,
+            params_stack,
+            x_buf,
+            topk_ids_bufs,
+            topk_weights_bufs,
+            backend=args.backend,
+            fast_math=args.fast_math,
+            output_buffers=graph_output_bufs,
+        )
+
+        def eager_chain() -> None:
+            run_moe_layer_chain(
+                weights_stack,
+                params_stack,
+                x_buf,
+                topk_ids_bufs,
+                topk_weights_bufs,
+                backend=args.backend,
+                fast_math=args.fast_math,
+                output_buffers=eager_output_bufs,
+            )
+
+        for scenario_name, pattern, seed in scenario_specs:
+            x_case = make_input_activations(
+                spec,
+                batch_size,
+                30_000 + batch_size + seed,
+                device,
+            )
+            routing_case = make_multilayer_routing_case(
+                spec,
+                batch_size,
+                graph_num_layers,
+                device,
+                pattern=pattern,
+                seed=40_000 + batch_size + seed,
+            )
+
+            x_buf.copy_(x_case)
+            for layer_idx, (topk_ids, topk_weights) in enumerate(routing_case):
+                topk_ids_bufs[layer_idx].copy_(topk_ids)
+                topk_weights_bufs[layer_idx].copy_(topk_weights)
+
+            graph.replay()
+            torch.cuda.synchronize()
+            graph_outputs = [buf.clone() for buf in graph_output_bufs]
+
+            eager_chain()
+            torch.cuda.synchronize()
+            eager_outputs = [buf.clone() for buf in eager_output_bufs]
+
+            final_metrics = compare_graph_replay_outputs(graph_outputs[-1], eager_outputs[-1])
+            layer_metrics = [
+                compare_graph_replay_outputs(graph_out, eager_out)
+                for graph_out, eager_out in zip(graph_outputs, eager_outputs, strict=True)
+            ]
+            graph_stats = bench_repeated(
+                graph.replay,
+                warmup=args.warmup,
+                iters=args.iters,
+                repeats=args.repeats,
+            )
+            eager_stats = bench_repeated(
+                eager_chain,
+                warmup=args.warmup,
+                iters=args.iters,
+                repeats=args.repeats,
+            )
+            ratio_stats = RatioStats([graph_stats.median_ms / eager_stats.median_ms])
+
+            print(
+                f"  {scenario_name}: "
+                f"graph {fmt_timing_stats(graph_stats)} | "
+                f"eager {fmt_timing_stats(eager_stats)} | "
+                f"ratio {fmt_ratio_stats(ratio_stats)}"
+            )
+            print(
+                "    final:",
+                format_oracle_metrics("graph vs eager", final_metrics),
+            )
+            for layer_idx, metrics in enumerate(layer_metrics):
+                print(
+                    f"    layer {layer_idx + layer_start}: "
+                    f"max_abs={metrics.max_abs:.6f} rmse={metrics.rmse:.6f} cos={metrics.cos:.6f}"
+                )
+                validation_failures.extend(
+                    _check_graph_replay_metrics(
+                        f"bs={batch_size} {scenario_name} layer={layer_idx + layer_start}",
+                        metrics,
+                    )
+                )
+            validation_failures.extend(
+                _check_graph_replay_metrics(
+                    f"bs={batch_size} {scenario_name} final",
+                    final_metrics,
+                )
+            )
+
+    if validation_failures:
+        print(f"\n\033[1;31m{'=' * 70}")
+        print("  MULTI-LAYER GRAPH VALIDATION FAILED")
+        print(f"{'=' * 70}")
+        for failure in validation_failures:
+            print(f"  {failure}")
+        print(f"{'=' * 70}\033[0m")
+        sys.exit(1)
+
+
 def bench_e2e() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--warmup", type=int, default=10)
@@ -448,6 +876,9 @@ def bench_e2e() -> None:
     parser.add_argument("--batch-size-profile", choices=sorted(BATCH_SIZE_PROFILES), default="micro")
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=None)
     parser.add_argument("--backend", choices=["static", "dynamic"], default="static")
+    parser.add_argument("--graph-mode", choices=["single-op", "multi-layer"], default="single-op")
+    parser.add_argument("--graph-num-layers", type=int, default=4)
+    parser.add_argument("--graph-layer-start", type=int, default=0)
     parser.add_argument("--reference", choices=["flashinfer", "none"], default="flashinfer")
     parser.add_argument("--scale-contract", choices=["shared", "per-expert"], default="shared")
     parser.add_argument("--validate", choices=["none", "oracle"], default="oracle")
@@ -510,6 +941,7 @@ def bench_e2e() -> None:
     print(f"Scale contract: {args.scale_contract}")
     print(f"Validation: {args.validate}")
     print(f"Fast math: {'on' if args.fast_math else 'off'}")
+    print(f"Graph mode: {args.graph_mode}")
     print(f"Timing passes per batch size: {args.repeats} x {args.iters} iterations")
     print(
         "Timed region: "
@@ -518,6 +950,10 @@ def bench_e2e() -> None:
     if args.validate == "oracle":
         print(f"Oracle mode: {args.oracle_mode}")
     print()
+
+    if args.graph_mode == "multi-layer":
+        bench_multilayer_graph_mode(args, spec, batch_sizes, device)
+        return
 
     weights = load_expert_weights(MODEL_PATH, spec)
     params = get_scale_contract_params(weights, args.scale_contract)
