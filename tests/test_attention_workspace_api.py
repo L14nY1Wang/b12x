@@ -6,7 +6,6 @@ import torch
 from b12x.attention.reference import attention_reference
 from b12x.integration.attention import (
     allocate_attention_workspace,
-    allocate_attention_workspace_pool,
     b12x_attention_forward,
     clear_attention_caches,
 )
@@ -50,25 +49,6 @@ def test_exact_workspace_matches_reference_for_qwen_like_shape() -> None:
     assert max_abs <= 0.02
     assert max_lse_abs <= 0.03
     assert _cosine_similarity(out, ref_out) >= 0.99999
-
-
-def test_workspace_pool_reuses_exact_shape_buffers() -> None:
-    require_sm120()
-    clear_attention_caches()
-
-    q, k, v = _make_gqa_inputs((1, 32, 8, 256), kv_heads=1, seed=11)
-    pool = allocate_attention_workspace_pool()
-
-    out0, lse0 = b12x_attention_forward(q, k, v, workspace=pool)
-    ref_out, ref_lse = attention_reference(q, k, v, causal=True)
-    out1, lse1 = b12x_attention_forward(q, k, v, workspace=pool)
-    torch.cuda.synchronize()
-
-    assert len(pool.workspaces) == 1
-    assert out0.data_ptr() == out1.data_ptr()
-    assert lse0.data_ptr() == lse1.data_ptr()
-    assert (out1 - ref_out).abs().max().item() <= 0.02
-    assert (lse1 - ref_lse).abs().max().item() <= 0.03
 
 
 def test_right_aligned_causal_multi_tile_shape_matches_reference() -> None:

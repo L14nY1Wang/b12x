@@ -6,7 +6,6 @@ import torch
 from b12x.attention.reference import paged_attention_reference
 from b12x.integration.attention import (
     allocate_paged_attention_workspace,
-    allocate_paged_attention_workspace_pool,
     b12x_paged_attention_forward,
     clear_attention_caches,
 )
@@ -82,8 +81,8 @@ def test_paged_workspace_matches_reference_for_qwen_like_extend_shape() -> None:
 
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
         q_seqlens=[6, 5, 7, 4],
-        cache_seqlens=[33, 29, 41, 20],
-        page_size=16,
+        cache_seqlens=[97, 81, 113, 68],
+        page_size=64,
         seed=23,
     )
     workspace = allocate_paged_attention_workspace(
@@ -120,70 +119,22 @@ def test_paged_workspace_matches_reference_for_qwen_like_extend_shape() -> None:
     assert _cosine_similarity(out, ref_out) >= 0.99999
 
 
-def test_paged_workspace_pool_reuses_output_buffers() -> None:
-    require_sm120()
-    clear_attention_caches()
-
-    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
-        q_seqlens=[1, 1, 1, 1],
-        cache_seqlens=[64, 96, 48, 80],
-        page_size=16,
-        seed=31,
-    )
-    pool = allocate_paged_attention_workspace_pool()
-
-    out0, lse0 = b12x_paged_attention_forward(
-        q,
-        k_cache,
-        v_cache,
-        page_table,
-        cache_seqlens,
-        cu_seqlens_q,
-        workspace=pool,
-    )
-    ref_out, ref_lse = paged_attention_reference(
-        q,
-        k_cache,
-        v_cache,
-        page_table,
-        cache_seqlens,
-        cu_seqlens_q,
-        causal=True,
-    )
-    out1, lse1 = b12x_paged_attention_forward(
-        q,
-        k_cache,
-        v_cache,
-        page_table,
-        cache_seqlens,
-        cu_seqlens_q,
-        workspace=pool,
-    )
-    torch.cuda.synchronize()
-
-    assert len(pool.workspaces) == 1
-    assert out0.data_ptr() == out1.data_ptr()
-    assert lse0.data_ptr() == lse1.data_ptr()
-    assert (out1 - ref_out).abs().max().item() <= 0.02
-    assert (lse1 - ref_lse).abs().max().item() <= 0.03
-
-
-def test_exact_paged_workspace_rejects_larger_cache_requirement() -> None:
+def test_exact_paged_workspace_rejects_shape_mismatch() -> None:
     require_sm120()
     clear_attention_caches()
 
     q0, k0, v0, page_table0, cache_seqlens0, cu_seqlens_q0 = _make_paged_inputs(
         q_seqlens=[2, 2],
-        cache_seqlens=[17, 17],
-        page_size=16,
+        cache_seqlens=[65, 65],
+        page_size=64,
         seed=37,
         page_table_width=3,
         num_pages=10,
     )
     q1, k1, v1, page_table1, cache_seqlens1, cu_seqlens_q1 = _make_paged_inputs(
-        q_seqlens=[2, 2],
-        cache_seqlens=[33, 17],
-        page_size=16,
+        q_seqlens=[2, 3],
+        cache_seqlens=[65, 129],
+        page_size=64,
         seed=41,
         page_table_width=3,
         num_pages=10,
@@ -198,7 +149,7 @@ def test_exact_paged_workspace_rejects_larger_cache_requirement() -> None:
         causal=True,
     )
 
-    with pytest.raises(ValueError, match="paged workspace capacity mismatch"):
+    with pytest.raises(ValueError, match="paged workspace shape mismatch"):
         b12x_paged_attention_forward(
             q1,
             k1,
@@ -217,11 +168,34 @@ def test_single_token_single_key_paged_corner_is_rejected() -> None:
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
         q_seqlens=[1],
         cache_seqlens=[1],
-        page_size=16,
+        page_size=64,
         seed=53,
     )
 
     with pytest.raises(ValueError, match="single-token single-key corner"):
+        allocate_paged_attention_workspace(
+            q,
+            k_cache,
+            v_cache,
+            page_table,
+            cache_seqlens,
+            cu_seqlens_q,
+            causal=True,
+        )
+
+
+def test_page_size_other_than_64_is_rejected() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
+        q_seqlens=[4, 4],
+        cache_seqlens=[32, 64],
+        page_size=32,
+        seed=61,
+    )
+
+    with pytest.raises(ValueError, match="page_size=64"):
         allocate_paged_attention_workspace(
             q,
             k_cache,

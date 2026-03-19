@@ -1,5 +1,5 @@
 import math
-from typing import Callable
+from typing import Callable, Optional
 
 import cutlass
 import cutlass.cute as cute
@@ -171,3 +171,15 @@ def shuffle_sync(
     for i in cutlass.range_constexpr(cute.size(val_i32)):
         val_i32[i] = cute.arch.shuffle_sync(val_i32[i], offset, mask_and_clamp=mask_and_clamp)
     return val[0]
+
+
+@cute.jit
+def warp_prefix_sum(val: cutlass.Int32, lane: Optional[cutlass.Int32] = None) -> cutlass.Int32:
+    if const_expr(lane is None):
+        lane = cute.arch.lane_idx()
+    for i in cutlass.range_constexpr(int(math.log2(cute.arch.WARP_SIZE))):
+        offset = 1 << i
+        partial_sum = cute.arch.shuffle_sync_up(val, offset=offset, mask_and_clamp=0)
+        if lane >= offset:
+            val += partial_sum
+    return val

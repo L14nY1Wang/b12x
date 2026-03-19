@@ -40,6 +40,7 @@ from b12x.attention.pack_gqa import PackGQA, pack_gqa_layout
 from b12x.attention.named_barrier import NamedBarrierFwd
 from b12x.attention.tile_scheduler import (
     SingleTileScheduler,
+    SingleTileVarlenScheduler,
     TileSchedulerArguments,
 )
 
@@ -382,7 +383,11 @@ class SM120ForwardKernel:
             self.tile_m, self.tile_hdimv, self.check_hdim_v_oob, self.qhead_per_kvhead
         )
         if const_expr(mLSE is not None):
-            mLSE_cur = mLSE[None, head_idx, batch_idx]
+            if const_expr(not seqlen.has_cu_seqlens_q):
+                mLSE_cur = mLSE[None, head_idx, batch_idx]
+            else:
+                offset = seqlen.offset_q if const_expr(not self.pack_gqa) else (0, seqlen.offset_q)
+                mLSE_cur = cute.domain_offset((offset,), mLSE[None, head_idx])
             if const_expr(not self.pack_gqa):
                 gLSE = cute.local_tile(mLSE_cur, (self.tile_m,), (m_block,))
                 gLSE_expanded_layout = cute.append(
@@ -403,7 +408,11 @@ class SM120ForwardKernel:
             else:
                 pack_gqa.store_LSE(mLSE_cur, lse, tiled_mma, tidx, m_block, seqlen.seqlen_q)
 
-        mO_cur = mO[None, None, head_idx, batch_idx]
+        if const_expr(not seqlen.has_cu_seqlens_q):
+            mO_cur = mO[None, None, head_idx, batch_idx]
+        else:
+            offset = seqlen.offset_q if const_expr(not self.pack_gqa) else (0, seqlen.offset_q)
+            mO_cur = cute.domain_offset((offset, 0), mO[None, None, head_idx])
         cute.arch.barrier(
             barrier_id=int(NamedBarrierFwd.Epilogue), number_of_threads=self.num_epilogue_threads
         )
@@ -454,9 +463,8 @@ class SM120ForwardKernel:
         aux_tensors=None,
         stream: cuda.CUstream = None,
     ):
-        assert mCuSeqlensQ is None and mCuSeqlensK is None
-        assert mSeqUsedQ is None and mSeqUsedK is None
-        assert mPageTable is None
+        assert mCuSeqlensK is None
+        assert mSeqUsedQ is None
         assert learnable_sink is None
         assert blocksparse_tensors is None
         self._check_type(
@@ -510,6 +518,9 @@ class SM120ForwardKernel:
             "K": cute.size_in_bytes(mK.element_type, cute.select(self.sK_layout, mode=[0, 1])),
             "V": cute.size_in_bytes(mV.element_type, cute.select(self.sV_layout, mode=[0, 1])),
         }
+        if const_expr(mPageTable is not None):
+            assert mK.shape[0] == self.tile_n, "paged TMA path requires page_size == tile_n"
+            assert mV.shape[0] == self.tile_n, "paged TMA path requires page_size == tile_n"
 
         tma_atom_Q, tma_tensor_Q = cpasync.make_tiled_tma_atom(
             gmem_tiled_copy_Q,
@@ -517,26 +528,39 @@ class SM120ForwardKernel:
             self.sQ_layout,
             (self.tile_m, self.tile_hdim),
         )
+        TileScheduler = (
+            SingleTileVarlenScheduler
+            if const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None)
+            else SingleTileScheduler
+        )
         tile_sched_args = TileSchedulerArguments(
             num_block=cute.ceil_div(cute.size(mQ.shape[0]), self.tile_m),
             num_head=cute.size(mQ.shape[2]),
-            num_batch=cute.size(mQ.shape[3]) if const_expr(cute.rank(mQ) == 4) else 1,
+            num_batch=(
+                cute.size(mQ.shape[3])
+                if const_expr(mCuSeqlensQ is None)
+                else cute.size(mCuSeqlensQ.shape[0] - 1)
+            ),
             num_splits=1,
-            seqlen_k=mK.shape[0],
+            seqlen_k=mK.shape[0] if const_expr(mPageTable is None) else mK.shape[0] * mPageTable.shape[1],
             headdim=mQ.shape[1],
             headdim_v=mV.shape[1],
-            total_q=(
+            total_q=cute.size(mQ.shape[0])
+            if const_expr(mCuSeqlensQ is not None)
+            else (
                 cute.size(mQ.shape[0]) * cute.size(mQ.shape[3])
                 if const_expr(cute.rank(mQ) == 4)
                 else cute.size(mQ.shape[0])
             ),
             tile_shape_mn=(self.tile_m, self.tile_n),
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-            mCuSeqlensQ=None,
-            mSeqUsedQ=None,
+            mCuSeqlensQ=mCuSeqlensQ,
+            mSeqUsedQ=mSeqUsedQ,
+            element_size=self.dtype.width // 8,
+            lpt=self.is_causal or self.is_local,
         )
-        tile_sched_params = SingleTileScheduler.to_underlying_arguments(tile_sched_args)
-        grid_dim = SingleTileScheduler.get_grid_shape(tile_sched_params)
+        tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
+        grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
         softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(softmax_scale)
         tma_atom_O, tma_tensor_O = None, None
         if const_expr(self.use_tma_O):
@@ -566,6 +590,11 @@ class SM120ForwardKernel:
             tma_tensor_V,
             tma_tensor_O if const_expr(self.use_tma_O) else mO,
             mLSE,
+            mCuSeqlensQ,
+            mCuSeqlensK,
+            mSeqUsedQ,
+            mSeqUsedK,
+            mPageTable,
             tma_atom_Q,
             tma_atom_K,
             tma_atom_V,
@@ -583,6 +612,7 @@ class SM120ForwardKernel:
             tiled_mma_qk,
             tiled_mma_pv,
             tile_sched_params,
+            TileScheduler,
             SharedStorage,
             aux_tensors,
         ).launch(
@@ -601,6 +631,11 @@ class SM120ForwardKernel:
         mV: cute.Tensor,
         mO: cute.Tensor,
         mLSE: Optional[cute.Tensor],
+        mCuSeqlensQ: Optional[cute.Tensor],
+        mCuSeqlensK: Optional[cute.Tensor],
+        mSeqUsedQ: Optional[cute.Tensor],
+        mSeqUsedK: Optional[cute.Tensor],
+        mPageTable: Optional[cute.Tensor],
         tma_atom_Q: cute.CopyAtom,
         tma_atom_K: cute.CopyAtom,
         tma_atom_V: cute.CopyAtom,
@@ -618,6 +653,7 @@ class SM120ForwardKernel:
         tiled_mma_qk: cute.TiledMma,
         tiled_mma_pv: cute.TiledMma,
         tile_sched_params,
+        TileScheduler: cutlass.Constexpr,
         SharedStorage: cutlass.Constexpr,
         aux_tensors=None,
     ):
@@ -678,13 +714,13 @@ class SM120ForwardKernel:
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,
             seqlen_q_static=mQ.shape[0] if const_expr(not self.pack_gqa) else mQ.shape[0][1],
-            seqlen_k_static=mK.shape[0],
-            mCuSeqlensQ=None,
-            mCuSeqlensK=None,
-            mSeqUsedQ=None,
-            mSeqUsedK=None,
+            seqlen_k_static=mK.shape[0] if const_expr(mPageTable is None) else mK.shape[0] * mPageTable.shape[1],
+            mCuSeqlensQ=mCuSeqlensQ,
+            mCuSeqlensK=mCuSeqlensK,
+            mSeqUsedQ=mSeqUsedQ,
+            mSeqUsedK=mSeqUsedK,
         )
-        TileSchedulerCls = partial(SingleTileScheduler.create, tile_sched_params)
+        TileSchedulerCls = partial(TileScheduler.create, tile_sched_params)
 
         if warp_idx == self.producer_warp_idx:
             cute.arch.setmaxregister_decrease(self.num_producer_regs)
@@ -695,6 +731,7 @@ class SM120ForwardKernel:
                 sQ,
                 sK,
                 sV,
+                mPageTable,
                 tma_atom_Q,
                 tma_atom_K,
                 tma_atom_V,
@@ -742,6 +779,7 @@ class SM120ForwardKernel:
         sQ: cute.Tensor,
         sK: cute.Tensor,
         sV: cute.Tensor,
+        mPageTable: Optional[cute.Tensor],
         tma_atom_Q: cute.CopyAtom,
         tma_atom_K: cute.CopyAtom,
         tma_atom_V: cute.CopyAtom,
@@ -767,11 +805,13 @@ class SM120ForwardKernel:
                 wait_for_q_consumed = False
             m_block, head_idx, batch_idx, _ = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
-            mQ_cur = (
-                seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
-                if const_expr(cute.rank(mQ) == 4)
-                else mQ[None, None, head_idx]
-            )
+            if const_expr(cute.rank(mQ) == 4):
+                mQ_batch = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)
+            elif const_expr(seqlen.has_cu_seqlens_q):
+                mQ_batch = seqlen.offset_batch_Q(mQ, batch_idx, dim=2)
+            else:
+                mQ_batch = mQ
+            mQ_cur = mQ_batch[None, None, head_idx]
             gQ = cute.local_tile(mQ_cur, (self.tile_m, self.tile_hdim), (m_block, 0))
             load_Q, _, _ = copy_utils.tma_get_copy_fn(
                 tma_atom_Q, 0, cute.make_layout(1), gQ, sQ, single_stage=True
@@ -779,18 +819,24 @@ class SM120ForwardKernel:
             head_idx_kv = (
                 head_idx if const_expr(self.pack_gqa) else head_idx // self.qhead_per_kvhead
             )
-            mK_cur = (
-                seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None, head_idx_kv]
-                if const_expr(cute.rank(mK) == 4)
-                else mK[None, None, head_idx_kv]
-            )
-            mV_cur = (
-                seqlen.offset_batch_K(mV, batch_idx, dim=3)[None, None, head_idx_kv]
-                if const_expr(cute.rank(mV) == 4)
-                else mV[None, None, head_idx_kv]
-            )
-            gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (None, 0))
-            gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (None, 0))
+            if const_expr(mPageTable is not None):
+                mK_cur = mK[None, None, head_idx_kv, None]
+                mV_cur = mV[None, None, head_idx_kv, None]
+                gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (0, 0, None))
+                gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (0, 0, None))
+            else:
+                mK_cur = (
+                    seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None, head_idx_kv]
+                    if const_expr(cute.rank(mK) == 4)
+                    else mK[None, None, head_idx_kv]
+                )
+                mV_cur = (
+                    seqlen.offset_batch_K(mV, batch_idx, dim=3)[None, None, head_idx_kv]
+                    if const_expr(cute.rank(mV) == 4)
+                    else mV[None, None, head_idx_kv]
+                )
+                gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (None, 0))
+                gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (None, 0))
             load_K, _, _ = copy_utils.tma_get_copy_fn(
                 tma_atom_K, 0, cute.make_layout(1), gK, sK
             )
@@ -808,10 +854,11 @@ class SM120ForwardKernel:
                 wait_for_q_consumed = True
             for n_tile in cutlass.range(n_block_max - n_block_min, unroll=1):
                 n_block = n_block_max - 1 - n_tile
+                src_idx = mPageTable[batch_idx, n_block] if const_expr(mPageTable is not None) else n_block
                 pipeline_k.producer_acquire(kv_producer_state)
-                load_K(src_idx=n_block, producer_state=kv_producer_state)
+                load_K(src_idx=src_idx, producer_state=kv_producer_state)
                 pipeline_v.producer_acquire(kv_producer_state)
-                load_V(src_idx=n_block, producer_state=kv_producer_state)
+                load_V(src_idx=src_idx, producer_state=kv_producer_state)
                 kv_producer_state.advance()
 
             if const_expr(not self.Q_in_regs):
