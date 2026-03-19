@@ -4,7 +4,11 @@ import pytest
 import torch
 
 from benchmarks.benchmark_moe import MODEL_PATH, TP_RANK, TP_SIZE, ModelSpec, load_expert_weights
-from b12x.integration.tp_moe import allocate_tp_moe_workspace, b12x_moe_fp4, clear_tp_moe_caches
+from b12x.integration.tp_moe import (
+    allocate_tp_moe_workspace_pool,
+    b12x_moe_fp4,
+    clear_tp_moe_caches,
+)
 from b12x.moe.fused.reference import compare_to_reference
 
 from .helpers import require_sm120
@@ -128,38 +132,43 @@ def test_b12x_supports_overlapping_stream_launches() -> None:
     weights_b = load_expert_weights(MODEL_PATH, spec, layer_idx=1)
     xa, ida, wa = _make_inputs(spec, batch_size=16, seed=123, device=device)
     xb, idb, wb = _make_inputs(spec, batch_size=16, seed=456, device=device)
-    workspace_a = allocate_tp_moe_workspace(
-        xa,
-        weights_a.w13_input_scale,
-        weights_a.w13_weight,
-        weights_a.w2_input_scale,
-        weights_a.w2_weight,
-        ida,
-        implementation="static",
-        input_scales_static=True,
-    )
-    workspace_b = allocate_tp_moe_workspace(
-        xb,
-        weights_b.w13_input_scale,
-        weights_b.w13_weight,
-        weights_b.w2_input_scale,
-        weights_b.w2_weight,
-        idb,
-        implementation="static",
-        input_scales_static=True,
-    )
+    shared_workspace_pool = allocate_tp_moe_workspace_pool()
 
     torch.cuda.synchronize(device)
-    ref_a = _run_once(x=xa, topk_ids=ida, topk_weights=wa, weights=weights_a, workspace=workspace_a)
-    ref_b = _run_once(x=xb, topk_ids=idb, topk_weights=wb, weights=weights_b, workspace=workspace_b)
+    ref_a = _run_once(
+        x=xa,
+        topk_ids=ida,
+        topk_weights=wa,
+        weights=weights_a,
+        workspace=shared_workspace_pool,
+    )
+    ref_b = _run_once(
+        x=xb,
+        topk_ids=idb,
+        topk_weights=wb,
+        weights=weights_b,
+        workspace=shared_workspace_pool,
+    )
     torch.cuda.synchronize(device)
 
     stream_a = torch.cuda.Stream(device=device, priority=0)
     stream_b = torch.cuda.Stream(device=device, priority=0)
     with torch.cuda.stream(stream_a):
-        out_a = _run_once(x=xa, topk_ids=ida, topk_weights=wa, weights=weights_a, workspace=workspace_a)
+        out_a = _run_once(
+            x=xa,
+            topk_ids=ida,
+            topk_weights=wa,
+            weights=weights_a,
+            workspace=shared_workspace_pool,
+        )
     with torch.cuda.stream(stream_b):
-        out_b = _run_once(x=xb, topk_ids=idb, topk_weights=wb, weights=weights_b, workspace=workspace_b)
+        out_b = _run_once(
+            x=xb,
+            topk_ids=idb,
+            topk_weights=wb,
+            weights=weights_b,
+            workspace=shared_workspace_pool,
+        )
     torch.cuda.synchronize(device)
 
     stream_c = torch.cuda.Stream(device=device, priority=0)
@@ -170,7 +179,7 @@ def test_b12x_supports_overlapping_stream_launches() -> None:
         topk_ids=ida,
         topk_weights=wa,
         weights=weights_a,
-        workspace=workspace_a,
+        workspace=shared_workspace_pool,
     )
     sink_b = _launch_with_alias_consumer(
         stream=stream_d,
@@ -178,7 +187,7 @@ def test_b12x_supports_overlapping_stream_launches() -> None:
         topk_ids=idb,
         topk_weights=wb,
         weights=weights_b,
-        workspace=workspace_b,
+        workspace=shared_workspace_pool,
     )
     torch.cuda.synchronize(device)
 
@@ -186,3 +195,4 @@ def test_b12x_supports_overlapping_stream_launches() -> None:
     _assert_matches(out_b, ref_b)
     _assert_matches(sink_a, ref_a)
     _assert_matches(sink_b, ref_b)
+    assert len(shared_workspace_pool.workspaces) >= 4

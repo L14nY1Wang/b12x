@@ -75,11 +75,11 @@ class TPMoEWorkspace:
 
 @dataclass
 class TPMoEWorkspacePool:
-    """Caller-owned exact-shape workspace cache for one execution context.
+    """Caller-owned exact-shape workspace cache partitioned by CUDA stream.
 
-    Pools are explicit and not concurrency-safe. Use one pool per active stream
-    or captured CUDA graph so scratch buffers remain stable without being shared
-    across overlapping launches.
+    A single explicit pool may be shared across multiple layers, but overlapping
+    launches on different CUDA streams must still use distinct scratch buffers.
+    The pool therefore keys allocations by both launch shape and current stream.
     """
 
     workspaces: Dict[Tuple, TPMoEWorkspace] = field(default_factory=dict)
@@ -571,6 +571,7 @@ def _validate_workspace(
 def _workspace_pool_key(
     implementation: str,
     *,
+    stream_key: int,
     state_E: int,
     weight_E: int,
     max_rows: int,
@@ -582,6 +583,7 @@ def _workspace_pool_key(
 ) -> tuple:
     return (
         implementation,
+        stream_key,
         state_E,
         weight_E,
         max_rows,
@@ -634,8 +636,10 @@ def _resolve_workspace(
             "workspace must be a TPMoEWorkspace or TPMoEWorkspacePool"
         )
 
+    stream_key = int(torch.cuda.current_stream(device).cuda_stream)
     key = _workspace_pool_key(
         implementation,
+        stream_key=stream_key,
         state_E=state_E,
         weight_E=weight_E,
         max_rows=max_rows,
