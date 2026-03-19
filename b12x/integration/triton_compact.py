@@ -15,30 +15,30 @@ def _compact_topk_ids_kernel(
     BLOCK: tl.constexpr,
 ):
     pair_slots = tl.arange(0, BLOCK)
-    ids = tl.load(topk_ids_ptr + pair_slots, mask=pair_slots < total_pairs, other=0).to(tl.int32)
+    valid = pair_slots < total_pairs
+    ids = tl.load(topk_ids_ptr + pair_slots, mask=valid, other=-1).to(tl.int32)
 
-    first_flags = tl.zeros((BLOCK,), dtype=tl.int32)
-    for pair_idx in range(BLOCK):
-        is_valid = pair_idx < total_pairs
-        expert_id = tl.load(topk_ids_ptr + pair_idx, mask=is_valid, other=0).to(tl.int32)
-        prior_same = is_valid & (pair_slots < pair_idx) & (ids == expert_id)
-        has_prior = tl.sum(prior_same.to(tl.int32), axis=0) > 0
-        is_first = is_valid & (~has_prior)
-        first_flags = tl.where(pair_slots == pair_idx, is_first.to(tl.int32), first_flags)
+    row_slots = pair_slots[:, None]
+    col_slots = pair_slots[None, :]
+    row_valid = valid[:, None]
+    col_valid = valid[None, :]
 
-    for pair_idx in range(BLOCK):
-        is_valid = pair_idx < total_pairs
-        expert_id = tl.load(topk_ids_ptr + pair_idx, mask=is_valid, other=0).to(tl.int32)
-        prior_same = is_valid & (pair_slots < pair_idx) & (ids == expert_id)
-        prior_slots = tl.where(prior_same, pair_slots, BLOCK)
-        first_match = tl.min(prior_slots, axis=0)
-        first_slot = tl.where(first_match < BLOCK, first_match, pair_idx)
-        compact_id = tl.sum(tl.where(pair_slots <= first_slot, first_flags, 0), axis=0) - 1
-        tl.store(compact_topk_ids_ptr + pair_idx, compact_id, mask=is_valid)
-        is_first = tl.sum(tl.where(pair_slots == pair_idx, first_flags, 0), axis=0) != 0
-        tl.store(weight_expert_ids_ptr + compact_id, expert_id, mask=is_valid & is_first)
+    same_id = ids[:, None] == ids[None, :]
+    prior_same = row_valid & col_valid & same_id & (col_slots < row_slots)
 
-    active_expert_count = tl.sum(first_flags, axis=0)
+    first_flags = valid & (tl.sum(prior_same.to(tl.int32), axis=1) == 0)
+    first_prefix = tl.cumsum(first_flags.to(tl.int32), axis=0)
+
+    prior_slots = tl.where(prior_same, col_slots, BLOCK)
+    first_match = tl.min(prior_slots, axis=1)
+    first_slot = tl.where(first_match < BLOCK, first_match, pair_slots)
+    first_slot_mask = col_slots == first_slot[:, None]
+    compact_id = tl.sum(tl.where(first_slot_mask, first_prefix[None, :], 0), axis=1) - 1
+
+    tl.store(compact_topk_ids_ptr + pair_slots, compact_id, mask=valid)
+    tl.store(weight_expert_ids_ptr + compact_id, ids, mask=valid & first_flags)
+
+    active_expert_count = tl.sum(first_flags.to(tl.int32), axis=0)
     tl.store(active_expert_count_ptr, active_expert_count)
 
 
@@ -60,6 +60,7 @@ def compact_topk_ids(
         raise ValueError("active_expert_count must have shape [1]")
 
     block = triton.next_power_of_2(total_pairs)
+    num_warps = 1 if block <= 16 else 2
     _compact_topk_ids_kernel[(1,)](
         topk_ids,
         compact_topk_ids,
@@ -67,5 +68,5 @@ def compact_topk_ids(
         active_expert_count,
         total_pairs,
         BLOCK=block,
-        num_warps=1,
+        num_warps=num_warps,
     )

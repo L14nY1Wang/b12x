@@ -169,6 +169,23 @@ def _compact_static_get_work_tile(
     return cur_tile_coord, is_valid, current_local_expert_idx, accum_tile_m
 
 
+@cute.jit
+def _compact_unique_get_work_tile(
+    *,
+    num_active_experts: Int32,
+    num_tiles_n: Int32,
+    current_work_linear_idx: Int32,
+    cta_id_in_cluster: cute.Coord,
+) -> Tuple[Tuple[Int32, Int32, Int32], Integer]:
+    local_expert_idx = current_work_linear_idx // num_tiles_n
+    cur_tile_coord = (
+        cta_id_in_cluster[0],
+        current_work_linear_idx % num_tiles_n,
+        local_expert_idx,
+    )
+    return cur_tile_coord, local_expert_idx < num_active_experts
+
+
 @dsl_user_op
 def _st_shared_i32(addr, val, *, loc=None, ip=None):
     llvm.inline_asm(
@@ -711,6 +728,10 @@ class MoEMicroKernel:
         max_rows = Int32(token_map.shape[1])
         total_pairs = Int32(topk_ids.shape[0])
         num_topk = total_pairs // num_tokens
+        num_active_experts = active_expert_count[Int32(0)]
+        all_rows_unique = Int32(0)
+        if num_tokens == Int32(1) and num_active_experts == total_pairs:
+            all_rows_unique = Int32(1)
         expert_scale_stride = Int32(scale_storage.shape[0]) // num_experts
         flat_tid = Int32(bidz) * Int32(self.threads_per_cta) + Int32(tidx)
         flat_stride = Int32(gdim_z) * Int32(self.threads_per_cta)
@@ -719,7 +740,10 @@ class MoEMicroKernel:
         # Phase 0: cooperative init — zero row_counts and scatter_output
         i = flat_tid
         while i < num_experts:
-            row_counts[i] = Int32(0)
+            row_count = Int32(0)
+            if all_rows_unique > Int32(0) and i < num_active_experts:
+                row_count = Int32(1)
+            row_counts[i] = row_count
             i += flat_stride
         if flat_tid == Int32(0):
             # Triton prepass has already populated the compact expert set.
@@ -736,29 +760,36 @@ class MoEMicroKernel:
 
         pair_idx = Int32(bidz)
         while pair_idx < total_pairs:
-            token_idx = pair_idx // num_topk
-            weight = topk_weights[pair_idx].to(cutlass.Float32)
+            token_idx = Int32(0)
+            weight = cutlass.Float32(0.0)
+            if all_rows_unique == Int32(0):
+                token_idx = pair_idx // num_topk
+                weight = topk_weights[pair_idx].to(cutlass.Float32)
 
             expert_id = Int32(0)
             local_expert_id = Int32(0)
             row = Int32(0)
-            if is_cta_leader > Int32(0):
-                local_expert_id = topk_ids[pair_idx].to(Int32)
+            if all_rows_unique > Int32(0):
+                local_expert_id = pair_idx
                 expert_id = weight_expert_ids[local_expert_id].to(Int32)
-                row = atomic_add_global_i32(
-                    get_ptr_as_int64(row_counts, local_expert_id),
-                    Int32(1),
-                )
-                map_idx = local_expert_id * max_rows + row
-                st_global_i32(get_ptr_as_int64(token_map, map_idx), token_idx)
-                st_global_f32(get_ptr_as_int64(token_weights, map_idx), weight)
-                _st_shared_i32(ctrl_base_addr + Int32(0), local_expert_id)
-                _st_shared_i32(ctrl_base_addr + Int32(4), row)
-                _st_shared_i32(ctrl_base_addr + Int32(8), expert_id)
-            cute.arch.sync_threads()
-            local_expert_id = _ld_shared_i32(ctrl_base_addr + Int32(0))
-            row = _ld_shared_i32(ctrl_base_addr + Int32(4))
-            expert_id = _ld_shared_i32(ctrl_base_addr + Int32(8))
+            else:
+                if is_cta_leader > Int32(0):
+                    local_expert_id = topk_ids[pair_idx].to(Int32)
+                    expert_id = weight_expert_ids[local_expert_id].to(Int32)
+                    row = atomic_add_global_i32(
+                        get_ptr_as_int64(row_counts, local_expert_id),
+                        Int32(1),
+                    )
+                    map_idx = local_expert_id * max_rows + row
+                    st_global_i32(get_ptr_as_int64(token_map, map_idx), token_idx)
+                    st_global_f32(get_ptr_as_int64(token_weights, map_idx), weight)
+                    _st_shared_i32(ctrl_base_addr + Int32(0), local_expert_id)
+                    _st_shared_i32(ctrl_base_addr + Int32(4), row)
+                    _st_shared_i32(ctrl_base_addr + Int32(8), expert_id)
+                cute.arch.sync_threads()
+                local_expert_id = _ld_shared_i32(ctrl_base_addr + Int32(0))
+                row = _ld_shared_i32(ctrl_base_addr + Int32(4))
+                expert_id = _ld_shared_i32(ctrl_base_addr + Int32(8))
 
             # Distribute quantization across ALL CTA threads, not just leader.
             # Each FP4 block (16 elements) is independent — perfect parallelism.
@@ -807,7 +838,8 @@ class MoEMicroKernel:
                 scale_storage[scale_offset] = scale_byte
                 sf_idx += Int32(self.threads_per_cta)
 
-            cute.arch.sync_threads()
+            if all_rows_unique == Int32(0):
+                cute.arch.sync_threads()
             pair_idx += Int32(gdim_z)
 
         self._resident_grid_barrier(
@@ -943,16 +975,26 @@ class MoEMicroKernel:
             current_work_linear_idx = Int32(bidz)
             current_local_expert_idx = Int32(0)
             accum_tile_m = Int32(0)
-            tile_coord, is_valid_tile, current_local_expert_idx, accum_tile_m = _compact_static_get_work_tile(
-                row_counts,
-                active_expert_count,
-                num_tiles_n=Int32(self.output_tile_count_n),
-                cluster_shape_mn=cluster_shape_mn,
-                current_work_linear_idx=current_work_linear_idx,
-                current_local_expert_idx=current_local_expert_idx,
-                accum_tile_m=accum_tile_m,
-                cta_id_in_cluster=cta_id_in_cluster,
-            )
+            tile_coord = (Int32(0), Int32(0), Int32(0))
+            is_valid_tile = Int32(0) < Int32(0)
+            if all_rows_unique > Int32(0):
+                tile_coord, is_valid_tile = _compact_unique_get_work_tile(
+                    num_active_experts=num_active_experts,
+                    num_tiles_n=Int32(self.output_tile_count_n),
+                    current_work_linear_idx=current_work_linear_idx,
+                    cta_id_in_cluster=cta_id_in_cluster,
+                )
+            else:
+                tile_coord, is_valid_tile, current_local_expert_idx, accum_tile_m = _compact_static_get_work_tile(
+                    row_counts,
+                    active_expert_count,
+                    num_tiles_n=Int32(self.output_tile_count_n),
+                    cluster_shape_mn=cluster_shape_mn,
+                    current_work_linear_idx=current_work_linear_idx,
+                    current_local_expert_idx=current_local_expert_idx,
+                    accum_tile_m=accum_tile_m,
+                    cta_id_in_cluster=cta_id_in_cluster,
+                )
 
             while is_valid_tile:
                 # tile_coord = (m_tile, intermediate_slice, local_expert_idx)
@@ -960,6 +1002,8 @@ class MoEMicroKernel:
                 weight_expert_idx = weight_expert_ids[local_expert_idx]
                 alpha_value = alpha[weight_expert_idx].to(cutlass.Float32)
                 valid_rows = row_counts[local_expert_idx]
+                if all_rows_unique > Int32(0):
+                    valid_rows = Int32(1)
                 tile_m_base = tile_coord[0] * Int32(self.tile_shape_mnk[0])
                 intermediate_slice = tile_coord[1]
                 valid_tile_rows = valid_rows - tile_m_base
@@ -969,15 +1013,16 @@ class MoEMicroKernel:
                     valid_tile_rows = Int32(0)
 
                 cache_row = Int32(tidx)
-                if cache_row < Int32(_COMPACT_STATIC_TILE_M):
-                    tok = Int32(0)
-                    wv = cutlass.Float32(0.0)
-                    if cache_row < valid_tile_rows:
-                        tok = token_map[local_expert_idx, tile_m_base + cache_row].to(Int32)
-                        wv = token_weights[local_expert_idx, tile_m_base + cache_row].to(cutlass.Float32)
-                    _st_shared_i32(scatter_tok_base_addr + cache_row * Int32(4), tok)
-                    _st_shared_f32(scatter_weight_base_addr + cache_row * Int32(4), wv)
-                self.epilog_sync_barrier.arrive_and_wait()
+                if all_rows_unique == Int32(0):
+                    if cache_row < Int32(_COMPACT_STATIC_TILE_M):
+                        tok = Int32(0)
+                        wv = cutlass.Float32(0.0)
+                        if cache_row < valid_tile_rows:
+                            tok = token_map[local_expert_idx, tile_m_base + cache_row].to(Int32)
+                            wv = token_weights[local_expert_idx, tile_m_base + cache_row].to(cutlass.Float32)
+                        _st_shared_i32(scatter_tok_base_addr + cache_row * Int32(4), tok)
+                        _st_shared_f32(scatter_weight_base_addr + cache_row * Int32(4), wv)
+                    self.epilog_sync_barrier.arrive_and_wait()
 
                 _is_m_major = self.c_layout.is_m_major_c()
                 copy_atom_r2s = cute.make_copy_atom(
@@ -1005,6 +1050,11 @@ class MoEMicroKernel:
 
                 down_alpha_value = down_alpha[weight_expert_idx].to(cutlass.Float32)
                 down_acc = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
+                unique_tok = Int32(0)
+                unique_wv = cutlass.Float32(0.0)
+                if all_rows_unique > Int32(0):
+                    unique_tok = local_expert_idx // num_topk
+                    unique_wv = topk_weights[local_expert_idx].to(cutlass.Float32)
 
                 epi_rest_m = self.tile_shape_mnk[0] // self.epi_tile[0]
                 MmaMPerEpiM = self.epi_tile[0] // mma_tile_m
@@ -1364,8 +1414,12 @@ class MoEMicroKernel:
                             tok = Int32(0)
                             wv = cutlass.Float32(0.0)
                             if lane_id == Int32(0):
-                                tok = _ld_shared_i32(scatter_tok_base_addr + cached_row * Int32(4))
-                                wv = _ld_shared_f32(scatter_weight_base_addr + cached_row * Int32(4))
+                                if all_rows_unique > Int32(0):
+                                    tok = unique_tok
+                                    wv = unique_wv
+                                else:
+                                    tok = _ld_shared_i32(scatter_tok_base_addr + cached_row * Int32(4))
+                                    wv = _ld_shared_f32(scatter_weight_base_addr + cached_row * Int32(4))
                             tok = cute.arch.shuffle_sync(tok, Int32(0))
                             wv = cute.arch.shuffle_sync(wv, Int32(0))
                             sc_v0 = cutlass.Float32(
@@ -1391,16 +1445,24 @@ class MoEMicroKernel:
                 self.pass_sync_barrier.arrive_and_wait()
 
                 current_work_linear_idx += num_persistent_clusters
-                tile_coord, is_valid_tile, current_local_expert_idx, accum_tile_m = _compact_static_get_work_tile(
-                    row_counts,
-                    active_expert_count,
-                    num_tiles_n=Int32(self.output_tile_count_n),
-                    cluster_shape_mn=cluster_shape_mn,
-                    current_work_linear_idx=current_work_linear_idx,
-                    current_local_expert_idx=current_local_expert_idx,
-                    accum_tile_m=accum_tile_m,
-                    cta_id_in_cluster=cta_id_in_cluster,
-                )
+                if all_rows_unique > Int32(0):
+                    tile_coord, is_valid_tile = _compact_unique_get_work_tile(
+                        num_active_experts=num_active_experts,
+                        num_tiles_n=Int32(self.output_tile_count_n),
+                        current_work_linear_idx=current_work_linear_idx,
+                        cta_id_in_cluster=cta_id_in_cluster,
+                    )
+                else:
+                    tile_coord, is_valid_tile, current_local_expert_idx, accum_tile_m = _compact_static_get_work_tile(
+                        row_counts,
+                        active_expert_count,
+                        num_tiles_n=Int32(self.output_tile_count_n),
+                        cluster_shape_mn=cluster_shape_mn,
+                        current_work_linear_idx=current_work_linear_idx,
+                        current_local_expert_idx=current_local_expert_idx,
+                        accum_tile_m=accum_tile_m,
+                        cta_id_in_cluster=cta_id_in_cluster,
+                    )
 
         # ===================================================================
         # DMA WARP (warp 4)
@@ -1421,16 +1483,26 @@ class MoEMicroKernel:
             current_work_linear_idx = Int32(bidz)
             current_local_expert_idx = Int32(0)
             accum_tile_m = Int32(0)
-            tile_coord, is_valid_tile, current_local_expert_idx, accum_tile_m = _compact_static_get_work_tile(
-                row_counts,
-                active_expert_count,
-                num_tiles_n=Int32(self.output_tile_count_n),
-                cluster_shape_mn=cluster_shape_mn,
-                current_work_linear_idx=current_work_linear_idx,
-                current_local_expert_idx=current_local_expert_idx,
-                accum_tile_m=accum_tile_m,
-                cta_id_in_cluster=cta_id_in_cluster,
-            )
+            tile_coord = (Int32(0), Int32(0), Int32(0))
+            is_valid_tile = Int32(0) < Int32(0)
+            if all_rows_unique > Int32(0):
+                tile_coord, is_valid_tile = _compact_unique_get_work_tile(
+                    num_active_experts=num_active_experts,
+                    num_tiles_n=Int32(self.output_tile_count_n),
+                    current_work_linear_idx=current_work_linear_idx,
+                    cta_id_in_cluster=cta_id_in_cluster,
+                )
+            else:
+                tile_coord, is_valid_tile, current_local_expert_idx, accum_tile_m = _compact_static_get_work_tile(
+                    row_counts,
+                    active_expert_count,
+                    num_tiles_n=Int32(self.output_tile_count_n),
+                    cluster_shape_mn=cluster_shape_mn,
+                    current_work_linear_idx=current_work_linear_idx,
+                    current_local_expert_idx=current_local_expert_idx,
+                    accum_tile_m=accum_tile_m,
+                    cta_id_in_cluster=cta_id_in_cluster,
+                )
 
             while is_valid_tile:
                 tc = tile_coord
@@ -1493,16 +1565,24 @@ class MoEMicroKernel:
                 self.pass_sync_barrier.arrive_and_wait()
 
                 current_work_linear_idx += num_persistent_clusters
-                tile_coord, is_valid_tile, current_local_expert_idx, accum_tile_m = _compact_static_get_work_tile(
-                    row_counts,
-                    active_expert_count,
-                    num_tiles_n=Int32(self.output_tile_count_n),
-                    cluster_shape_mn=cluster_shape_mn,
-                    current_work_linear_idx=current_work_linear_idx,
-                    current_local_expert_idx=current_local_expert_idx,
-                    accum_tile_m=accum_tile_m,
-                    cta_id_in_cluster=cta_id_in_cluster,
-                )
+                if all_rows_unique > Int32(0):
+                    tile_coord, is_valid_tile = _compact_unique_get_work_tile(
+                        num_active_experts=num_active_experts,
+                        num_tiles_n=Int32(self.output_tile_count_n),
+                        current_work_linear_idx=current_work_linear_idx,
+                        cta_id_in_cluster=cta_id_in_cluster,
+                    )
+                else:
+                    tile_coord, is_valid_tile, current_local_expert_idx, accum_tile_m = _compact_static_get_work_tile(
+                        row_counts,
+                        active_expert_count,
+                        num_tiles_n=Int32(self.output_tile_count_n),
+                        cluster_shape_mn=cluster_shape_mn,
+                        current_work_linear_idx=current_work_linear_idx,
+                        current_local_expert_idx=current_local_expert_idx,
+                        accum_tile_m=accum_tile_m,
+                        cta_id_in_cluster=cta_id_in_cluster,
+                    )
 
             ml_pipeline.producer_tail(prod_state)
             up_pipeline.producer_tail(up_prod_state)

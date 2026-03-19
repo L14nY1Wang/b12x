@@ -1288,6 +1288,12 @@ def _launch_compact_static(
         # resident clusters avoids idle CTA participation in the barrier phases.
         static_mac = min(_get_impl_mac("static"), 64)
     if use_micro:
+        # Micro work can cover at most one m-tile per routed pair and one
+        # FC2 output tile per N tile. Launching more persistent CTAs than that
+        # upper bound only creates idle clusters that sit through the grid
+        # barriers without owning useful work.
+        micro_work_tiles = max(1, routed_rows * max(1, (n + 128 - 1) // 128))
+        micro_mac = min(_get_impl_mac("static"), micro_work_tiles)
         compact_ids = workspace.compact_topk_ids[: flat_ids.numel()]
         triton_compact_topk_ids(
             flat_ids,
@@ -1300,6 +1306,7 @@ def _launch_compact_static(
             topk_ids_dtype=torch.int32,
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
+            mac_override=micro_mac,
         )
         launch_ids = compact_ids
     else:
