@@ -196,6 +196,35 @@ def _ld_shared_i32(addr, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _st_shared_f32(addr, val, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [
+            Int32(addr).ir_value(loc=loc, ip=ip),
+            cutlass.Float32(val).ir_value(loc=loc, ip=ip),
+        ],
+        "st.shared.f32 [$0], $1;",
+        "r,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def _ld_shared_f32(addr, *, loc=None, ip=None):
+    return cutlass.Float32(llvm.inline_asm(
+        T.f32(),
+        [Int32(addr).ir_value(loc=loc, ip=ip)],
+        "ld.shared.f32 $0, [$1];",
+        "=f,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    ))
+
+
+@dsl_user_op
 def _ld_global_u64(addr, *, loc=None, ip=None):
     return Uint64(llvm.inline_asm(
         T.i64(),
@@ -590,6 +619,8 @@ class MoEStaticKernel:
             pipeline_array: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
             up_pipeline_array: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
             phase2_pipeline_array: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
+            scatter_tok_cache: cute.struct.MemRange[cutlass.Int32, _COMPACT_STATIC_TILE_M]
+            scatter_weight_cache: cute.struct.MemRange[cutlass.Float32, _COMPACT_STATIC_TILE_M]
             sA: cute.struct.Align[
                 cute.struct.MemRange[self.a_dtype, cute.cosize(a_smem_staged)],
                 self.buffer_align_bytes,
@@ -668,6 +699,8 @@ class MoEStaticKernel:
         )
         sfa_base_addr = shared_ptr_to_u32(storage.sSFA.data_ptr())
         ctrl_base_addr = shared_ptr_to_u32(storage.ctrl.data_ptr())
+        scatter_tok_base_addr = shared_ptr_to_u32(storage.scatter_tok_cache.data_ptr())
+        scatter_weight_base_addr = shared_ptr_to_u32(storage.scatter_weight_cache.data_ptr())
 
         num_tokens = Int32(a_input.shape[0])
         cols = Int32(a_input.shape[1])
@@ -957,6 +990,22 @@ class MoEStaticKernel:
                 valid_rows = row_counts[local_expert_idx]
                 tile_m_base = tile_coord[0] * Int32(self.tile_shape_mnk[0])
                 intermediate_slice = tile_coord[1]
+                valid_tile_rows = valid_rows - tile_m_base
+                if valid_tile_rows > Int32(_COMPACT_STATIC_TILE_M):
+                    valid_tile_rows = Int32(_COMPACT_STATIC_TILE_M)
+                if valid_tile_rows < Int32(0):
+                    valid_tile_rows = Int32(0)
+
+                cache_row = Int32(tidx)
+                if cache_row < Int32(_COMPACT_STATIC_TILE_M):
+                    tok = Int32(0)
+                    wv = cutlass.Float32(0.0)
+                    if cache_row < valid_tile_rows:
+                        tok = token_map[local_expert_idx, tile_m_base + cache_row].to(Int32)
+                        wv = token_weights[local_expert_idx, tile_m_base + cache_row].to(cutlass.Float32)
+                    _st_shared_i32(scatter_tok_base_addr + cache_row * Int32(4), tok)
+                    _st_shared_f32(scatter_weight_base_addr + cache_row * Int32(4), wv)
+                self.epilog_sync_barrier.arrive_and_wait()
 
                 _is_m_major = self.c_layout.is_m_major_c()
                 copy_atom_r2s = cute.make_copy_atom(
@@ -1338,12 +1387,13 @@ class MoEStaticKernel:
                             local_pair_col = pair_idx & Int32(31)  # % 32
                             global_row = tile_m_base + rows_offset + warp_m_base + local_row
                             global_col = tile_n_base_cur + warp_n_base + local_pair_col * Int32(2)
+                            cached_row = rows_offset + warp_m_base + local_row
                             # Only lane 0 loads tok/wv from gmem; broadcast via shuffle.
                             tok = Int32(0)
                             wv = cutlass.Float32(0.0)
                             if lane_id == Int32(0):
-                                tok = token_map[local_expert_idx, global_row].to(Int32)
-                                wv = token_weights[local_expert_idx, global_row].to(cutlass.Float32)
+                                tok = _ld_shared_i32(scatter_tok_base_addr + cached_row * Int32(4))
+                                wv = _ld_shared_f32(scatter_weight_base_addr + cached_row * Int32(4))
                             tok = cute.arch.shuffle_sync(tok, Int32(0))
                             wv = cute.arch.shuffle_sync(wv, Int32(0))
                             sc_v0 = cutlass.Float32(
