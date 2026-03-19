@@ -5,6 +5,7 @@ import torch
 
 from b12x.attention.reference import paged_attention_reference
 from b12x.integration.attention import (
+    allocate_paged_attention_workspace_pool,
     allocate_paged_attention_workspace_for_plan,
     b12x_paged_attention_forward,
     choose_paged_attention_num_splits,
@@ -156,6 +157,77 @@ def test_paged_plan_exposes_logical_gqa_dimensions() -> None:
     assert plan.seqlen_k_static == page_size * page_table.shape[1]
     assert plan.logical_q_rows_static == sum(q_seqlens) * 8
     assert plan.logical_total_q_rows == sum(q_seqlens) * 8
+
+
+def test_paged_workspace_pool_reuses_plan_exact_shape() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
+        q_seqlens=[6, 5, 7, 4],
+        cache_seqlens=[97, 81, 113, 68],
+        page_size=64,
+        seed=41,
+    )
+    plan = create_paged_attention_plan(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        causal=True,
+    )
+    pool = allocate_paged_attention_workspace_pool()
+
+    out0, lse0 = b12x_paged_attention_forward(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        workspace=pool,
+        plan=plan,
+    )
+    out1, lse1 = b12x_paged_attention_forward(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        workspace=pool,
+        plan=plan,
+    )
+
+    assert out0.data_ptr() == out1.data_ptr()
+    assert lse0.data_ptr() == lse1.data_ptr()
+    assert len(pool.workspaces) == 1
+
+
+def test_paged_workspace_pool_requires_explicit_plan() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
+        q_seqlens=[6, 5, 7, 4],
+        cache_seqlens=[97, 81, 113, 68],
+        page_size=64,
+        seed=43,
+    )
+    pool = allocate_paged_attention_workspace_pool()
+
+    with pytest.raises(TypeError, match="require an explicit PagedAttentionPlan"):
+        b12x_paged_attention_forward(
+            q,
+            k_cache,
+            v_cache,
+            page_table,
+            cache_seqlens,
+            cu_seqlens_q,
+            workspace=pool,
+        )
 
 
 def test_exact_paged_workspace_rejects_shape_mismatch() -> None:

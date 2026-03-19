@@ -5,6 +5,7 @@ import torch
 
 from b12x.attention.reference import attention_reference
 from b12x.integration.attention import (
+    allocate_attention_workspace_pool,
     allocate_attention_workspace_for_plan,
     b12x_attention_forward,
     clear_attention_caches,
@@ -68,6 +69,33 @@ def test_contiguous_plan_exposes_logical_gqa_dimensions() -> None:
     assert plan.seqlen_k_static == 48
     assert plan.logical_q_rows_static == 48 * 8
     assert plan.logical_total_q_rows == 2 * 48 * 8
+
+
+def test_contiguous_workspace_pool_reuses_plan_exact_shape() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    q, k, v = _make_gqa_inputs((1, 48, 8, 256), kv_heads=1, seed=31)
+    plan = create_attention_plan(q, k, v, causal=True)
+    pool = allocate_attention_workspace_pool()
+
+    out0, lse0 = b12x_attention_forward(q, k, v, workspace=pool, plan=plan)
+    out1, lse1 = b12x_attention_forward(q, k, v, workspace=pool, plan=plan)
+
+    assert out0.data_ptr() == out1.data_ptr()
+    assert lse0.data_ptr() == lse1.data_ptr()
+    assert len(pool.workspaces) == 1
+
+
+def test_contiguous_workspace_pool_requires_explicit_plan() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    q, k, v = _make_gqa_inputs((1, 48, 8, 256), kv_heads=1, seed=37)
+    pool = allocate_attention_workspace_pool()
+
+    with pytest.raises(TypeError, match="require an explicit AttentionPlan"):
+        b12x_attention_forward(q, k, v, workspace=pool)
 
 
 def test_right_aligned_causal_multi_tile_shape_matches_reference() -> None:

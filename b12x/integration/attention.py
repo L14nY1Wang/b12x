@@ -540,6 +540,28 @@ class PagedAttentionWorkspace:
     plan_key: PagedAttentionPlanKey | None = None
 
 
+@dataclass
+class AttentionWorkspacePool:
+    """Caller-owned exact-shape workspace cache partitioned by CUDA stream."""
+
+    workspaces: dict[tuple[int, AttentionPlanKey], AttentionWorkspace] = field(default_factory=dict)
+
+    def clear(self) -> None:
+        self.workspaces.clear()
+
+
+@dataclass
+class PagedAttentionWorkspacePool:
+    """Caller-owned exact-shape paged workspace cache partitioned by CUDA stream."""
+
+    workspaces: dict[tuple[int, PagedAttentionPlanKey], PagedAttentionWorkspace] = field(
+        default_factory=dict
+    )
+
+    def clear(self) -> None:
+        self.workspaces.clear()
+
+
 class _AttentionForwardLaunch:
     def __init__(
         self,
@@ -1265,6 +1287,58 @@ def allocate_paged_attention_workspace_for_plan(plan: PagedAttentionPlan) -> Pag
     )
 
 
+def allocate_attention_workspace_pool() -> AttentionWorkspacePool:
+    """Allocate an explicit caller-owned workspace pool for contiguous attention."""
+    return AttentionWorkspacePool()
+
+
+def allocate_paged_attention_workspace_pool() -> PagedAttentionWorkspacePool:
+    """Allocate an explicit caller-owned workspace pool for paged attention."""
+    return PagedAttentionWorkspacePool()
+
+
+def _resolve_attention_workspace(
+    workspace: AttentionWorkspace | AttentionWorkspacePool,
+    *,
+    plan: AttentionPlan,
+) -> AttentionWorkspace:
+    if isinstance(workspace, AttentionWorkspace):
+        _validate_workspace(workspace, plan=plan)
+        return workspace
+    if not isinstance(workspace, AttentionWorkspacePool):
+        raise TypeError("workspace must be an AttentionWorkspace or AttentionWorkspacePool")
+
+    stream_key = int(torch.cuda.current_stream(plan.device).cuda_stream)
+    key = (stream_key, plan.key)
+    resolved = workspace.workspaces.get(key)
+    if resolved is None:
+        resolved = allocate_attention_workspace_for_plan(plan)
+        workspace.workspaces[key] = resolved
+    return resolved
+
+
+def _resolve_paged_attention_workspace(
+    workspace: PagedAttentionWorkspace | PagedAttentionWorkspacePool,
+    *,
+    plan: PagedAttentionPlan,
+) -> PagedAttentionWorkspace:
+    if isinstance(workspace, PagedAttentionWorkspace):
+        _validate_paged_workspace(workspace, plan=plan)
+        return workspace
+    if not isinstance(workspace, PagedAttentionWorkspacePool):
+        raise TypeError(
+            "workspace must be a PagedAttentionWorkspace or PagedAttentionWorkspacePool"
+        )
+
+    stream_key = int(torch.cuda.current_stream(plan.device).cuda_stream)
+    key = (stream_key, plan.key)
+    resolved = workspace.workspaces.get(key)
+    if resolved is None:
+        resolved = allocate_paged_attention_workspace_for_plan(plan)
+        workspace.workspaces[key] = resolved
+    return resolved
+
+
 def create_attention_plan(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1452,22 +1526,27 @@ def b12x_attention_forward(
     k: torch.Tensor,
     v: torch.Tensor,
     *,
-    workspace: AttentionWorkspace,
+    workspace: AttentionWorkspace | AttentionWorkspacePool,
     plan: AttentionPlan | None = None,
     softmax_scale: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Execute contiguous self-attention using the transplanted SM120 kernel."""
     q_shape, k_shape, v_shape, device, dtype = _validate_forward_inputs(q, k, v)
-    resolved_plan = plan or _get_attention_plan(
-        q_shape,
-        k_shape,
-        v_shape,
-        _cuda_device_index(workspace.device),
-        workspace.dtype,
-        workspace.causal,
-        workspace.tile_m,
-        workspace.tile_n,
-    )
+    if plan is None:
+        if isinstance(workspace, AttentionWorkspacePool):
+            raise TypeError("workspace pools require an explicit AttentionPlan")
+        resolved_plan = _get_attention_plan(
+            q_shape,
+            k_shape,
+            v_shape,
+            _cuda_device_index(workspace.device),
+            workspace.dtype,
+            workspace.causal,
+            workspace.tile_m,
+            workspace.tile_n,
+        )
+    else:
+        resolved_plan = plan
     _validate_attention_inputs_against_plan(
         q_shape=q_shape,
         k_shape=k_shape,
@@ -1476,10 +1555,7 @@ def b12x_attention_forward(
         dtype=dtype,
         plan=resolved_plan,
     )
-    _validate_workspace(
-        workspace,
-        plan=resolved_plan,
-    )
+    resolved_workspace = _resolve_attention_workspace(workspace, plan=resolved_plan)
     _, seqlen_q, _, head_dim = _seq_dims(q_shape)
     _, seqlen_k, _, _ = _seq_dims(k_shape)
     if seqlen_q == 1 and seqlen_k == 1:
@@ -1496,15 +1572,20 @@ def b12x_attention_forward(
         make_ptr(resolved_plan.cutlass_dtype, v.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
         make_ptr(
             resolved_plan.cutlass_dtype,
-            workspace.output.data_ptr(),
+            resolved_workspace.output.data_ptr(),
             cute.AddressSpace.gmem,
             assumed_align=16,
         ),
-        make_ptr(cutlass.Float32, workspace.lse.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
+        make_ptr(
+            cutlass.Float32,
+            resolved_workspace.lse.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=4,
+        ),
         float(softmax_scale),
         current_cuda_stream(),
     )
-    return workspace.output, workspace.lse
+    return resolved_workspace.output, resolved_workspace.lse
 
 
 def b12x_paged_attention_forward(
@@ -1515,7 +1596,7 @@ def b12x_paged_attention_forward(
     cache_seqlens: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     *,
-    workspace: PagedAttentionWorkspace,
+    workspace: PagedAttentionWorkspace | PagedAttentionWorkspacePool,
     plan: PagedAttentionPlan | None = None,
     softmax_scale: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1536,20 +1617,25 @@ def b12x_paged_attention_forward(
         cache_seqlens,
         cu_seqlens_q,
     )
-    resolved_plan = plan or _get_paged_attention_plan(
-        q_shape,
-        workspace.k_cache_shape,
-        workspace.v_cache_shape,
-        workspace.page_table_shape,
-        tuple(int(dim) for dim in cache_seqlens.shape),
-        tuple(int(dim) for dim in cu_seqlens_q.shape),
-        _cuda_device_index(workspace.device),
-        workspace.dtype,
-        workspace.causal,
-        workspace.tile_m,
-        workspace.tile_n,
-        workspace.num_splits,
-    )
+    if plan is None:
+        if isinstance(workspace, PagedAttentionWorkspacePool):
+            raise TypeError("workspace pools require an explicit PagedAttentionPlan")
+        resolved_plan = _get_paged_attention_plan(
+            q_shape,
+            workspace.k_cache_shape,
+            workspace.v_cache_shape,
+            workspace.page_table_shape,
+            tuple(int(dim) for dim in cache_seqlens.shape),
+            tuple(int(dim) for dim in cu_seqlens_q.shape),
+            _cuda_device_index(workspace.device),
+            workspace.dtype,
+            workspace.causal,
+            workspace.tile_m,
+            workspace.tile_n,
+            workspace.num_splits,
+        )
+    else:
+        resolved_plan = plan
     _validate_paged_inputs_against_plan(
         q_shape=q_shape,
         k_cache_shape=k_cache_shape,
@@ -1561,19 +1647,23 @@ def b12x_paged_attention_forward(
         dtype=dtype,
         plan=resolved_plan,
     )
-    _validate_paged_workspace(
-        workspace,
-        plan=resolved_plan,
-    )
-    if workspace.tile_n != page_size:
+    resolved_workspace = _resolve_paged_attention_workspace(workspace, plan=resolved_plan)
+    if resolved_workspace.tile_n != page_size:
         raise ValueError(
-            f"paged workspace tile_n must match page_size, got tile_n={workspace.tile_n}, page_size={page_size}"
+            "paged workspace tile_n must match page_size, got "
+            f"tile_n={resolved_workspace.tile_n}, page_size={page_size}"
         )
     if softmax_scale is None:
         softmax_scale = q_shape[2] ** -0.5
 
-    kernel_output = workspace.output if workspace.num_splits == 1 else workspace.split_output
-    kernel_lse = workspace.lse if workspace.num_splits == 1 else workspace.split_lse
+    kernel_output = (
+        resolved_workspace.output
+        if resolved_workspace.num_splits == 1
+        else resolved_workspace.split_output
+    )
+    kernel_lse = (
+        resolved_workspace.lse if resolved_workspace.num_splits == 1 else resolved_workspace.split_lse
+    )
     assert kernel_output is not None
     assert kernel_lse is not None
     resolved_plan.compiled(
@@ -1593,21 +1683,25 @@ def b12x_paged_attention_forward(
         float(softmax_scale),
         current_cuda_stream(),
     )
-    if workspace.num_splits > 1:
-        _combine_split_partials(workspace, plan=resolved_plan)
-    return workspace.output, workspace.lse.transpose(0, 1)
+    if resolved_workspace.num_splits > 1:
+        _combine_split_partials(resolved_workspace, plan=resolved_plan)
+    return resolved_workspace.output, resolved_workspace.lse.transpose(0, 1)
 
 
 __all__ = [
     "AttentionPlan",
     "AttentionPlanKey",
     "AttentionWorkspace",
+    "AttentionWorkspacePool",
     "PagedAttentionPlan",
     "PagedAttentionPlanKey",
     "PagedAttentionWorkspace",
+    "PagedAttentionWorkspacePool",
     "allocate_attention_workspace",
+    "allocate_attention_workspace_pool",
     "allocate_attention_workspace_for_plan",
     "allocate_paged_attention_workspace",
+    "allocate_paged_attention_workspace_pool",
     "allocate_paged_attention_workspace_for_plan",
     "b12x_attention_forward",
     "b12x_paged_attention_forward",
