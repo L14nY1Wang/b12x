@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import operator
+import math
 from typing import Type
 
 import cuda.bindings.driver as cuda
@@ -140,31 +140,39 @@ class PagedAttentionCombineKernel:
         row_idx, head_idx, k_block = cute.arch.block_idx()
         k_idx = k_block * self.tile_k + lane
 
-        lane_active = lane < self.num_splits
-        split_lse = -Float32.inf
-        if lane_active:
-            split_lse = mLSE_partial[lane, head_idx, row_idx]
-
-        lse_max = utils.warp_reduce(split_lse, utils.fmax)
-        lse_max_cur = 0.0 if lse_max == -Float32.inf else lse_max
-        split_weight = Float32.zero
-        if lane_active:
-            split_weight = cute.math.exp2(
-                (split_lse - lse_max_cur) * utils.LOG2_E,
-                fastmath=True,
-            )
-        lse_sum = utils.warp_reduce(split_weight, operator.add)
+        lse_max = -Float32.inf
+        lse_sum = Float32.zero
         final_lse = -Float32.inf
-        if lse_sum != 0.0:
-            split_weight *= 1.0 / lse_sum
-            final_lse = cute.math.log(lse_sum, fastmath=True) + lse_max_cur
+        split_weight = cute.make_rmem_tensor((self.num_splits,), Float32)
 
+        if lane == 0:
+            for split_idx in cutlass.range_constexpr(self.num_splits):
+                lse_val = mLSE_partial[split_idx, head_idx, row_idx]
+                lse_max = max(lse_max, lse_val)
+            lse_max_cur = 0.0 if lse_max == -Float32.inf else lse_max
+            for split_idx in cutlass.range_constexpr(self.num_splits):
+                lse_val = mLSE_partial[split_idx, head_idx, row_idx]
+                weight = cute.math.exp2(
+                    (lse_val - lse_max_cur) * utils.LOG2_E,
+                    fastmath=True,
+                )
+                split_weight[split_idx] = weight
+                lse_sum += weight
+            if lse_sum == 0.0:
+                final_lse = -Float32.inf
+            else:
+                inv_lse_sum = 1.0 / lse_sum
+                for split_idx in cutlass.range_constexpr(self.num_splits):
+                    split_weight[split_idx] *= inv_lse_sum
+                final_lse = cute.math.log(lse_sum, fastmath=True) + lse_max_cur
+
+        final_lse = cute.arch.shuffle_sync(final_lse, Int32(0))
         if k_block == 0 and lane == 0:
             mLSE[head_idx, row_idx] = final_lse
 
         accum = Float32.zero
         if k_idx < self.head_dim:
             for split_idx in cutlass.range_constexpr(self.num_splits):
-                weight = cute.arch.shuffle_sync(split_weight, Int32(split_idx))
+                weight = cute.arch.shuffle_sync(split_weight[split_idx], Int32(0))
                 accum += weight * mO_partial[split_idx, row_idx, head_idx, k_idx].to(Float32)
             mO[row_idx, head_idx, k_idx] = accum.to(self.dtype)
