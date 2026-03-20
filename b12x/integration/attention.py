@@ -212,13 +212,12 @@ def _select_paged_kernel_config(
     if mode == "decode" and head_dim == 256 and (
         max_pages <= 4 or (kv_dtype == _FP8_KV_DTYPE and max_pages >= 128)
     ):
-        use_2stage = kv_dtype == _FP8_KV_DTYPE and max_pages >= 128
         return PagedKernelConfig(
             kernel_family="decode_micro",
             tile_m=tile_m,
             tile_n=tile_n,
             num_compute_warps=1,
-            num_stages=2 if use_2stage else 1,
+            num_stages=1,
             q_in_regs=True,
         )
     return PagedKernelConfig(
