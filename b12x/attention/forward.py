@@ -111,27 +111,13 @@ def convert_fp8_fragment_to_bf16(
     del transpose
     src_u8 = cute.flatten(cute.recast_tensor(src, cutlass.Uint8))
     src_u32 = cute.recast_tensor(src_u8, cutlass.Uint32)
-    src_u64 = cute.recast_tensor(src_u8, cutlass.Uint64)
     dst_u32 = cute.recast_tensor(dst, cutlass.Uint32)
     num_packed = cute.size(src_u32.shape)
-    num_pairs = num_packed // 2
-    shift32 = cutlass.Uint64(32)
-    mask32 = cutlass.Uint64(0xFFFFFFFF)
-    for i in cutlass.range_constexpr(num_pairs):
-        packed64 = src_u64[i]
-        packed_lo = cutlass.Uint32(packed64 & mask32)
-        packed_hi = cutlass.Uint32(packed64 >> shift32)
-        bf2_lo, bf2_hi = fp8x4_e4m3_to_bfloat2x2(packed_lo)
-        dst_u32[4 * i + 0] = bf2_lo
-        dst_u32[4 * i + 1] = bf2_hi
-        bf2_lo, bf2_hi = fp8x4_e4m3_to_bfloat2x2(packed_hi)
-        dst_u32[4 * i + 2] = bf2_lo
-        dst_u32[4 * i + 3] = bf2_hi
-    if const_expr(num_packed % 2 != 0):
-        packed = src_u32[num_packed - 1]
+    for i in cutlass.range_constexpr(num_packed):
+        packed = src_u32[i]
         bf2_lo, bf2_hi = fp8x4_e4m3_to_bfloat2x2(packed)
-        dst_u32[2 * (num_packed - 1) + 0] = bf2_lo
-        dst_u32[2 * (num_packed - 1) + 1] = bf2_hi
+        dst_u32[2 * i + 0] = bf2_lo
+        dst_u32[2 * i + 1] = bf2_hi
 
 
 @cute.jit
