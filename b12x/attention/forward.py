@@ -1286,20 +1286,26 @@ class SM120ForwardKernel:
         acc_S = cute.make_fragment(acc_shape_S, Float32)
         acc_S.fill(0.0)
         if const_expr(self.kv_is_fp8):
-            warp_mma_gemm_fp8(
+            self.dequant_fp8_stage_shared(
+                sKRaw,
+                sK,
+                mFp8Lut,
+                kv_consumer_state.index if const_expr(self.num_stages > 1) else 0,
+                self.tile_hdim,
+                tidx,
+            )
+            warp_mma_gemm(
                 thr_mma_qk,
                 acc_S,
                 tSrQ,
                 tSrK,
-                tSrKRaw,
                 tSsQ,
-                tSsKRaw[
+                tSsK[
                     None, None, None, kv_consumer_state.index if const_expr(self.num_stages > 1) else 0
                 ],
                 smem_thr_copy_Q,
-                smem_thr_copy_KRaw,
+                smem_thr_copy_K,
                 A_in_regs=self.Q_in_regs,
-                transpose=False,
             )
         else:
             warp_mma_gemm(
@@ -1327,17 +1333,23 @@ class SM120ForwardKernel:
 
         pipeline_v.consumer_wait(kv_consumer_state, pipeline_v.consumer_try_wait(kv_consumer_state))
         if const_expr(self.kv_is_fp8):
-            warp_mma_gemm_rs_fp8(
+            self.dequant_fp8_stage_shared(
+                sVRaw,
+                sV,
+                mFp8Lut,
+                kv_consumer_state.index if const_expr(self.num_stages > 1) else 0,
+                self.tile_hdimv,
+                tidx,
+            )
+            warp_mma_gemm_rs(
                 thr_mma_pv,
                 acc_O,
                 tOrP,
                 tOrVt,
-                tOrVtRaw,
-                tOsVtRaw[
+                tOsVt[
                     None, None, None, kv_consumer_state.index if const_expr(self.num_stages > 1) else 0
                 ],
-                smem_thr_copy_VRaw,
-                transpose=True,
+                smem_thr_copy_V,
             )
         else:
             warp_mma_gemm_rs(
