@@ -101,6 +101,87 @@ def warp_mma_gemm_rs(
         cute.gemm(tiled_mma, acc, tCrA[None, None, k], tCrB[None, None, k], acc)
 
 
+@cute.jit
+def convert_fp8_fragment_to_bf16(
+    dst: cute.Tensor,
+    src: cute.Tensor,
+    transpose: cutlass.Constexpr = False,
+):
+    src_u8 = cute.flatten(cute.recast_tensor(src, cutlass.Uint8))
+    dst_u32 = cute.recast_tensor(dst, cutlass.Uint32)
+    num_packed = cute.size(dst_u32.shape) // 2
+    for i in cutlass.range_constexpr(num_packed):
+        packed = (
+            cutlass.Uint32(src_u8[4 * i + 0])
+            | (cutlass.Uint32(src_u8[4 * i + 1]) << cutlass.Uint32(8))
+            | (cutlass.Uint32(src_u8[4 * i + 2]) << cutlass.Uint32(16))
+            | (cutlass.Uint32(src_u8[4 * i + 3]) << cutlass.Uint32(24))
+        )
+        bf2_lo, bf2_hi = fp8x4_e4m3_to_bfloat2x2(packed)
+        dst_u32[2 * i + 0] = bf2_lo
+        dst_u32[2 * i + 1] = bf2_hi
+
+
+@cute.jit
+def copy_flattened(src: cute.Tensor, dst: cute.Tensor):
+    src_flat = cute.flatten(src)
+    dst_flat = cute.flatten(dst)
+    for i in cutlass.range_constexpr(cute.size(dst_flat.shape)):
+        dst_flat[i] = src_flat[i]
+
+
+@cute.jit
+def warp_mma_gemm_fp8(
+    tiled_mma: cute.TiledMma,
+    acc: cute.Tensor,
+    tCrA: cute.Tensor,
+    tCrB: cute.Tensor,
+    tCrBRaw: cute.Tensor,
+    tCsA: cute.Tensor,
+    tCsBRaw: cute.Tensor,
+    smem_thr_copy_A: cute.TiledCopy,
+    smem_thr_copy_B_raw: cute.TiledCopy,
+    A_in_regs: cutlass.Constexpr = False,
+    transpose: cutlass.Constexpr = False,
+):
+    tCrA_copy_view = smem_thr_copy_A.retile(tCrA)
+    tCrB_raw_copy_view = smem_thr_copy_B_raw.retile(tCrBRaw)
+    if const_expr(not A_in_regs):
+        cute.copy(smem_thr_copy_A, tCsA[None, None, 0], tCrA_copy_view[None, None, 0])
+    copy_flattened(tCsBRaw[None, None, 0], tCrB_raw_copy_view[None, None, 0])
+    for k in cutlass.range_constexpr(cute.size(tCsA.shape[2])):
+        if k < cute.size(tCsA.shape[2]) - 1:
+            if const_expr(not A_in_regs):
+                cute.copy(
+                    smem_thr_copy_A,
+                    tCsA[None, None, k + 1],
+                    tCrA_copy_view[None, None, k + 1],
+                )
+            copy_flattened(tCsBRaw[None, None, k + 1], tCrB_raw_copy_view[None, None, k + 1])
+        convert_fp8_fragment_to_bf16(tCrB[None, None, k], tCrBRaw[None, None, k], transpose)
+        cute.gemm(tiled_mma, acc, tCrA[None, None, k], tCrB[None, None, k], acc)
+
+
+@cute.jit
+def warp_mma_gemm_rs_fp8(
+    tiled_mma: cute.TiledMma,
+    acc: cute.Tensor,
+    tCrA: cute.Tensor,
+    tCrB: cute.Tensor,
+    tCrBRaw: cute.Tensor,
+    tCsBRaw: cute.Tensor,
+    smem_thr_copy_B_raw: cute.TiledCopy,
+    transpose: cutlass.Constexpr = False,
+):
+    tCrB_raw_copy_view = smem_thr_copy_B_raw.retile(tCrBRaw)
+    copy_flattened(tCsBRaw[None, None, 0], tCrB_raw_copy_view[None, None, 0])
+    for k in cutlass.range_constexpr(cute.size(tCrA.shape[2])):
+        if const_expr(k < cute.size(tCrA.shape[2]) - 1):
+            copy_flattened(tCsBRaw[None, None, k + 1], tCrB_raw_copy_view[None, None, k + 1])
+        convert_fp8_fragment_to_bf16(tCrB[None, None, k], tCrBRaw[None, None, k], transpose)
+        cute.gemm(tiled_mma, acc, tCrA[None, None, k], tCrB[None, None, k], acc)
+
+
 class SM120ForwardKernel:
     arch = 120
 
@@ -1169,7 +1250,9 @@ class SM120ForwardKernel:
         thr_mma_pv: cute.TiledMma,
         tSrQ: cute.Tensor,
         tSrK: cute.Tensor,
+        tSrKRaw: Optional[cute.Tensor],
         tOrVt: cute.Tensor,
+        tOrVtRaw: Optional[cute.Tensor],
         acc_O: cute.Tensor,
         sK: cute.Tensor,
         sV: cute.Tensor,
@@ -1177,10 +1260,14 @@ class SM120ForwardKernel:
         sVRaw: Optional[cute.Tensor],
         smem_thr_copy_Q: cute.TiledCopy,
         smem_thr_copy_K: cute.TiledCopy,
+        smem_thr_copy_KRaw: Optional[cute.TiledCopy],
         smem_thr_copy_V: cute.TiledCopy,
+        smem_thr_copy_VRaw: Optional[cute.TiledCopy],
         tSsQ: cute.Tensor,
         tSsK: cute.Tensor,
+        tSsKRaw: Optional[cute.Tensor],
         tOsVt: cute.Tensor,
+        tOsVtRaw: Optional[cute.Tensor],
         pipeline_k: cutlass.pipeline.PipelineAsync,
         pipeline_v: cutlass.pipeline.PipelineAsync,
         softmax: Softmax,
@@ -1195,29 +1282,39 @@ class SM120ForwardKernel:
         is_first_n_block: cutlass.Constexpr = False,
     ):
         pipeline_k.consumer_wait(kv_consumer_state, pipeline_k.consumer_try_wait(kv_consumer_state))
-        if const_expr(self.kv_is_fp8):
-            self.dequant_fp8_stage_shared(
-                sKRaw,
-                sK,
-                mFp8Lut,
-                kv_consumer_state.index if const_expr(self.num_stages > 1) else 0,
-                self.tile_hdim,
-                cute.arch.thread_idx()[0],
-            )
         acc_shape_S = thr_mma_qk.partition_shape_C((self.tile_m, self.tile_n))
         acc_S = cute.make_fragment(acc_shape_S, Float32)
         acc_S.fill(0.0)
-        warp_mma_gemm(
-            thr_mma_qk,
-            acc_S,
-            tSrQ,
-            tSrK,
-            tSsQ,
-            tSsK[None, None, None, kv_consumer_state.index if const_expr(self.num_stages > 1) else 0],
-            smem_thr_copy_Q,
-            smem_thr_copy_K,
-            A_in_regs=self.Q_in_regs,
-        )
+        if const_expr(self.kv_is_fp8):
+            warp_mma_gemm_fp8(
+                thr_mma_qk,
+                acc_S,
+                tSrQ,
+                tSrK,
+                tSrKRaw,
+                tSsQ,
+                tSsKRaw[
+                    None, None, None, kv_consumer_state.index if const_expr(self.num_stages > 1) else 0
+                ],
+                smem_thr_copy_Q,
+                smem_thr_copy_KRaw,
+                A_in_regs=self.Q_in_regs,
+                transpose=False,
+            )
+        else:
+            warp_mma_gemm(
+                thr_mma_qk,
+                acc_S,
+                tSrQ,
+                tSrK,
+                tSsQ,
+                tSsK[
+                    None, None, None, kv_consumer_state.index if const_expr(self.num_stages > 1) else 0
+                ],
+                smem_thr_copy_Q,
+                smem_thr_copy_K,
+                A_in_regs=self.Q_in_regs,
+            )
         pipeline_k.consumer_release(kv_consumer_state)
 
         mask_fn(acc_S, n_block=n_block)
@@ -1230,24 +1327,29 @@ class SM120ForwardKernel:
 
         pipeline_v.consumer_wait(kv_consumer_state, pipeline_v.consumer_try_wait(kv_consumer_state))
         if const_expr(self.kv_is_fp8):
-            self.dequant_fp8_stage_shared(
-                sVRaw,
-                sV,
-                mFp8Lut,
-                kv_consumer_state.index if const_expr(self.num_stages > 1) else 0,
-                self.tile_hdimv,
-                cute.arch.thread_idx()[0],
+            warp_mma_gemm_rs_fp8(
+                thr_mma_pv,
+                acc_O,
+                tOrP,
+                tOrVt,
+                tOrVtRaw,
+                tOsVtRaw[
+                    None, None, None, kv_consumer_state.index if const_expr(self.num_stages > 1) else 0
+                ],
+                smem_thr_copy_VRaw,
+                transpose=True,
             )
-        warp_mma_gemm_rs(
-            thr_mma_pv,
-            acc_O,
-            tOrP,
-            tOrVt,
-            tOsVt[
-                None, None, None, kv_consumer_state.index if const_expr(self.num_stages > 1) else 0
-            ],
-            smem_thr_copy_V,
-        )
+        else:
+            warp_mma_gemm_rs(
+                thr_mma_pv,
+                acc_O,
+                tOrP,
+                tOrVt,
+                tOsVt[
+                    None, None, None, kv_consumer_state.index if const_expr(self.num_stages > 1) else 0
+                ],
+                smem_thr_copy_V,
+            )
         pipeline_v.consumer_release(kv_consumer_state)
         kv_consumer_state.advance()
         return kv_consumer_state
@@ -1288,7 +1390,22 @@ class SM120ForwardKernel:
         thr_mma_pv = tiled_mma_pv.get_slice(tidx)
         tSrQ = thr_mma_qk.make_fragment_A(thr_mma_qk.partition_A(sQ))
         tSrK = thr_mma_qk.make_fragment_B(thr_mma_qk.partition_B(sK[None, None, 0]))
+        sVtRaw = layout_utils.transpose_view(sVRaw) if const_expr(self.kv_is_fp8) else None
+        sKRawU8 = cute.recast_tensor(sKRaw, cutlass.Uint8) if const_expr(self.kv_is_fp8) else None
+        sVtRawU8 = (
+            cute.recast_tensor(sVtRaw, cutlass.Uint8) if const_expr(self.kv_is_fp8) else None
+        )
+        tSrKRaw = (
+            cute.make_fragment_like(cute.recast_tensor(tSrK, cutlass.Uint8), cutlass.Uint8)
+            if const_expr(self.kv_is_fp8)
+            else None
+        )
         tOrVt = thr_mma_pv.make_fragment_B(thr_mma_pv.partition_B(sVt[None, None, 0]))
+        tOrVtRaw = (
+            cute.make_fragment_like(cute.recast_tensor(tOrVt, cutlass.Uint8), cutlass.Uint8)
+            if const_expr(self.kv_is_fp8)
+            else None
+        )
         acc_shape_O = thr_mma_pv.partition_shape_C((self.tile_m, self.tile_hdimv))
         acc_O = cute.make_fragment(acc_shape_O, Float32)
 
@@ -1300,12 +1417,40 @@ class SM120ForwardKernel:
             warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4),
             self.dtype,
         )
+        smem_copy_atom_KRaw = (
+            cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(),
+                cutlass.Uint8,
+            )
+            if const_expr(self.kv_is_fp8)
+            else None
+        )
+        smem_copy_atom_VRaw = (
+            cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(),
+                cutlass.Uint8,
+            )
+            if const_expr(self.kv_is_fp8)
+            else None
+        )
         smem_thr_copy_Q = utils.make_tiled_copy_A(smem_copy_atom_QK, tiled_mma_qk).get_slice(tidx)
         smem_thr_copy_K = utils.make_tiled_copy_B(smem_copy_atom_QK, tiled_mma_qk).get_slice(tidx)
         smem_thr_copy_V = utils.make_tiled_copy_B(smem_copy_atom_V, tiled_mma_pv).get_slice(tidx)
+        smem_thr_copy_KRaw = (
+            utils.make_tiled_copy_B(smem_copy_atom_KRaw, tiled_mma_qk).get_slice(tidx)
+            if const_expr(self.kv_is_fp8)
+            else None
+        )
+        smem_thr_copy_VRaw = (
+            utils.make_tiled_copy_B(smem_copy_atom_VRaw, tiled_mma_pv).get_slice(tidx)
+            if const_expr(self.kv_is_fp8)
+            else None
+        )
         tSsQ = smem_thr_copy_Q.partition_S(sQ)
         tSsK = smem_thr_copy_K.partition_S(sK)
         tOsVt = smem_thr_copy_V.partition_S(sVt)
+        tSsKRaw = smem_thr_copy_KRaw.partition_S(sKRawU8) if const_expr(self.kv_is_fp8) else None
+        tOsVtRaw = smem_thr_copy_VRaw.partition_S(sVtRawU8) if const_expr(self.kv_is_fp8) else None
 
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
@@ -1372,7 +1517,9 @@ class SM120ForwardKernel:
                     thr_mma_pv,
                     tSrQ,
                     tSrK,
+                    tSrKRaw,
                     tOrVt,
+                    tOrVtRaw,
                     acc_O,
                     sK,
                     sV,
@@ -1380,10 +1527,14 @@ class SM120ForwardKernel:
                     sVRaw,
                     smem_thr_copy_Q,
                     smem_thr_copy_K,
+                    smem_thr_copy_KRaw,
                     smem_thr_copy_V,
+                    smem_thr_copy_VRaw,
                     tSsQ,
                     tSsK,
+                    tSsKRaw,
                     tOsVt,
+                    tOsVtRaw,
                     pipeline_k,
                     pipeline_v,
                     softmax,
@@ -1412,7 +1563,9 @@ class SM120ForwardKernel:
                             thr_mma_pv,
                             tSrQ,
                             tSrK,
+                            tSrKRaw,
                             tOrVt,
+                            tOrVtRaw,
                             acc_O,
                             sK,
                             sV,
@@ -1420,10 +1573,14 @@ class SM120ForwardKernel:
                             sVRaw,
                             smem_thr_copy_Q,
                             smem_thr_copy_K,
+                            smem_thr_copy_KRaw,
                             smem_thr_copy_V,
+                            smem_thr_copy_VRaw,
                             tSsQ,
                             tSsK,
+                            tSsKRaw,
                             tOsVt,
+                            tOsVtRaw,
                             pipeline_k,
                             pipeline_v,
                             softmax,
@@ -1448,7 +1605,9 @@ class SM120ForwardKernel:
                         thr_mma_pv,
                         tSrQ,
                         tSrK,
+                        tSrKRaw,
                         tOrVt,
+                        tOrVtRaw,
                         acc_O,
                         sK,
                         sV,
@@ -1456,10 +1615,14 @@ class SM120ForwardKernel:
                         sVRaw,
                         smem_thr_copy_Q,
                         smem_thr_copy_K,
+                        smem_thr_copy_KRaw,
                         smem_thr_copy_V,
+                        smem_thr_copy_VRaw,
                         tSsQ,
                         tSsK,
+                        tSsKRaw,
                         tOsVt,
+                        tOsVtRaw,
                         pipeline_k,
                         pipeline_v,
                         softmax,

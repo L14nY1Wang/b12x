@@ -4,13 +4,10 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as cutlass_utils
-import cutlass.utils.hopper_helpers as sm90_utils_basic
 import pytest
 import torch
 from cutlass import Float32, const_expr
-from cutlass.cute.nvgpu import warpgroup
 from cutlass.cute.runtime import from_dlpack
-from cutlass.utils import LayoutEnum
 
 from b12x.cute.fp4 import (
     bfloat2_mul,
@@ -29,13 +26,7 @@ class TinyFp8Bf16DequantKernel:
     dtype = cutlass.BFloat16
 
     def _make_smem_layout(self):
-        s_layout_atom = warpgroup.make_smem_layout_atom(
-            sm90_utils_basic.get_smem_layout_atom(
-                LayoutEnum.ROW_MAJOR, self.dtype, self.tile_n
-            ),
-            self.dtype,
-        )
-        return cute.tile_to_shape(s_layout_atom, (self.tile_m, self.tile_n), (0, 1))
+        return cute.make_layout((self.tile_m, self.tile_n))
 
     @cute.jit
     def __call__(
@@ -75,12 +66,7 @@ class TinyFp8Bf16DequantKernel:
         tidx = cute.arch.thread_idx()[0]
         lane = cute.arch.lane_idx()
         smem = cutlass_utils.SmemAllocator()
-        sB = smem.allocate_tensor(
-            element_type=self.dtype,
-            layout=s_layout.outer,
-            byte_alignment=128,
-            swizzle=s_layout.inner,
-        )
+        sB = smem.allocate_tensor(element_type=self.dtype, layout=s_layout, byte_alignment=128)
         mBu8 = cute.recast_tensor(mB, cutlass.Uint8)
         descale_bf2 = broadcast_f32_to_bfloat2(mDescale[0])
         one = Float32(1.0)

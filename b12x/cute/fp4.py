@@ -802,6 +802,46 @@ def fp8x4_e4m3_to_bfloat2x2(packed: Uint32, *, loc=None, ip=None) -> Tuple[Uint3
 
 
 @dsl_user_op
+def byte_perm(a: Uint32, b: Uint32, selector: Int32, *, loc=None, ip=None) -> Uint32:
+    """PTX byte permutation helper."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Uint32(a).ir_value(loc=loc, ip=ip),
+                Uint32(b).ir_value(loc=loc, ip=ip),
+                Int32(selector).ir_value(loc=loc, ip=ip),
+            ],
+            "prmt.b32 $0, $1, $2, $3;",
+            "=r,r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@cute.jit
+def frag_layout_swizzle_16b_to_8b(x: Uint32) -> Uint32:
+    tmp = cute.arch.shuffle_sync_bfly(x, offset=1)
+    x = byte_perm(x, tmp, Int32(0x5410 if cute.arch.lane_idx() & 0x1 == 0 else 0x3276))
+    tmp = cute.arch.shuffle_sync_bfly(x, offset=2)
+    x = byte_perm(x, tmp, Int32(0x5410 if cute.arch.lane_idx() & 0x2 == 0 else 0x3276))
+    return x
+
+
+@cute.jit
+def frag_layout_swizzle_16b_to_8b_trans(x: Uint32) -> Uint32:
+    tmp = cute.arch.shuffle_sync_bfly(x, offset=4)
+    x = byte_perm(x, tmp, Int32(0x6420 if cute.arch.lane_idx() & 0x4 == 0 else 0x3175))
+    tmp = cute.arch.shuffle_sync_bfly(x, offset=8)
+    x = byte_perm(x, tmp, Int32(0x5410 if cute.arch.lane_idx() & 0x8 == 0 else 0x3276))
+    tmp = cute.arch.shuffle_sync_bfly(x, offset=16)
+    x = byte_perm(x, tmp, Int32(0x5410 if cute.arch.lane_idx() & 0x10 == 0 else 0x3276))
+    return x
+
+
+@dsl_user_op
 def bfloat2_habs2(x: Uint32, *, loc=None, ip=None) -> Uint32:
     """BFloat16x2 absolute value - clears sign bits of both bf16 values."""
     return Uint32(
