@@ -1503,7 +1503,7 @@ class SM120ForwardKernel:
             else None
         )
         smem_thr_copy_VRaw = (
-            utils.make_tiled_copy_B(smem_copy_atom_VRaw, tiled_mma_pv).get_slice(tidx)
+            utils.make_tiled_copy_A(smem_copy_atom_VRaw, tiled_mma_pv).get_slice(tidx)
             if const_expr(self.kv_is_fp8)
             else None
         )
