@@ -861,7 +861,6 @@ class _PagedAttentionForwardLaunch:
         self._dtype = _torch_to_cutlass_dtype(dtype)
         self._kv_dtype = _torch_to_cutlass_dtype(kv_dtype)
         self._q_in_regs = q_in_regs or (self._kv_dtype == cutlass.Float8E4M3FN)
-        self._use_flat_decode_metadata = mode == "decode"
         (
             self._num_batch,
             q_heads,
@@ -872,10 +871,6 @@ class _PagedAttentionForwardLaunch:
             self._logical_q_rows_static,
             self._logical_total_q_rows,
         ) = _paged_attention_logical_dims(q_shape, k_cache_shape, page_table_shape)
-        if self._use_flat_decode_metadata:
-            self._seqlen_q_static = 1
-            self._logical_q_rows_static = qhead_per_kvhead
-            self._logical_total_q_rows = self._num_batch * qhead_per_kvhead
         _, _, head_dim = q_shape
         _, page_size, _, head_dim_k = k_cache_shape
         _, _, v_heads, head_dim_v = v_cache_shape
@@ -954,13 +949,9 @@ class _PagedAttentionForwardLaunch:
             lse_ptr,
             layout=cute.make_layout(self._lse_shape, stride=self._lse_stride),
         )
-        cu_seqlens_q_tensor = (
-            None
-            if self._use_flat_decode_metadata
-            else cute.make_tensor(
-                cu_seqlens_q_ptr,
-                layout=cute.make_layout(self._cu_seqlens_q_shape, stride=self._cu_seqlens_q_stride),
-            )
+        cu_seqlens_q_tensor = cute.make_tensor(
+            cu_seqlens_q_ptr,
+            layout=cute.make_layout(self._cu_seqlens_q_shape, stride=self._cu_seqlens_q_stride),
         )
         cache_seqlens_tensor = cute.make_tensor(
             cache_seqlens_ptr,
