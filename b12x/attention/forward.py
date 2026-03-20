@@ -108,12 +108,16 @@ def convert_fp8_fragment_to_bf16(
     src: cute.Tensor,
     transpose: cutlass.Constexpr = False,
 ):
-    del transpose
-    src_u32 = cute.flatten(cute.recast_tensor(src, cutlass.Uint32))
+    src_u8 = cute.flatten(cute.recast_tensor(src, cutlass.Uint8))
     dst_u32 = cute.recast_tensor(dst, cutlass.Uint32)
-    num_packed = cute.size(src_u32.shape)
+    num_packed = cute.size(dst_u32.shape) // 2
     for i in cutlass.range_constexpr(num_packed):
-        packed = src_u32[i]
+        packed = (
+            cutlass.Uint32(src_u8[4 * i + 0])
+            | (cutlass.Uint32(src_u8[4 * i + 1]) << cutlass.Uint32(8))
+            | (cutlass.Uint32(src_u8[4 * i + 2]) << cutlass.Uint32(16))
+            | (cutlass.Uint32(src_u8[4 * i + 3]) << cutlass.Uint32(24))
+        )
         bf2_lo, bf2_hi = fp8x4_e4m3_to_bfloat2x2(packed)
         dst_u32[2 * i + 0] = bf2_lo
         dst_u32[2 * i + 1] = bf2_hi
