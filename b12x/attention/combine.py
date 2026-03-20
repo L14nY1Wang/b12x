@@ -133,12 +133,11 @@ class PagedAttentionCombineKernel:
 
         total_q = mO.shape[0]
         num_heads = mO.shape[1]
-        SharedStorage = self.shared_storage
         grid = (total_q, num_heads, 1)
-        self.kernel(mO_partial, mLSE_partial, mO, mLSE, SharedStorage).launch(
+        self.kernel(mO_partial, mLSE_partial, mO, mLSE, self.shared_storage).launch(
             grid=grid,
             block=[self.num_threads, 1, 1],
-            smem=SharedStorage.size_in_bytes(),
+            smem=self.shared_storage.size_in_bytes(),
             stream=stream,
         )
 
