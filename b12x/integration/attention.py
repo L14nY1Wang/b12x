@@ -81,12 +81,6 @@ def _split_paged_lse_storage_shape(
     return (num_splits, *base)
 
 
-def _fp8_bridge_cache_shape(plan: "PagedAttentionPlan") -> tuple[int, ...]:
-    batch, max_pages = plan.page_table_shape
-    _, page_size, kv_heads, head_dim = plan.k_cache_shape
-    return (batch * max_pages, page_size, kv_heads, head_dim)
-
-
 @functools.cache
 def _fp8_e4m3_lut(device_index: int) -> torch.Tensor:
     values = torch.arange(256, dtype=torch.uint8, device=torch.device("cuda", device_index))
@@ -689,9 +683,6 @@ class PagedAttentionWorkspace:
     default_k_descale: torch.Tensor
     default_v_descale: torch.Tensor
     fp8_e4m3_lut: torch.Tensor
-    fp8_k_cache_scratch: torch.Tensor | None = None
-    fp8_v_cache_scratch: torch.Tensor | None = None
-    fp8_identity_page_table: torch.Tensor | None = None
     split_output: torch.Tensor | None = None
     split_lse: torch.Tensor | None = None
     plan_key: PagedAttentionPlanKey | None = None
@@ -765,6 +756,7 @@ class _AttentionForwardLaunch:
             160,
             causal,
             False,
+            kv_dtype=self._dtype,
         ):
             raise TypeError(
                 "b12x attention launch is unsupported with "
@@ -859,6 +851,7 @@ class _PagedAttentionForwardLaunch:
         self._lse_stride = _contiguous_stride(self._lse_shape)
         self._dtype = _torch_to_cutlass_dtype(dtype)
         self._kv_dtype = _torch_to_cutlass_dtype(kv_dtype)
+        self._q_in_regs = q_in_regs or (self._kv_dtype == cutlass.Float8E4M3FN)
         (
             self._num_batch,
             q_heads,
@@ -887,8 +880,9 @@ class _PagedAttentionForwardLaunch:
             num_stages,
             (num_compute_warps + 1) * 32,
             causal,
-            q_in_regs,
+            self._q_in_regs,
             num_compute_warps=num_compute_warps,
+            kv_dtype=self._kv_dtype,
         ):
             raise TypeError(
                 "b12x paged attention launch is unsupported with "
@@ -910,7 +904,7 @@ class _PagedAttentionForwardLaunch:
             num_stages=num_stages,
             num_splits=num_splits,
             num_compute_warps=num_compute_warps,
-            Q_in_regs=q_in_regs,
+            Q_in_regs=self._q_in_regs,
         )
         assert head_dim == head_dim_k
 
@@ -1299,44 +1293,36 @@ def _get_paged_attention_plan(
             logical_q_rows_static=logical_q_rows_static,
             logical_total_q_rows=logical_total_q_rows,
         ),
-        compiled=(
-            None
-            if kv_dtype == _FP8_KV_DTYPE
-            else _compile_paged_attention(
-                q_shape,
-                k_cache_shape,
-                v_cache_shape,
-                page_table_shape,
-                cache_seqlens_shape,
-                cu_seqlens_q_shape,
-                dtype,
-                kv_dtype,
-                causal,
-                mode,
-                kernel_family,
-                tile_m,
-                tile_n,
-                num_splits,
-                num_compute_warps,
-                num_stages,
-                q_in_regs,
-            )
+        compiled=_compile_paged_attention(
+            q_shape,
+            k_cache_shape,
+            v_cache_shape,
+            page_table_shape,
+            cache_seqlens_shape,
+            cu_seqlens_q_shape,
+            dtype,
+            kv_dtype,
+            causal,
+            mode,
+            kernel_family,
+            tile_m,
+            tile_n,
+            num_splits,
+            num_compute_warps,
+            num_stages,
+            q_in_regs,
         ),
         compiled_combine=(
-            None
-            if kv_dtype == _FP8_KV_DTYPE
-            else (
-                _compile_paged_attention_combine(
-                    _split_paged_output_shape(q_shape, num_splits=num_splits),
-                    _split_paged_lse_storage_shape(q_shape, num_splits=num_splits),
-                    q_shape,
-                    _paged_lse_storage_shape(q_shape),
-                    dtype,
-                    num_splits,
-                )
-                if num_splits > 1
-                else None
+            _compile_paged_attention_combine(
+                _split_paged_output_shape(q_shape, num_splits=num_splits),
+                _split_paged_lse_storage_shape(q_shape, num_splits=num_splits),
+                q_shape,
+                _paged_lse_storage_shape(q_shape),
+                dtype,
+                num_splits,
             )
+            if num_splits > 1
+            else None
         ),
         cutlass_dtype=_torch_to_cutlass_dtype(dtype),
     )
@@ -1507,18 +1493,6 @@ def allocate_paged_attention_workspace_for_plan(plan: PagedAttentionPlan) -> Pag
         device=plan.device,
     )
     fp8_lut = _fp8_e4m3_lut(plan.device.index if plan.device.index is not None else torch.cuda.current_device())
-    fp8_k_cache_scratch = None
-    fp8_v_cache_scratch = None
-    fp8_identity_page_table = None
-    if plan.kv_dtype == _FP8_KV_DTYPE:
-        bridge_shape = _fp8_bridge_cache_shape(plan)
-        fp8_k_cache_scratch = torch.empty(bridge_shape, dtype=plan.dtype, device=plan.device)
-        fp8_v_cache_scratch = torch.empty(bridge_shape, dtype=plan.dtype, device=plan.device)
-        fp8_identity_page_table = torch.arange(
-            plan.num_batch * plan.page_table_shape[1],
-            dtype=torch.int32,
-            device=plan.device,
-        ).view(plan.num_batch, plan.page_table_shape[1])
     split_output = None
     split_lse = None
     if plan.num_splits > 1:
@@ -1554,9 +1528,6 @@ def allocate_paged_attention_workspace_for_plan(plan: PagedAttentionPlan) -> Pag
         default_k_descale=default_descale.clone(),
         default_v_descale=default_descale,
         fp8_e4m3_lut=fp8_lut,
-        fp8_k_cache_scratch=fp8_k_cache_scratch,
-        fp8_v_cache_scratch=fp8_v_cache_scratch,
-        fp8_identity_page_table=fp8_identity_page_table,
         split_output=split_output,
         split_lse=split_lse,
         plan_key=plan.key,
@@ -1817,30 +1788,6 @@ def _combine_split_partials(
     )
 
 
-def _get_fp8_bridge_plan(plan: PagedAttentionPlan) -> PagedAttentionPlan:
-    bridge_shape = _fp8_bridge_cache_shape(plan)
-    return _get_paged_attention_plan(
-        plan.q_shape,
-        bridge_shape,
-        bridge_shape,
-        plan.page_table_shape,
-        plan.cache_seqlens_shape,
-        plan.cu_seqlens_q_shape,
-        plan.device_index,
-        plan.dtype,
-        plan.dtype,
-        plan.causal,
-        plan.mode,
-        plan.kernel_family,
-        plan.tile_m,
-        plan.tile_n,
-        plan.num_splits,
-        plan.num_compute_warps,
-        plan.num_stages,
-        plan.q_in_regs,
-    )
-
-
 def b12x_attention_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2012,59 +1959,30 @@ def b12x_paged_attention_forward(
     assert kernel_lse is not None
     k_descale_tensor = k_descale if k_descale is not None else resolved_workspace.default_k_descale
     v_descale_tensor = v_descale if v_descale is not None else resolved_workspace.default_v_descale
-    executed_plan = resolved_plan
-    launch_k_cache = k_cache
-    launch_v_cache = v_cache
-    launch_page_table = page_table
-    launch_output = kernel_output
-    launch_lse = kernel_lse
-    if resolved_plan.kv_dtype == _FP8_KV_DTYPE:
-        if resolved_workspace.fp8_k_cache_scratch is None or resolved_workspace.fp8_v_cache_scratch is None:
-            raise ValueError("FP8 paged attention workspace is missing dequant scratch buffers")
-        if resolved_workspace.fp8_identity_page_table is None:
-            raise ValueError("FP8 paged attention workspace is missing identity page_table scratch")
-        batch, max_pages = resolved_plan.page_table_shape
-        gather_ids = page_table.reshape(-1).to(torch.long)
-        k_scale = k_descale_tensor[:, None, :, None].expand(batch, max_pages, resolved_plan.num_kv_heads, 1)
-        v_scale = v_descale_tensor[:, None, :, None].expand(batch, max_pages, resolved_plan.num_kv_heads, 1)
-        selected_k = k_cache.index_select(0, gather_ids).reshape(_fp8_bridge_cache_shape(resolved_plan))
-        selected_v = v_cache.index_select(0, gather_ids).reshape(_fp8_bridge_cache_shape(resolved_plan))
-        resolved_workspace.fp8_k_cache_scratch.copy_(
-            (selected_k.float() * k_scale.reshape(_fp8_bridge_cache_shape(resolved_plan)[:1] + (1, resolved_plan.num_kv_heads, 1))).to(dtype)
-        )
-        resolved_workspace.fp8_v_cache_scratch.copy_(
-            (selected_v.float() * v_scale.reshape(_fp8_bridge_cache_shape(resolved_plan)[:1] + (1, resolved_plan.num_kv_heads, 1))).to(dtype)
-        )
-        executed_plan = _get_fp8_bridge_plan(resolved_plan)
-        if executed_plan.compiled is None:
-            raise ValueError("FP8 bridge plan failed to compile")
-        launch_k_cache = resolved_workspace.fp8_k_cache_scratch
-        launch_v_cache = resolved_workspace.fp8_v_cache_scratch
-        launch_page_table = resolved_workspace.fp8_identity_page_table
-    if executed_plan.compiled is None:
+    if resolved_plan.compiled is None:
         raise ValueError("paged attention plan is missing a compiled kernel")
-    executed_plan.compiled(
-        make_ptr(executed_plan.cutlass_dtype, q.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(_torch_to_cutlass_dtype(executed_plan.kv_dtype), launch_k_cache.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(_torch_to_cutlass_dtype(executed_plan.kv_dtype), launch_v_cache.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+    resolved_plan.compiled(
+        make_ptr(resolved_plan.cutlass_dtype, q.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(_torch_to_cutlass_dtype(resolved_plan.kv_dtype), k_cache.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(_torch_to_cutlass_dtype(resolved_plan.kv_dtype), v_cache.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
         make_ptr(
-            executed_plan.cutlass_dtype,
-            launch_output.data_ptr(),
+            resolved_plan.cutlass_dtype,
+            kernel_output.data_ptr(),
             cute.AddressSpace.gmem,
             assumed_align=16,
         ),
-        make_ptr(cutlass.Float32, launch_lse.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
+        make_ptr(cutlass.Float32, kernel_lse.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(cutlass.Int32, cu_seqlens_q.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(cutlass.Int32, cache_seqlens.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
-        make_ptr(cutlass.Int32, launch_page_table.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
-        make_ptr(cutlass.Float32, resolved_workspace.default_k_descale.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
-        make_ptr(cutlass.Float32, resolved_workspace.default_v_descale.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
+        make_ptr(cutlass.Int32, page_table.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
+        make_ptr(cutlass.Float32, k_descale_tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
+        make_ptr(cutlass.Float32, v_descale_tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(cutlass.Float32, resolved_workspace.fp8_e4m3_lut.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
         float(softmax_scale),
         current_cuda_stream(),
     )
-    if executed_plan.num_splits > 1:
-        _combine_split_partials(resolved_workspace, plan=executed_plan)
+    if resolved_plan.num_splits > 1:
+        _combine_split_partials(resolved_workspace, plan=resolved_plan)
     return resolved_workspace.output, resolved_workspace.lse.transpose(0, 1)
 
 

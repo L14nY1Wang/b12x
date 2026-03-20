@@ -56,7 +56,15 @@ def _dtype_from_name(name: str) -> torch.dtype:
         return torch.bfloat16
     if name == "fp16":
         return torch.float16
+    if name == "fp8_e4m3fn":
+        return torch.float8_e4m3fn
     raise ValueError(f"unsupported dtype {name}")
+
+
+def _resolve_kv_dtype(name: str, q_dtype: torch.dtype) -> torch.dtype:
+    if name == "same":
+        return q_dtype
+    return _dtype_from_name(name)
 
 
 def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -153,6 +161,48 @@ def _make_uniform_paged_inputs(
     return q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q
 
 
+def _quantize_paged_kv_cache_global_e4m3(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    *,
+    batch: int,
+    kv_heads: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float, float]:
+    finfo = torch.finfo(torch.float8_e4m3fn)
+    k_scale = k_cache.abs().amax().to(torch.float32) / finfo.max
+    v_scale = v_cache.abs().amax().to(torch.float32) / finfo.max
+    if float(k_scale.item()) == 0.0:
+        k_scale = torch.ones_like(k_scale)
+    if float(v_scale.item()) == 0.0:
+        v_scale = torch.ones_like(v_scale)
+    k_fp8 = (k_cache.to(torch.float32) / k_scale).clamp(min=finfo.min, max=finfo.max).to(
+        torch.float8_e4m3fn
+    )
+    v_fp8 = (v_cache.to(torch.float32) / v_scale).clamp(min=finfo.min, max=finfo.max).to(
+        torch.float8_e4m3fn
+    )
+    k_descale = torch.full(
+        (batch, kv_heads),
+        float(k_scale.item()),
+        dtype=torch.float32,
+        device=k_cache.device,
+    )
+    v_descale = torch.full(
+        (batch, kv_heads),
+        float(v_scale.item()),
+        dtype=torch.float32,
+        device=v_cache.device,
+    )
+    return (
+        k_fp8.contiguous(),
+        v_fp8.contiguous(),
+        k_descale,
+        v_descale,
+        float(k_scale.item()),
+        float(v_scale.item()),
+    )
+
+
 def _make_flashinfer_page_metadata(
     *,
     batch: int,
@@ -190,6 +240,8 @@ def _capture_b12x_graph(
     cache_seqlens: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     num_splits: int,
+    k_descale: torch.Tensor | None,
+    v_descale: torch.Tensor | None,
     warmup: int,
 ) -> tuple[torch.cuda.CUDAGraph, torch.Tensor, int]:
     plan = create_paged_attention_plan(
@@ -214,6 +266,8 @@ def _capture_b12x_graph(
             cu_seqlens_q,
             workspace=workspace,
             plan=plan,
+            k_descale=k_descale,
+            v_descale=v_descale,
         )
 
     graph = _capture_graph(run, warmup=warmup)
@@ -232,7 +286,10 @@ def _capture_flashinfer_fa2_graph(
     q_heads: int,
     kv_heads: int,
     head_dim: int,
-    dtype: torch.dtype,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    k_scale: float | None,
+    v_scale: float | None,
     workspace_bytes: int,
     warmup: int,
 ) -> tuple[torch.cuda.CUDAGraph, torch.Tensor]:
@@ -269,15 +326,21 @@ def _capture_flashinfer_fa2_graph(
             num_kv_heads=kv_heads,
             head_dim=head_dim,
             page_size=page_size,
-            q_data_type=dtype,
-            kv_data_type=dtype,
+            q_data_type=q_dtype,
+            kv_data_type=kv_dtype,
             sm_scale=sm_scale,
         )
         q_input = q.view(batch, q_heads, head_dim)
         output = torch.empty_like(q_input)
 
         def run() -> None:
-            wrapper.run(q_input, (k_cache, v_cache), out=output)
+            wrapper.run(
+                q_input,
+                (k_cache, v_cache),
+                out=output,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
 
         graph = _capture_graph(run, warmup=warmup)
         return graph, output.view(-1, q_heads, head_dim)
@@ -302,14 +365,14 @@ def _capture_flashinfer_fa2_graph(
         head_dim_qk=head_dim,
         page_size=page_size,
         causal=True,
-        q_data_type=dtype,
-        kv_data_type=dtype,
+        q_data_type=q_dtype,
+        kv_data_type=kv_dtype,
         sm_scale=sm_scale,
     )
     output = torch.empty_like(q)
 
     def run() -> None:
-        wrapper.run(q, (k_cache, v_cache), out=output)
+        wrapper.run(q, (k_cache, v_cache), out=output, k_scale=k_scale, v_scale=v_scale)
 
     graph = _capture_graph(run, warmup=warmup)
     return graph, output
@@ -325,6 +388,7 @@ def main() -> None:
     parser.add_argument("--kv-heads", type=int, default=1)
     parser.add_argument("--head-dim", type=int, default=256)
     parser.add_argument("--dtype", choices=["bf16", "fp16"], default="bf16")
+    parser.add_argument("--kv-dtype", choices=["same", "bf16", "fp16", "fp8_e4m3fn"], default="same")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--replays", type=int, default=200)
     parser.add_argument("--flashinfer-workspace-mb", type=int, default=512)
@@ -340,6 +404,7 @@ def main() -> None:
     clear_attention_caches()
 
     dtype = _dtype_from_name(args.dtype)
+    kv_dtype = _resolve_kv_dtype(args.kv_dtype, dtype)
     flashinfer_workspace_bytes = args.flashinfer_workspace_mb * 1024 * 1024
     q_seqlens = _parse_csv_ints(args.q_seqlens)
     cache_seqlens = _parse_csv_ints(args.cache_seqlens)
@@ -359,7 +424,8 @@ def main() -> None:
             "q_heads": args.q_heads,
             "kv_heads": args.kv_heads,
             "head_dim": args.head_dim,
-            "dtype": str(dtype),
+            "q_dtype": str(dtype),
+            "kv_dtype": str(kv_dtype),
             "num_splits": args.num_splits,
             "replays": args.replays,
             "flashinfer_fa2": args.compare_fa2,
@@ -381,6 +447,17 @@ def main() -> None:
                 seed=1 + case_idx,
             )
         )
+        k_descale = None
+        v_descale = None
+        k_scale = None
+        v_scale = None
+        if kv_dtype == torch.float8_e4m3fn:
+            k_cache, v_cache, k_descale, v_descale, k_scale, v_scale = _quantize_paged_kv_cache_global_e4m3(
+                k_cache,
+                v_cache,
+                batch=case.batch,
+                kv_heads=args.kv_heads,
+            )
         b12x_graph, b12x_output, b12x_num_splits = _capture_b12x_graph(
             q=q,
             k_cache=k_cache,
@@ -389,6 +466,8 @@ def main() -> None:
             cache_seqlens=cache_seqlens_tensor,
             cu_seqlens_q=cu_seqlens_q,
             num_splits=args.num_splits,
+            k_descale=k_descale,
+            v_descale=v_descale,
             warmup=args.warmup,
         )
         b12x_times_ms = _bench_graph(b12x_graph, replays=args.replays)
@@ -412,7 +491,10 @@ def main() -> None:
                 q_heads=args.q_heads,
                 kv_heads=args.kv_heads,
                 head_dim=args.head_dim,
-                dtype=dtype,
+                q_dtype=dtype,
+                kv_dtype=kv_dtype,
+                k_scale=k_scale,
+                v_scale=v_scale,
                 workspace_bytes=flashinfer_workspace_bytes,
                 warmup=args.warmup,
             )
