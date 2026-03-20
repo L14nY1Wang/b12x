@@ -324,6 +324,8 @@ def _promote_fp8_paged_splits_for_occupancy(
         chosen = bucket
         if total_blocks_max * logical_num_head * bucket >= target_ctas:
             break
+    if tile_m == 16 and max_pages >= 128 and chosen == 24 and 32 in split_buckets and 32 <= max_pages:
+        chosen = 32
     return chosen
 
 
