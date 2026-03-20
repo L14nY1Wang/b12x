@@ -1039,19 +1039,26 @@ class SM120ForwardKernel:
         tile_hdim_x: cutlass.Constexpr,
     ):
         lane = cute.arch.lane_idx()
-        mXu8 = cute.recast_tensor(mX, cutlass.Uint8)
+        mXu32 = cute.recast_tensor(mX, cutlass.Uint32)
         sXu8 = cute.recast_tensor(sX, cutlass.Uint8)
-        total_vec4 = (self.tile_n * tile_hdim_x) // 4
+        words_per_row = tile_hdim_x // 4
+        total_vec4 = self.tile_n * words_per_row
         for idx_iter in cutlass.range_constexpr(cute.ceil_div(total_vec4, cute.arch.WARP_SIZE)):
             vec_idx = lane + idx_iter * cute.arch.WARP_SIZE
             if vec_idx < total_vec4:
-                linear_idx = vec_idx * 4
-                row = linear_idx // tile_hdim_x
-                col = linear_idx - row * tile_hdim_x
-                sXu8[row, col + 0, stage_idx] = mXu8[row, col + 0, head_idx_kv, src_idx]
-                sXu8[row, col + 1, stage_idx] = mXu8[row, col + 1, head_idx_kv, src_idx]
-                sXu8[row, col + 2, stage_idx] = mXu8[row, col + 2, head_idx_kv, src_idx]
-                sXu8[row, col + 3, stage_idx] = mXu8[row, col + 3, head_idx_kv, src_idx]
+                row = vec_idx // words_per_row
+                col = (vec_idx - row * words_per_row) * 4
+                packed = mXu32[row, col // 4, head_idx_kv, src_idx]
+                sXu8[row, col + 0, stage_idx] = (packed & cutlass.Uint32(0xFF)).to(cutlass.Uint8)
+                sXu8[row, col + 1, stage_idx] = (
+                    (packed >> cutlass.Uint32(8)) & cutlass.Uint32(0xFF)
+                ).to(cutlass.Uint8)
+                sXu8[row, col + 2, stage_idx] = (
+                    (packed >> cutlass.Uint32(16)) & cutlass.Uint32(0xFF)
+                ).to(cutlass.Uint8)
+                sXu8[row, col + 3, stage_idx] = (
+                    (packed >> cutlass.Uint32(24)) & cutlass.Uint32(0xFF)
+                ).to(cutlass.Uint8)
 
     @cute.jit
     def dequant_fp8_stage_shared(
