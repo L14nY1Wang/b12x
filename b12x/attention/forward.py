@@ -134,25 +134,22 @@ def convert_fp8_pv_word_fragment_to_bf16_copy_b(
     src_words_flat = cute.flatten(src_words)
     dst_u32 = cute.recast_tensor(dst, cutlass.Uint32)
     num_packed = cute.size(dst_u32.shape) // 2
-    active_packed = cute.size(src_words_flat.shape) // 4
     byte_shift = cutlass.Uint32(byte_sel) << cutlass.Uint32(3)
     for packed_idx in cutlass.range_constexpr(num_packed):
-        packed = cutlass.Uint32(0)
-        if packed_idx < active_packed:
-            block_idx = packed_idx // 4
-            lane_group = packed_idx % 4
-            word_idx = block_idx * 2
-            source_lane = lane_base | Int32(lane_group << 3)
-            word0 = cute.arch.shuffle_sync(src_words_flat[word_idx + 0], source_lane)
-            word1 = cute.arch.shuffle_sync(src_words_flat[word_idx + 1], source_lane)
-            word2 = cute.arch.shuffle_sync(src_words_flat[word_idx + 64], source_lane)
-            word3 = cute.arch.shuffle_sync(src_words_flat[word_idx + 65], source_lane)
-            packed = (
-                ((word0 >> byte_shift) & cutlass.Uint32(0xFF))
-                | (((word1 >> byte_shift) & cutlass.Uint32(0xFF)) << cutlass.Uint32(8))
-                | (((word2 >> byte_shift) & cutlass.Uint32(0xFF)) << cutlass.Uint32(16))
-                | (((word3 >> byte_shift) & cutlass.Uint32(0xFF)) << cutlass.Uint32(24))
-            )
+        block_idx = packed_idx // 4
+        lane_group = packed_idx % 4
+        word_idx = block_idx * 2
+        source_lane = lane_base | Int32(lane_group << 3)
+        word0 = cute.arch.shuffle_sync(src_words_flat[word_idx + 0], source_lane)
+        word1 = cute.arch.shuffle_sync(src_words_flat[word_idx + 1], source_lane)
+        word2 = cute.arch.shuffle_sync(src_words_flat[word_idx + 64], source_lane)
+        word3 = cute.arch.shuffle_sync(src_words_flat[word_idx + 65], source_lane)
+        packed = (
+            ((word0 >> byte_shift) & cutlass.Uint32(0xFF))
+            | (((word1 >> byte_shift) & cutlass.Uint32(0xFF)) << cutlass.Uint32(8))
+            | (((word2 >> byte_shift) & cutlass.Uint32(0xFF)) << cutlass.Uint32(16))
+            | (((word3 >> byte_shift) & cutlass.Uint32(0xFF)) << cutlass.Uint32(24))
+        )
         bf2_lo, bf2_hi = fp8x4_e4m3_to_bfloat2x2(packed)
         dst_u32[2 * packed_idx + 0] = bf2_lo
         dst_u32[2 * packed_idx + 1] = bf2_hi
