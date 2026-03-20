@@ -1343,25 +1343,26 @@ class SM120ForwardKernel:
         aux_tensors=None,
         fastdiv_mods=None,
         is_first_n_block: cutlass.Constexpr = False,
-        tidx: Int32 = 0,
     ):
         pipeline_k.consumer_wait(kv_consumer_state, pipeline_k.consumer_try_wait(kv_consumer_state))
         acc_shape_S = thr_mma_qk.partition_shape_C((self.tile_m, self.tile_n))
         acc_S = cute.make_fragment(acc_shape_S, Float32)
         acc_S.fill(0.0)
         if const_expr(self.kv_is_fp8):
-            stage = kv_consumer_state.index if const_expr(self.num_stages > 1) else 0
-            self.dequant_fp8_stage_shared(sKRaw, sK, None, stage, self.tile_hdim, tidx)
-            warp_mma_gemm(
+            warp_mma_gemm_fp8(
                 thr_mma_qk,
                 acc_S,
                 tSrQ,
                 tSrK,
+                tSrKRaw,
                 tSsQ,
-                tSsK[None, None, None, stage],
+                tSsKRaw[
+                    None, None, None, kv_consumer_state.index if const_expr(self.num_stages > 1) else 0
+                ],
                 smem_thr_copy_Q,
-                smem_thr_copy_K,
+                smem_thr_copy_KRaw,
                 A_in_regs=self.Q_in_regs,
+                transpose=False,
             )
         else:
             warp_mma_gemm(
@@ -1389,15 +1390,17 @@ class SM120ForwardKernel:
 
         pipeline_v.consumer_wait(kv_consumer_state, pipeline_v.consumer_try_wait(kv_consumer_state))
         if const_expr(self.kv_is_fp8):
-            stage = kv_consumer_state.index if const_expr(self.num_stages > 1) else 0
-            self.dequant_fp8_stage_shared(sVRaw, sV, None, stage, self.tile_hdimv, tidx)
-            warp_mma_gemm_rs(
+            warp_mma_gemm_rs_fp8(
                 thr_mma_pv,
                 acc_O,
                 tOrP,
                 tOrVt,
-                tOsVt[None, None, None, stage],
-                smem_thr_copy_V,
+                tOrVtRaw,
+                tOsVtRaw[
+                    None, None, None, kv_consumer_state.index if const_expr(self.num_stages > 1) else 0
+                ],
+                smem_thr_copy_VRaw,
+                transpose=True,
             )
         else:
             warp_mma_gemm_rs(
@@ -1611,7 +1614,6 @@ class SM120ForwardKernel:
                     partial(mask_fn, mask_seqlen=True),
                     aux_tensors=aux_tensors,
                     is_first_n_block=True,
-                    tidx=tidx,
                 )
                 n_block_max -= 1
 
@@ -1657,7 +1659,6 @@ class SM120ForwardKernel:
                             m_block,
                             partial(mask_fn, mask_seqlen=False),
                             aux_tensors=aux_tensors,
-                            tidx=tidx,
                         )
                     n_block_max = cutlass.min(n_block_max, n_block_min_causal_local_mask)
 
@@ -1700,7 +1701,6 @@ class SM120ForwardKernel:
                         m_block,
                         partial(mask_fn, mask_seqlen=False),
                         aux_tensors=aux_tensors,
-                        tidx=tidx,
                     )
 
             row_scale = softmax.finalize()
