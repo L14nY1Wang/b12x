@@ -38,7 +38,7 @@ class Fp8PvLayoutDumpKernel:
     head_dim = 256
     num_compute_warps = 3
     num_threads = num_compute_warps * 32
-    max_dump_bytes = 1024
+    max_dump_bytes = 256
 
     def __init__(self, *, source_mode: str, copy_tiling: str):
         if source_mode not in {"word_direct", "word_transpose"}:
@@ -154,8 +154,10 @@ class Fp8PvLayoutDumpKernel:
         tCandSrc = cand_copy.partition_S(sCand)
         copy_flattened(tCandSrc[None, None, None, 0], tCandCopyView[None, None, 0])
 
-        ref_bytes = cute.flatten(tRefRaw)
-        cand_bytes = cute.flatten(cute.recast_tensor(tCandWords, cutlass.Uint8))
+        ref_bytes = cute.flatten(tRefRaw[None, None, 0])
+        cand_bytes = cute.flatten(
+            cute.recast_tensor(cute.recast_tensor(tRefCopyView[None, None, 0], cutlass.Uint32), cutlass.Uint8)
+        )
         num_bytes = cute.size(ref_bytes.shape)
         mNumBytes[tidx] = Int32(num_bytes)
         for idx in cutlass.range_constexpr(self.max_dump_bytes):

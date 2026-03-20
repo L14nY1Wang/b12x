@@ -743,6 +743,31 @@ def pack_f32x2_to_bfloat2(x0: Float32, x1: Float32, *, loc=None, ip=None) -> Uin
 
 
 @dsl_user_op
+def cvt_bf16x2_to_e4m3x2(src: Uint32, *, loc=None, ip=None) -> Uint32:
+    """Convert packed bf16x2 to packed e4m3x2 in the low 16 bits of a u32."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Uint32(src).ir_value(loc=loc, ip=ip)],
+            """
+            {
+                .reg .b16 out, zero;
+                cvt.rn.satfinite.e4m3x2.bf16x2 out, $1;
+                mov.u16 zero, 0;
+                mov.b32 $0, {out, zero};
+            }
+            """,
+            "=r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def bfloat2_add(a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
     """Add two BFloat2 values element-wise: (a.x+b.x, a.y+b.y)."""
     return Uint32(
@@ -799,6 +824,128 @@ def fp8x4_e4m3_to_bfloat2x2(packed: Uint32, *, loc=None, ip=None) -> Tuple[Uint3
     lo = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
     hi = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
     return Uint32(lo), Uint32(hi)
+
+
+@dsl_user_op
+def bf16_mma_m16n8k16_f32(
+    d0: Float32,
+    d1: Float32,
+    d2: Float32,
+    d3: Float32,
+    a0: Uint32,
+    a1: Uint32,
+    a2: Uint32,
+    a3: Uint32,
+    b0: Uint32,
+    b1: Uint32,
+    *,
+    loc=None,
+    ip=None,
+) -> Tuple[Float32, Float32, Float32, Float32]:
+    """Warp MMA helper for `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32`."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
+        [
+            Float32(d0).ir_value(loc=loc, ip=ip),
+            Float32(d1).ir_value(loc=loc, ip=ip),
+            Float32(d2).ir_value(loc=loc, ip=ip),
+            Float32(d3).ir_value(loc=loc, ip=ip),
+            Uint32(a0).ir_value(loc=loc, ip=ip),
+            Uint32(a1).ir_value(loc=loc, ip=ip),
+            Uint32(a2).ir_value(loc=loc, ip=ip),
+            Uint32(a3).ir_value(loc=loc, ip=ip),
+            Uint32(b0).ir_value(loc=loc, ip=ip),
+            Uint32(b1).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32
+        {$0, $1, $2, $3},
+        {$4, $5, $6, $7},
+        {$8, $9},
+        {$0, $1, $2, $3};
+        """,
+        "=f,=f,=f,=f,r,r,r,r,r,r,0,1,2,3",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    r0 = llvm.extractvalue(T.f32(), result, [0], loc=loc, ip=ip)
+    r1 = llvm.extractvalue(T.f32(), result, [1], loc=loc, ip=ip)
+    r2 = llvm.extractvalue(T.f32(), result, [2], loc=loc, ip=ip)
+    r3 = llvm.extractvalue(T.f32(), result, [3], loc=loc, ip=ip)
+    return Float32(r0), Float32(r1), Float32(r2), Float32(r3)
+
+
+@dsl_user_op
+def mxfp8_mma_m16n8k32_f32_e4m3(
+    d0: Float32,
+    d1: Float32,
+    d2: Float32,
+    d3: Float32,
+    a0: Uint32,
+    a1: Uint32,
+    a2: Uint32,
+    a3: Uint32,
+    b0: Uint32,
+    b1: Uint32,
+    sfa: Uint32,
+    sfb: Uint32,
+    *,
+    loc=None,
+    ip=None,
+) -> Tuple[Float32, Float32, Float32, Float32]:
+    """Warp MMA helper for SM120 MXFP8 block-scaled `m16n8k32` E4M3/E4M3."""
+    i16_ty = cutlass._mlir.ir.IntegerType.get_signless(16)
+    zero_i16 = cutlass._mlir.ir.Operation.create(
+        "llvm.mlir.constant",
+        results=[i16_ty],
+        attributes={"value": cutlass._mlir.ir.IntegerAttr.get(i16_ty, 0)},
+    ).result
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
+        [
+            Uint32(a0).ir_value(loc=loc, ip=ip),
+            Uint32(a1).ir_value(loc=loc, ip=ip),
+            Uint32(a2).ir_value(loc=loc, ip=ip),
+            Uint32(a3).ir_value(loc=loc, ip=ip),
+            Uint32(b0).ir_value(loc=loc, ip=ip),
+            Uint32(b1).ir_value(loc=loc, ip=ip),
+            Uint32(sfa).ir_value(loc=loc, ip=ip),
+            zero_i16,
+            zero_i16,
+            Uint32(sfb).ir_value(loc=loc, ip=ip),
+            zero_i16,
+            zero_i16,
+            Float32(d0).ir_value(loc=loc, ip=ip),
+            Float32(d1).ir_value(loc=loc, ip=ip),
+            Float32(d2).ir_value(loc=loc, ip=ip),
+            Float32(d3).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.f32.e4m3.e4m3.f32.ue8m0
+        {$0, $1, $2, $3},
+        {$4, $5, $6, $7},
+        {$8, $9},
+        {$0, $1, $2, $3},
+        {$10},
+        {$11, $12},
+        {$13},
+        {$14, $15};
+        """,
+        "=f,=f,=f,=f,r,r,r,r,r,r,r,h,h,r,h,h,0,1,2,3",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    r0 = llvm.extractvalue(T.f32(), result, [0], loc=loc, ip=ip)
+    r1 = llvm.extractvalue(T.f32(), result, [1], loc=loc, ip=ip)
+    r2 = llvm.extractvalue(T.f32(), result, [2], loc=loc, ip=ip)
+    r3 = llvm.extractvalue(T.f32(), result, [3], loc=loc, ip=ip)
+    return Float32(r0), Float32(r1), Float32(r2), Float32(r3)
 
 
 @dsl_user_op
