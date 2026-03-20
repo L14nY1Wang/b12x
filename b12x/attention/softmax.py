@@ -15,6 +15,7 @@ from b12x.attention.cute_dsl_utils import ParamsBase
 class Softmax(ParamsBase):
     scale_log2: Float32
     num_rows: cutlass.Constexpr[int]
+    active_rows: cutlass.Constexpr[int]
     row_max: cute.Tensor
     row_sum: cute.Tensor
     arch: cutlass.Constexpr[int] = 80
@@ -24,12 +25,15 @@ class Softmax(ParamsBase):
     def create(
         scale_log2: Float32,
         num_rows: cutlass.Constexpr[int],
+        active_rows: cutlass.Constexpr[int] | None = None,
         arch: cutlass.Constexpr[int] = 80,
         softmax_scale: Float32 | None = None,
     ):
+        if active_rows is None:
+            active_rows = num_rows
         row_max = cute.make_rmem_tensor(num_rows, Float32)
         row_sum = cute.make_rmem_tensor(num_rows, Float32)
-        return Softmax(scale_log2, num_rows, row_max, row_sum, arch, softmax_scale)
+        return Softmax(scale_log2, num_rows, active_rows, row_max, row_sum, arch, softmax_scale)
 
     def _row_layout(self) -> cute.Layout:
         return cute.make_layout((self.num_rows,), stride=(1,))
@@ -56,8 +60,9 @@ class Softmax(ParamsBase):
     ) -> cute.Tensor:
         acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S)
         row_scale = cute.make_fragment(self._row_layout(), Float32)
+        row_scale.fill(1.0)
 
-        for r in range(int(self.num_rows)):
+        for r in range(int(self.active_rows)):
             acc_S_row = acc_S_mn[r, None].load()
             row_max_cur = utils.fmax_reduce(
                 acc_S_row,
@@ -102,8 +107,9 @@ class Softmax(ParamsBase):
             assert cute.size(sink_val) == self.num_rows
         self.row_sum.store(utils.warp_reduce(self.row_sum.load(), operator.add, width=4))
         row_scale = cute.make_fragment(self._row_layout(), Float32)
+        row_scale.fill(1.0)
 
-        for r in range(int(self.num_rows)):
+        for r in range(int(self.active_rows)):
             if cutlass.const_expr(sink_val is not None):
                 sink_val_cur = sink_val if not isinstance(sink_val, cute.Tensor) else sink_val[r]
                 self.row_sum[r] += cute.math.exp2(
