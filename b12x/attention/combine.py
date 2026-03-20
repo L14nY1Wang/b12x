@@ -122,16 +122,19 @@ class PagedAttentionCombineKernel:
 
         total_q = mO.shape[0]
         num_heads = mO.shape[1]
-        SharedStorage = cute.struct.Align[
-            cute.struct.MemRange[Float32, self.num_splits + 1],
-            16,
-        ]
-        shared_bytes = int(math.ceil(((self.num_splits + 1) * 4) / 16) * 16)
+        SharedStorage = type("SharedStorage", (), {})
+        SharedStorage.__annotations__ = {
+            "scratch": cute.struct.Align[
+                cute.struct.MemRange[Float32, self.num_splits + 1],
+                16,
+            ]
+        }
+        SharedStorage = cute.struct(SharedStorage)
         grid = (total_q, num_heads, 1)
         self.kernel(mO_partial, mLSE_partial, mO, mLSE, SharedStorage).launch(
             grid=grid,
             block=[self.num_threads, 1, 1],
-            smem=shared_bytes,
+            smem=SharedStorage.size_in_bytes(),
             stream=stream,
         )
 
@@ -150,9 +153,8 @@ class PagedAttentionCombineKernel:
         row_idx, head_idx, _ = cute.arch.block_idx()
 
         smem = cutlass.utils.SmemAllocator()
-        scratch = smem.allocate(SharedStorage).get_tensor(
-            cute.make_layout((self.num_splits + 1,))
-        )
+        storage = smem.allocate(SharedStorage)
+        scratch = storage.scratch.get_tensor(cute.make_layout((self.num_splits + 1,)))
 
         lse_max = -Float32.inf
         lse_sum = Float32.zero
