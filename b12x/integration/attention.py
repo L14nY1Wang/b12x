@@ -205,9 +205,9 @@ def _select_paged_kernel_config(
         )
     return PagedKernelConfig(
         kernel_family="main",
-        tile_m=tile_m,
+        tile_m=32 if head_dim == 256 else tile_m,
         tile_n=tile_n,
-        num_compute_warps=4,
+        num_compute_warps=2 if head_dim == 256 else 4,
         num_stages=1,
         q_in_regs=False,
     )
@@ -420,6 +420,7 @@ def choose_paged_attention_num_splits(
     cache_seqlens: torch.Tensor,
     *,
     page_size: int,
+    mode: Literal["decode", "extend"] | None = None,
     split_buckets: tuple[int, ...] = _DEFAULT_PAGED_SPLIT_BUCKETS,
     min_pages_per_split: int = _DEFAULT_MIN_PAGES_PER_SPLIT,
 ) -> int:
@@ -428,6 +429,20 @@ def choose_paged_attention_num_splits(
         raise ValueError(f"min_pages_per_split must be >= 1, got {min_pages_per_split}")
     buckets = _normalize_split_buckets(split_buckets)
     max_pages = _max_pages_from_cache_seqlens(cache_seqlens, page_size=page_size)
+    if mode == "decode":
+        if max_pages <= 1:
+            return 1
+        if max_pages <= 2:
+            return 2 if 2 in buckets else 4
+        if max_pages <= 4:
+            return 4 if 4 in buckets else buckets[-1]
+        return 8 if 8 in buckets else buckets[-1]
+    if mode == "extend":
+        if max_pages <= 2:
+            return 1
+        if max_pages <= 4:
+            return 4 if 4 in buckets else buckets[-1]
+        return 8 if 8 in buckets else buckets[-1]
     chosen = 1
     for bucket in buckets[1:]:
         if max_pages >= bucket * min_pages_per_split:
@@ -1549,6 +1564,7 @@ def create_paged_attention_plan(
         num_splits = choose_paged_attention_num_splits(
             cache_seqlens,
             page_size=page_size,
+            mode=mode,
             split_buckets=buckets,
             min_pages_per_split=min_pages_per_split,
         )

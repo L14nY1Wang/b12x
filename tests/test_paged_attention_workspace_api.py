@@ -162,7 +162,8 @@ def test_paged_plan_exposes_logical_gqa_dimensions() -> None:
     assert plan.logical_total_q_rows == sum(q_seqlens) * 8
     assert plan.mode == "extend"
     assert plan.kernel_family == "main"
-    assert plan.num_compute_warps == 4
+    assert plan.tile_m == 32
+    assert plan.num_compute_warps == 2
     assert plan.num_stages == 1
     assert plan.q_in_regs is False
 
@@ -238,8 +239,8 @@ def test_long_decode_plan_falls_back_to_main_kernel_family() -> None:
 
     assert plan.mode == "decode"
     assert plan.kernel_family == "main"
-    assert plan.tile_m == 64
-    assert plan.num_compute_warps == 4
+    assert plan.tile_m == 32
+    assert plan.num_compute_warps == 2
     assert plan.q_in_regs is False
 
 
@@ -490,8 +491,8 @@ def test_auto_split_bucket_selection_is_deterministic() -> None:
         seed=89,
     )
 
-    assert choose_paged_attention_num_splits(cache_seqlens0, page_size=64) == 1
-    assert choose_paged_attention_num_splits(cache_seqlens1, page_size=64) == 4
+    assert choose_paged_attention_num_splits(cache_seqlens0, page_size=64, mode="decode") == 1
+    assert choose_paged_attention_num_splits(cache_seqlens1, page_size=64, mode="extend") == 8
 
     plan0 = create_paged_attention_plan(
         q0,
@@ -515,7 +516,26 @@ def test_auto_split_bucket_selection_is_deterministic() -> None:
     )
 
     assert plan0.num_splits == 1
-    assert plan1.num_splits == 4
+    assert plan1.num_splits == 8
+
+
+def test_mode_aware_split_bucket_selection_matches_planner_policy() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    short_decode = torch.tensor([64] * 8, dtype=torch.int32, device="cuda")
+    mid_decode = torch.tensor([128] * 8, dtype=torch.int32, device="cuda")
+    long_decode = torch.tensor([2048] * 8, dtype=torch.int32, device="cuda")
+    short_extend = torch.tensor([128] * 8, dtype=torch.int32, device="cuda")
+    mid_extend = torch.tensor([256] * 8, dtype=torch.int32, device="cuda")
+    long_extend = torch.tensor([2048] * 8, dtype=torch.int32, device="cuda")
+
+    assert choose_paged_attention_num_splits(short_decode, page_size=64, mode="decode") == 1
+    assert choose_paged_attention_num_splits(mid_decode, page_size=64, mode="decode") == 2
+    assert choose_paged_attention_num_splits(long_decode, page_size=64, mode="decode") == 8
+    assert choose_paged_attention_num_splits(short_extend, page_size=64, mode="extend") == 1
+    assert choose_paged_attention_num_splits(mid_extend, page_size=64, mode="extend") == 4
+    assert choose_paged_attention_num_splits(long_extend, page_size=64, mode="extend") == 8
 
 
 def test_page_size_other_than_64_is_rejected() -> None:
