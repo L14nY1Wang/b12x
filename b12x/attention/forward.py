@@ -1198,10 +1198,13 @@ class SM120ForwardKernel:
             if const_expr(mPageTable is not None):
                 mK_cur = mK[None, None, head_idx_kv, None]
                 mV_cur = mV[None, None, head_idx_kv, None]
-                gK = (
-                    mK_cur
-                    if const_expr(self.use_tma_K and self.kv_is_fp8)
-                    else cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (0, 0, None))
+                gK = cute.local_tile(
+                    mK_cur,
+                    (
+                        self.tile_n,
+                        self.tile_hdim // 4 if const_expr(self.use_tma_K and self.kv_is_fp8) else self.tile_hdim,
+                    ),
+                    (0, 0, None),
                 )
                 gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (0, 0, None))
             else:
