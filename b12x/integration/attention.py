@@ -220,6 +220,20 @@ def _select_paged_kernel_config(
             num_stages=1,
             q_in_regs=True,
         )
+    if (
+        mode == "extend"
+        and head_dim == 256
+        and kv_dtype == _FP8_KV_DTYPE
+        and max_pages >= 256
+    ):
+        return PagedKernelConfig(
+            kernel_family="main",
+            tile_m=48,
+            tile_n=tile_n,
+            num_compute_warps=3,
+            num_stages=1,
+            q_in_regs=True,
+        )
     return PagedKernelConfig(
         kernel_family="main",
         tile_m=32 if head_dim == 256 else tile_m,
