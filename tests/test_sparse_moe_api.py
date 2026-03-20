@@ -46,6 +46,9 @@ def test_route_experts_fast_from_gate_weight_renormalizes() -> None:
     routing = b12x_route_experts_fast(hidden_states, top_k=2, gate_weight=gate_weight)
 
     assert routing.router_logits is not None
+    assert routing.topk_ids.dtype == torch.int32
+    assert routing.flat_ids is not None
+    assert routing.flat_weights is not None
     assert routing.topk_ids.tolist() == [[0, 1], [1, 0]]
     expected = torch.softmax(
         torch.tensor(
@@ -58,6 +61,8 @@ def test_route_experts_fast_from_gate_weight_renormalizes() -> None:
         dim=-1,
     )
     torch.testing.assert_close(routing.topk_weights, expected)
+    torch.testing.assert_close(routing.flat_ids, routing.topk_ids.view(-1))
+    torch.testing.assert_close(routing.flat_weights, routing.topk_weights.view(-1))
 
 
 def test_route_experts_fast_without_renormalize_returns_topk_logits() -> None:

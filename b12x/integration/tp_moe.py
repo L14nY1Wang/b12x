@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from b12x.cute.fp4 import align_up, as_grouped_scale_view
 from b12x.cute.utils import current_cuda_stream, get_max_active_clusters, get_num_sm, make_ptr
 from b12x.integration.triton_compact import compact_topk_ids as triton_compact_topk_ids
+from b12x.integration.triton_route import route_topk as triton_route_topk
 from b12x.moe.fused import MoEDynamicKernel, MoEMicroKernel, MoEStaticKernel
 
 _NVFP4_BLOCK_SIZE = 16
@@ -47,6 +48,7 @@ class TPMoEWorkspace:
     packed_a_flat: torch.Tensor | None = None
     scale_flat: torch.Tensor | None = None
     packed_a_storage_ptr: object = None
+    route_workspace: "_TPRouteWorkspace | None" = None
 
 
 @dataclass(kw_only=True)
@@ -89,9 +91,11 @@ class TPMoEWorkspacePool:
     """
 
     workspaces: Dict[Tuple, TPMoEWorkspace] = field(default_factory=dict)
+    route_workspaces: Dict[Tuple, "_TPRouteWorkspace"] = field(default_factory=dict)
 
     def clear(self) -> None:
         self.workspaces.clear()
+        self.route_workspaces.clear()
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -115,6 +119,16 @@ class B12XTopKRouting:
     topk_weights: torch.Tensor
     topk_ids: torch.Tensor
     router_logits: torch.Tensor | None = None
+    flat_ids: torch.Tensor | None = None
+    flat_weights: torch.Tensor | None = None
+
+
+@dataclass(kw_only=True)
+class _TPRouteWorkspace:
+    router_logits: torch.Tensor
+    topk_logits: torch.Tensor
+    topk_ids: torch.Tensor
+    topk_weights: torch.Tensor
 
 
 @dataclass
@@ -1582,6 +1596,86 @@ def _validate_sparse_routing(hidden_states: torch.Tensor, routing: B12XTopKRouti
             "router_logits batch mismatch: expected "
             f"{hidden_states.shape[0]}, got {routing.router_logits.shape[0]}"
         )
+    if routing.flat_ids is not None and routing.flat_ids.numel() != routing.topk_ids.numel():
+        raise ValueError(
+            "flat_ids size mismatch: expected "
+            f"{routing.topk_ids.numel()}, got {routing.flat_ids.numel()}"
+        )
+    if routing.flat_weights is not None and routing.flat_weights.numel() != routing.topk_weights.numel():
+        raise ValueError(
+            "flat_weights size mismatch: expected "
+            f"{routing.topk_weights.numel()}, got {routing.flat_weights.numel()}"
+        )
+
+
+def _alloc_route_workspace(
+    *,
+    num_tokens: int,
+    num_experts: int,
+    top_k: int,
+    device: torch.device,
+    logits_dtype: torch.dtype,
+) -> _TPRouteWorkspace:
+    return _TPRouteWorkspace(
+        router_logits=torch.empty(num_tokens, num_experts, device=device, dtype=logits_dtype),
+        topk_logits=torch.empty(num_tokens, top_k, device=device, dtype=torch.float32),
+        topk_ids=torch.empty(num_tokens, top_k, device=device, dtype=torch.int32),
+        topk_weights=torch.empty(num_tokens, top_k, device=device, dtype=torch.float32),
+    )
+
+
+def _get_route_workspace(
+    hidden_states: torch.Tensor,
+    *,
+    num_experts: int,
+    top_k: int,
+    logits_dtype: torch.dtype,
+    workspace: TPMoEWorkspace | TPMoEWorkspacePool | None,
+) -> _TPRouteWorkspace | None:
+    if workspace is None:
+        return None
+
+    m = hidden_states.shape[0]
+    device = hidden_states.device
+
+    if isinstance(workspace, TPMoEWorkspacePool):
+        key = (
+            int(torch.cuda.current_stream(device=device).cuda_stream),
+            device.index,
+            m,
+            num_experts,
+            top_k,
+            logits_dtype,
+        )
+        route_workspace = workspace.route_workspaces.get(key)
+        if route_workspace is None:
+            route_workspace = _alloc_route_workspace(
+                num_tokens=m,
+                num_experts=num_experts,
+                top_k=top_k,
+                device=device,
+                logits_dtype=logits_dtype,
+            )
+            workspace.route_workspaces[key] = route_workspace
+        return route_workspace
+
+    route_workspace = workspace.route_workspace
+    if (
+        route_workspace is None
+        or route_workspace.router_logits.shape != (m, num_experts)
+        or route_workspace.topk_logits.shape != (m, top_k)
+        or route_workspace.router_logits.dtype != logits_dtype
+        or route_workspace.router_logits.device != device
+    ):
+        route_workspace = _alloc_route_workspace(
+            num_tokens=m,
+            num_experts=num_experts,
+            top_k=top_k,
+            device=device,
+            logits_dtype=logits_dtype,
+        )
+        workspace.route_workspace = route_workspace
+    return route_workspace
 
 
 def _select_experts_reference(
@@ -1674,19 +1768,125 @@ def b12x_route_experts_fast(
     """Public sparse-routing entrypoint for higher-level integrations.
 
     This is the optimization seam for future fast routing work. The current
-    implementation intentionally falls back to the simple reference selection
-    path while preserving the interface we want sglang and future fused routing
-    kernels to target.
+    implementation preserves the simple reference math, but when a caller-owned
+    workspace is available it reuses route scratch buffers for the gate logits
+    and top-k outputs. Returned tensors may therefore alias mutable workspace
+    scratch and should be cloned by callers that want to retain them across
+    subsequent launches on the same workspace.
     """
+    if hidden_states.ndim != 2:
+        raise ValueError(
+            "expected hidden_states with rank 2, got shape "
+            f"{tuple(hidden_states.shape)}"
+        )
+    if top_k <= 0:
+        raise ValueError(f"top_k must be positive, got {top_k}")
+    if router_logits is not None and gate_weight is not None:
+        raise ValueError("pass either router_logits or gate_weight, not both")
+    if router_logits is None and gate_weight is None:
+        raise ValueError("expected router_logits or gate_weight")
 
-    del workspace
-    return _select_experts_reference(
+    if router_logits is None:
+        assert gate_weight is not None
+        if gate_weight.ndim != 2:
+            raise ValueError(
+                f"expected gate_weight with rank 2, got shape {tuple(gate_weight.shape)}"
+            )
+        if gate_weight.shape[1] != hidden_states.shape[1]:
+            raise ValueError(
+                "gate_weight hidden-size mismatch: expected "
+                f"{hidden_states.shape[1]}, got {gate_weight.shape[1]}"
+            )
+        if gate_bias is not None:
+            if gate_bias.ndim != 1:
+                raise ValueError(
+                    f"expected gate_bias with rank 1, got shape {tuple(gate_bias.shape)}"
+                )
+            if gate_bias.shape[0] != gate_weight.shape[0]:
+                raise ValueError(
+                    "gate_bias expert mismatch: expected "
+                    f"{gate_weight.shape[0]}, got {gate_bias.shape[0]}"
+                )
+        num_experts = gate_weight.shape[0]
+        logits_dtype = torch.result_type(hidden_states, gate_weight)
+    else:
+        if router_logits.ndim != 2:
+            raise ValueError(
+                "expected router_logits with rank 2, got shape "
+                f"{tuple(router_logits.shape)}"
+            )
+        if router_logits.shape[0] != hidden_states.shape[0]:
+            raise ValueError(
+                "router_logits batch mismatch: expected "
+                f"{hidden_states.shape[0]}, got {router_logits.shape[0]}"
+            )
+        num_experts = router_logits.shape[1]
+        logits_dtype = router_logits.dtype
+
+    if top_k > num_experts:
+        raise ValueError(f"top_k={top_k} exceeds num_experts={num_experts}")
+
+    if not hidden_states.is_cuda or num_experts > 1024:
+        selected = _select_experts_reference(
+            hidden_states,
+            top_k=top_k,
+            gate_weight=gate_weight,
+            gate_bias=gate_bias,
+            router_logits=router_logits,
+            renormalize=renormalize,
+        )
+        topk_ids_i32 = selected.topk_ids.to(torch.int32)
+        return B12XTopKRouting(
+            topk_weights=selected.topk_weights,
+            topk_ids=topk_ids_i32,
+            router_logits=selected.router_logits,
+            flat_ids=topk_ids_i32.view(-1),
+            flat_weights=selected.topk_weights.reshape(-1),
+        )
+
+    route_workspace = _get_route_workspace(
         hidden_states,
+        num_experts=num_experts,
         top_k=top_k,
-        gate_weight=gate_weight,
-        gate_bias=gate_bias,
-        router_logits=router_logits,
+        logits_dtype=logits_dtype,
+        workspace=workspace,
+    )
+    if route_workspace is None:
+        route_workspace = _alloc_route_workspace(
+            num_tokens=hidden_states.shape[0],
+            num_experts=num_experts,
+            top_k=top_k,
+            device=hidden_states.device,
+            logits_dtype=logits_dtype,
+        )
+
+    if router_logits is None:
+        assert gate_weight is not None
+        torch.mm(hidden_states, gate_weight.t(), out=route_workspace.router_logits)
+        if gate_bias is not None:
+            route_workspace.router_logits.add_(gate_bias.to(route_workspace.router_logits.dtype))
+        router_logits = route_workspace.router_logits
+    else:
+        if not router_logits.is_contiguous():
+            route_workspace.router_logits.copy_(router_logits)
+            router_logits = route_workspace.router_logits
+
+    triton_route_topk(
+        router_logits,
+        route_workspace.topk_logits,
+        route_workspace.topk_ids,
+        route_workspace.topk_weights,
         renormalize=renormalize,
+    )
+    topk_ids = route_workspace.topk_ids
+    topk_weights = route_workspace.topk_weights
+
+    return B12XTopKRouting(
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        router_logits=router_logits,
+        flat_ids=topk_ids.view(-1),
+        flat_weights=topk_weights.view(-1),
     )
 
 
