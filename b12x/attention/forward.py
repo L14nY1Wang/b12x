@@ -176,7 +176,7 @@ def warp_mma_gemm_rs_fp8(
     for k in cutlass.range_constexpr(cute.size(tCrA.shape[2])):
         if const_expr(k < cute.size(tCrA.shape[2]) - 1):
             copy_flattened(tCsBRaw[None, None, k + 1], tCrB_raw_copy_view[None, None, k + 1])
-        convert_fp8_fragment_to_bf16(tCrB[None, None, k], tCrB_raw_copy_view[None, None, k], transpose)
+        convert_fp8_fragment_to_bf16(tCrB[None, None, k], tCrBRaw[None, None, k], transpose)
         cute.gemm(tiled_mma, acc, tCrA[None, None, k], tCrB[None, None, k], acc)
 
 
