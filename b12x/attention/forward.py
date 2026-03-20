@@ -1075,18 +1075,21 @@ class SM120ForwardKernel:
     ):
         total_elems = self.tile_n * tile_hdim_x
         total_vec4 = total_elems // 4
-        words_per_row = tile_hdim_x // 4
         one = Float32(1.0)
         sXRaw_u8 = cute.recast_tensor(sXRaw, cutlass.Uint8)
         if const_expr(self.dtype == cutlass.BFloat16):
-            sXRaw_u32 = cute.recast_tensor(sXRaw, cutlass.Uint32)
             for idx_iter in cutlass.range_constexpr(cute.ceil_div(total_vec4, self.num_mma_threads)):
                 vec_idx = tidx + idx_iter * self.num_mma_threads
                 if vec_idx < total_vec4:
-                    row = vec_idx // words_per_row
-                    col_word = vec_idx - row * words_per_row
-                    col = col_word * 4
-                    packed = sXRaw_u32[row, col_word, stage_idx]
+                    linear_idx = vec_idx * 4
+                    row = linear_idx // tile_hdim_x
+                    col = linear_idx - row * tile_hdim_x
+                    packed = (
+                        cutlass.Uint32(sXRaw_u8[row, col + 0, stage_idx])
+                        | (cutlass.Uint32(sXRaw_u8[row, col + 1, stage_idx]) << cutlass.Uint32(8))
+                        | (cutlass.Uint32(sXRaw_u8[row, col + 2, stage_idx]) << cutlass.Uint32(16))
+                        | (cutlass.Uint32(sXRaw_u8[row, col + 3, stage_idx]) << cutlass.Uint32(24))
+                    )
                     bf2_01, bf2_23 = fp8x4_e4m3_to_bfloat2x2(packed)
                     value0, value1 = bfloat2_to_float2_scaled(bf2_01, one)
                     value2, value3 = bfloat2_to_float2_scaled(bf2_23, one)
