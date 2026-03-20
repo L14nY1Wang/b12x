@@ -48,14 +48,14 @@ class PagedAttentionCombineKernel:
         self.shared_storage = self._get_shared_storage_cls()
 
     def _get_shared_storage_cls(self):
-        @cute.struct
-        class SharedStorage:
-            scratch: cute.struct.Align[
+        SharedStorage = type("SharedStorage", (), {})
+        SharedStorage.__annotations__ = {
+            "scratch": cute.struct.Align[
                 cute.struct.MemRange[Float32, self.num_splits + 1],
                 16,
             ]
-
-        return SharedStorage
+        }
+        return cute.struct(SharedStorage)
 
     @staticmethod
     def can_implement(
