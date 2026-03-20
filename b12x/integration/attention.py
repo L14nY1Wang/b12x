@@ -1674,7 +1674,7 @@ def create_paged_attention_plan(
     max_pages = _max_pages_from_cache_seqlens(cache_seqlens, page_size=page_size)
     if (
         kv_dtype == _FP8_KV_DTYPE
-        and mode in ("decode", "extend")
+        and mode == "decode"
         and max_pages >= 32
         and num_splits < 16
         and 16 in buckets
