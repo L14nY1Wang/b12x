@@ -15,7 +15,7 @@ from b12x.attention.combine import PagedAttentionCombineKernel
 from b12x.attention.forward import SM120ForwardKernel
 from b12x.cute.utils import current_cuda_stream, make_ptr
 
-_DEFAULT_PAGED_SPLIT_BUCKETS = (1, 2, 4, 8, 16)
+_DEFAULT_PAGED_SPLIT_BUCKETS = (1, 2, 4, 8, 16, 24)
 _DEFAULT_MIN_PAGES_PER_SPLIT = 8
 _FP8_KV_DTYPE = torch.float8_e4m3fn
 
@@ -461,6 +461,7 @@ def choose_paged_attention_num_splits(
     *,
     page_size: int,
     mode: Literal["decode", "extend"] | None = None,
+    kv_dtype: torch.dtype | None = None,
     split_buckets: tuple[int, ...] = _DEFAULT_PAGED_SPLIT_BUCKETS,
     min_pages_per_split: int = _DEFAULT_MIN_PAGES_PER_SPLIT,
 ) -> int:
@@ -484,6 +485,8 @@ def choose_paged_attention_num_splits(
             return 1
         if max_pages <= 4:
             return 4 if 4 in buckets else buckets[-1]
+        if kv_dtype == _FP8_KV_DTYPE and max_pages >= 512 and 24 in buckets:
+            return 24
         if max_pages <= 128:
             return 8 if 8 in buckets else buckets[-1]
         return 16 if 16 in buckets else buckets[-1]
@@ -1666,6 +1669,7 @@ def create_paged_attention_plan(
             cache_seqlens,
             page_size=page_size,
             mode=mode,
+            kv_dtype=kv_dtype,
             split_buckets=buckets,
             min_pages_per_split=min_pages_per_split,
         )
