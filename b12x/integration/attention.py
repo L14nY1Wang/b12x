@@ -1009,19 +1009,21 @@ class _PagedAttentionCombineLaunch:
         self._lse_stride = _contiguous_stride(lse_shape)
         self._dtype = _torch_to_cutlass_dtype(dtype)
         _, _, _, head_dim = split_output_shape
+        num_threads = min(256, max(32, ((head_dim + tile_k - 1) // tile_k) * 32))
         if not PagedAttentionCombineKernel.can_implement(
             self._dtype,
             self._dtype,
             head_dim=head_dim,
             num_splits=num_splits,
             tile_k=tile_k,
-            num_threads=32,
+            num_threads=num_threads,
         ):
             raise TypeError(
                 "b12x paged attention combine launch is unsupported with "
                 f"dtype={dtype}, split_output_shape={split_output_shape}, "
                 f"split_lse_shape={split_lse_shape}, output_shape={output_shape}, "
-                f"lse_shape={lse_shape}, num_splits={num_splits}, tile_k={tile_k}"
+                f"lse_shape={lse_shape}, num_splits={num_splits}, tile_k={tile_k}, "
+                f"num_threads={num_threads}"
             )
         self._kernel = PagedAttentionCombineKernel(
             self._dtype,
@@ -1029,6 +1031,7 @@ class _PagedAttentionCombineLaunch:
             head_dim=head_dim,
             num_splits=num_splits,
             tile_k=tile_k,
+            num_threads=num_threads,
         )
 
     @cute.jit
