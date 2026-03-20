@@ -21,7 +21,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, const_expr
+from cutlass import Float32, Int32, Uint32, const_expr
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 from cutlass.utils import LayoutEnum
 import cutlass.utils.hopper_helpers as sm90_utils_basic
@@ -46,7 +46,9 @@ from b12x.attention.tile_scheduler import (
 )
 from b12x.cute.fp4 import (
     bfloat2_to_float2_scaled,
+    cvt_bf16x2_to_e4m3x2,
     fp8x4_e4m3_to_bfloat2x2,
+    mxfp8_mma_m16n8k32_f32_e4m3,
 )
 
 @cute.jit
@@ -180,6 +182,116 @@ def warp_mma_gemm_rs_fp8(
         cute.gemm(tiled_mma, acc, tCrA[None, None, k], tCrB[None, None, k], acc)
 
 
+@cute.jit
+def warp_mma_gemm_rs_mxfp8(
+    acc: cute.Tensor,
+    tCrA: cute.Tensor,
+    tCrBRaw: cute.Tensor,
+    tCsBRaw: cute.Tensor,
+    smem_thr_copy_B_raw: cute.TiledCopy,
+):
+    """PV accumulation using MXFP8 block-scaled MMA m16n8k32.
+
+    Instead of dequanting V (FP8->BF16) and using BF16 MMA k=16, this path:
+    1. Quantizes P (A operand) from BF16 to E4M3 using cvt.rn.satfinite.e4m3x2.bf16x2
+    2. Loads V (B operand) as raw E4M3 bytes (already FP8 in KV cache)
+    3. Uses MXFP8 block-scaled MMA m16n8k32 with scale=1.0 for both operands
+
+    The k=32 MMA processes 2x the K-elements per instruction at similar cycle cost,
+    giving ~2x MMA throughput on the PV accumulation.
+
+    Requires num_k_steps (= tile_n / 16) to be even, i.e. tile_n divisible by 32.
+    """
+    tCrB_raw_copy_view = smem_thr_copy_B_raw.retile(tCrBRaw)
+
+    # Scale factors: ue8m0 = 0x7F = 2^0 = 1.0 for both P and V.
+    sfa = Uint32(0x7F7F7F7F)
+    sfb = Uint32(0x7F7F7F7F)
+    mask16 = Uint32(0xFFFF)
+    shift16 = Uint32(16)
+
+    num_k_steps = cute.size(tCrA.shape[2])
+
+    # Recast all fragments to u32 for direct register manipulation.
+    # The BF16 tiled_mma_pv partitions the A/B fragments into per-thread slices.
+    # For a warp-level m16n8k16 MMA, each thread's fragment per k-step is:
+    #   A: 4 u32 (8 bf16 values)
+    #   B: 2 u32 (4 bf16 values) — but for raw FP8, 4 u8 = 1 u32
+    #   C: 4 f32 (4 accumulator values)
+    # We flatten everything and work on the raw registers directly.
+
+    acc_flat = cute.flatten(acc)
+
+    # Prefetch first two k-steps of V raw bytes
+    copy_flattened(tCsBRaw[None, None, 0], tCrB_raw_copy_view[None, None, 0])
+    if const_expr(num_k_steps > 1):
+        copy_flattened(tCsBRaw[None, None, 1], tCrB_raw_copy_view[None, None, 1])
+
+    for k_pair in cutlass.range_constexpr(num_k_steps // 2):
+        k0 = k_pair * 2
+        k1 = k0 + 1
+
+        # Prefetch next pair of V k-steps
+        if const_expr(k1 + 1 < num_k_steps):
+            copy_flattened(tCsBRaw[None, None, k1 + 1], tCrB_raw_copy_view[None, None, k1 + 1])
+        if const_expr(k1 + 2 < num_k_steps):
+            copy_flattened(tCsBRaw[None, None, k1 + 2], tCrB_raw_copy_view[None, None, k1 + 2])
+
+        # Quantize A (P): flatten both k-steps to u32, convert bf16x2 -> e4m3x2, pack
+        a_k0 = cute.flatten(cute.recast_tensor(tCrA[None, None, k0], cutlass.Uint32))
+        a_k1 = cute.flatten(cute.recast_tensor(tCrA[None, None, k1], cutlass.Uint32))
+
+        # Pack B (V): flatten both k-steps to u32
+        b_k0 = cute.flatten(cute.recast_tensor(tCrBRaw[None, None, k0], cutlass.Uint32))
+        b_k1 = cute.flatten(cute.recast_tensor(tCrBRaw[None, None, k1], cutlass.Uint32))
+
+        # For the tiled MMA with num_compute_warps warps, cute.gemm would issue
+        # multiple MMA instructions per k-step: one per (m_tile, n_tile) pair.
+        # The flattened A fragment has 4 * num_m_tiles u32 values.
+        # The flattened B fragment has 1 * num_n_tiles u32 values.
+        # The flattened acc has 4 * num_m_tiles * num_n_tiles f32 values.
+        #
+        # Each MMA m16n8k32 consumes: A[4 u32], B[2 u32], C[4 f32]
+        # We iterate over accumulator tiles in the same order cute.gemm would.
+
+        num_a_words = cute.size(a_k0.shape)  # 4 * num_m_tiles
+        num_b_words = cute.size(b_k0.shape)  # 1 * num_n_tiles
+        num_m_tiles = num_a_words // 4
+        num_n_tiles = num_b_words  # 1 u32 per n_tile per k-step
+
+        for m in cutlass.range_constexpr(num_m_tiles):
+            # Quantize this m-tile's A registers for k=32
+            a_base = m * 4
+            qa0 = (cvt_bf16x2_to_e4m3x2(a_k0[a_base + 0]) & mask16) | ((cvt_bf16x2_to_e4m3x2(a_k1[a_base + 0]) & mask16) << shift16)
+            qa1 = (cvt_bf16x2_to_e4m3x2(a_k0[a_base + 1]) & mask16) | ((cvt_bf16x2_to_e4m3x2(a_k1[a_base + 1]) & mask16) << shift16)
+            qa2 = (cvt_bf16x2_to_e4m3x2(a_k0[a_base + 2]) & mask16) | ((cvt_bf16x2_to_e4m3x2(a_k1[a_base + 2]) & mask16) << shift16)
+            qa3 = (cvt_bf16x2_to_e4m3x2(a_k0[a_base + 3]) & mask16) | ((cvt_bf16x2_to_e4m3x2(a_k1[a_base + 3]) & mask16) << shift16)
+
+            for n in cutlass.range_constexpr(num_n_tiles):
+                # Pack this n-tile's B registers for k=32
+                qb0 = b_k0[n]
+                qb1 = b_k1[n]
+
+                # Accumulator index: (m * num_n_tiles + n) * 4
+                acc_base = (m * num_n_tiles + n) * 4
+                d0 = acc_flat[acc_base + 0]
+                d1 = acc_flat[acc_base + 1]
+                d2 = acc_flat[acc_base + 2]
+                d3 = acc_flat[acc_base + 3]
+
+                d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
+                    d0, d1, d2, d3,
+                    qa0, qa1, qa2, qa3,
+                    qb0, qb1,
+                    sfa, sfb,
+                )
+
+                acc_flat[acc_base + 0] = d0
+                acc_flat[acc_base + 1] = d1
+                acc_flat[acc_base + 2] = d2
+                acc_flat[acc_base + 3] = d3
+
+
 class SM120ForwardKernel:
     arch = 120
 
@@ -244,6 +356,11 @@ class SM120ForwardKernel:
             "SM120 paged KV cp.async path does not support irregular head dim"
         )
         self.kv_is_fp8 = self.kv_dtype == cutlass.Float8E4M3FN
+        # Use MXFP8 block-scaled MMA for the PV accumulation when KV cache is FP8.
+        # This quantizes P (BF16 softmax output) to E4M3 and uses the SM120 MXFP8
+        # m16n8k32 MMA which gives 2x K-throughput vs the BF16 m16n8k16 dequant path.
+        # Requires tile_n divisible by 32 (k=32 MMA processes pairs of k=16 steps).
+        self.use_mxfp8_pv = self.kv_is_fp8 and (tile_n % 32 == 0)
         self.paged_direct_q_seqlen = paged_direct_q_seqlen
 
     def _check_type(
@@ -1386,7 +1503,17 @@ class SM120ForwardKernel:
         tOrP = layout_utils.reshape_acc_to_frgA(rP)
 
         pipeline_v.consumer_wait(kv_consumer_state, pipeline_v.consumer_try_wait(kv_consumer_state))
-        if const_expr(self.kv_is_fp8):
+        if const_expr(self.use_mxfp8_pv):
+            warp_mma_gemm_rs_mxfp8(
+                acc_O,
+                tOrP,
+                tOrVtRaw,
+                tOsVtRaw[
+                    None, None, None, kv_consumer_state.index if const_expr(self.num_stages > 1) else 0
+                ],
+                smem_thr_copy_VRaw,
+            )
+        elif const_expr(self.kv_is_fp8):
             warp_mma_gemm_rs_fp8(
                 thr_mma_pv,
                 acc_O,
