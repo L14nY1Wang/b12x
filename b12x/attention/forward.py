@@ -136,23 +136,6 @@ def copy_flattened(src: cute.Tensor, dst: cute.Tensor):
 
 
 @cute.jit
-def copy_flattened_transpose_4x4(src: cute.Tensor, dst: cute.Tensor):
-    src_flat = cute.flatten(src)
-    dst_flat = cute.flatten(dst)
-    num_bytes = cute.size(dst_flat.shape)
-    full_blocks = num_bytes // 16
-    for block_idx in cutlass.range_constexpr(full_blocks):
-        base = block_idx * 16
-        for lane_idx in cutlass.range_constexpr(4):
-            dst_flat[base + 4 * lane_idx + 0] = src_flat[base + lane_idx + 0]
-            dst_flat[base + 4 * lane_idx + 1] = src_flat[base + lane_idx + 4]
-            dst_flat[base + 4 * lane_idx + 2] = src_flat[base + lane_idx + 8]
-            dst_flat[base + 4 * lane_idx + 3] = src_flat[base + lane_idx + 12]
-    for idx in cutlass.range_constexpr(full_blocks * 16, num_bytes):
-        dst_flat[idx] = src_flat[idx]
-
-
-@cute.jit
 def warp_mma_gemm_fp8(
     tiled_mma: cute.TiledMma,
     acc: cute.Tensor,
@@ -196,12 +179,10 @@ def warp_mma_gemm_rs_fp8(
     transpose: cutlass.Constexpr = False,
 ):
     tCrB_raw_copy_view = smem_thr_copy_B_raw.retile(tCrBRaw)
-    copy_flattened_transpose_4x4(tCsBRaw[None, None, 0], tCrB_raw_copy_view[None, None, 0])
+    copy_flattened(tCsBRaw[None, None, 0], tCrB_raw_copy_view[None, None, 0])
     for k in cutlass.range_constexpr(cute.size(tCrA.shape[2])):
         if const_expr(k < cute.size(tCrA.shape[2]) - 1):
-            copy_flattened_transpose_4x4(
-                tCsBRaw[None, None, k + 1], tCrB_raw_copy_view[None, None, k + 1]
-            )
+            copy_flattened(tCsBRaw[None, None, k + 1], tCrB_raw_copy_view[None, None, k + 1])
         convert_fp8_fragment_to_bf16(tCrB[None, None, k], tCrBRaw[None, None, k], transpose)
         cute.gemm(tiled_mma, acc, tCrA[None, None, k], tCrB[None, None, k], acc)
 
