@@ -1039,40 +1039,19 @@ class SM120ForwardKernel:
         tile_hdim_x: cutlass.Constexpr,
     ):
         lane = cute.arch.lane_idx()
-        mXu64 = cute.recast_tensor(mX, cutlass.Uint64)
+        mXu8 = cute.recast_tensor(mX, cutlass.Uint8)
         sXu8 = cute.recast_tensor(sX, cutlass.Uint8)
-        chunks_per_row = tile_hdim_x // 8
-        total_vec8 = self.tile_n * chunks_per_row
-        for idx_iter in cutlass.range_constexpr(cute.ceil_div(total_vec8, cute.arch.WARP_SIZE)):
+        total_vec4 = (self.tile_n * tile_hdim_x) // 4
+        for idx_iter in cutlass.range_constexpr(cute.ceil_div(total_vec4, cute.arch.WARP_SIZE)):
             vec_idx = lane + idx_iter * cute.arch.WARP_SIZE
-            if vec_idx < total_vec8:
-                row = vec_idx // chunks_per_row
-                col = (vec_idx - row * chunks_per_row) * 8
-                packed = mXu64[row, col // 8, head_idx_kv, src_idx]
-                sXu8[row, col + 0, stage_idx] = (
-                    packed & cutlass.Uint64(0xFF)
-                ).to(cutlass.Uint8)
-                sXu8[row, col + 1, stage_idx] = (
-                    (packed >> cutlass.Uint64(8)) & cutlass.Uint64(0xFF)
-                ).to(cutlass.Uint8)
-                sXu8[row, col + 2, stage_idx] = (
-                    (packed >> cutlass.Uint64(16)) & cutlass.Uint64(0xFF)
-                ).to(cutlass.Uint8)
-                sXu8[row, col + 3, stage_idx] = (
-                    (packed >> cutlass.Uint64(24)) & cutlass.Uint64(0xFF)
-                ).to(cutlass.Uint8)
-                sXu8[row, col + 4, stage_idx] = (
-                    (packed >> cutlass.Uint64(32)) & cutlass.Uint64(0xFF)
-                ).to(cutlass.Uint8)
-                sXu8[row, col + 5, stage_idx] = (
-                    (packed >> cutlass.Uint64(40)) & cutlass.Uint64(0xFF)
-                ).to(cutlass.Uint8)
-                sXu8[row, col + 6, stage_idx] = (
-                    (packed >> cutlass.Uint64(48)) & cutlass.Uint64(0xFF)
-                ).to(cutlass.Uint8)
-                sXu8[row, col + 7, stage_idx] = (
-                    (packed >> cutlass.Uint64(56)) & cutlass.Uint64(0xFF)
-                ).to(cutlass.Uint8)
+            if vec_idx < total_vec4:
+                linear_idx = vec_idx * 4
+                row = linear_idx // tile_hdim_x
+                col = linear_idx - row * tile_hdim_x
+                sXu8[row, col + 0, stage_idx] = mXu8[row, col + 0, head_idx_kv, src_idx]
+                sXu8[row, col + 1, stage_idx] = mXu8[row, col + 1, head_idx_kv, src_idx]
+                sXu8[row, col + 2, stage_idx] = mXu8[row, col + 2, head_idx_kv, src_idx]
+                sXu8[row, col + 3, stage_idx] = mXu8[row, col + 3, head_idx_kv, src_idx]
 
     @cute.jit
     def dequant_fp8_stage_shared(
