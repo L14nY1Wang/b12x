@@ -851,7 +851,7 @@ class _PagedAttentionForwardLaunch:
         self._lse_stride = _contiguous_stride(self._lse_shape)
         self._dtype = _torch_to_cutlass_dtype(dtype)
         self._kv_dtype = _torch_to_cutlass_dtype(kv_dtype)
-        self._q_in_regs = q_in_regs
+        self._q_in_regs = q_in_regs or (self._kv_dtype == cutlass.Float8E4M3FN)
         (
             self._num_batch,
             q_heads,
