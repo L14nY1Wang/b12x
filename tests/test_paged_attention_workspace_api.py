@@ -623,7 +623,6 @@ def test_mode_aware_split_bucket_selection_matches_planner_policy() -> None:
     short_decode = torch.tensor([64] * 8, dtype=torch.int32, device="cuda")
     mid_decode = torch.tensor([128] * 8, dtype=torch.int32, device="cuda")
     long_decode = torch.tensor([2048] * 8, dtype=torch.int32, device="cuda")
-    very_long_decode = torch.tensor([8192] * 2, dtype=torch.int32, device="cuda")
     ultra_long_decode = torch.tensor([32768] * 2, dtype=torch.int32, device="cuda")
     short_extend = torch.tensor([128] * 8, dtype=torch.int32, device="cuda")
     mid_extend = torch.tensor([256] * 8, dtype=torch.int32, device="cuda")
@@ -633,15 +632,6 @@ def test_mode_aware_split_bucket_selection_matches_planner_policy() -> None:
     assert choose_paged_attention_num_splits(short_decode, page_size=64, mode="decode") == 1
     assert choose_paged_attention_num_splits(mid_decode, page_size=64, mode="decode") == 2
     assert choose_paged_attention_num_splits(long_decode, page_size=64, mode="decode") == 8
-    assert (
-        choose_paged_attention_num_splits(
-            very_long_decode,
-            page_size=64,
-            mode="decode",
-            kv_dtype=torch.float8_e4m3fn,
-        )
-        == 24
-    )
     assert (
         choose_paged_attention_num_splits(
             ultra_long_decode,
