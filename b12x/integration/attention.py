@@ -1672,14 +1672,11 @@ def create_paged_attention_plan(
     elif num_splits not in buckets:
         raise ValueError(f"num_splits must be one of {buckets}, got {num_splits}")
     max_pages = _max_pages_from_cache_seqlens(cache_seqlens, page_size=page_size)
-    if (
-        kv_dtype == _FP8_KV_DTYPE
-        and mode == "decode"
-        and max_pages >= 32
-        and num_splits < 16
-        and 16 in buckets
-    ):
-        num_splits = 16
+    if kv_dtype == _FP8_KV_DTYPE and mode == "decode":
+        if max_pages >= 128 and num_splits < 32:
+            num_splits = 32
+        elif max_pages >= 32 and num_splits < 16 and 16 in buckets:
+            num_splits = 16
     _, _, head_dim = q_shape
     kernel_config = _select_paged_kernel_config(
         head_dim,

@@ -62,7 +62,7 @@ class PagedAttentionCombineKernel:
             return False
         if head_dim <= 0 or head_dim % 8 != 0:
             return False
-        if num_splits <= 1 or num_splits > 16:
+        if num_splits <= 1 or num_splits > 32:
             return False
         if tile_k != 32:
             return False
