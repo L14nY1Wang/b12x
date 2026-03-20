@@ -226,7 +226,7 @@ def _select_paged_kernel_config(
         tile_n=tile_n,
         num_compute_warps=2 if head_dim == 256 else 4,
         num_stages=1,
-        q_in_regs=False,
+        q_in_regs=mode == "decode" and head_dim == 256,
     )
 
 
