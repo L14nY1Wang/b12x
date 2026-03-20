@@ -721,7 +721,18 @@ class SM120ForwardKernel:
             if const_expr(mLSE is not None):
                 mLSE = pack_gqa_layout(mLSE, self.qhead_per_kvhead, nheads_kv, head_idx=1)
         mK_tma_src = (
-            cute.recast_tensor(mK, cutlass.Uint32)
+            cute.make_tensor(
+                cute.recast_ptr(mK.iterator, dtype=cutlass.Uint32),
+                cute.make_layout(
+                    (mK.shape[0], mK.shape[1] // 4, mK.shape[2], mK.shape[3]),
+                    stride=(
+                        (mK.shape[1] // 4) * mK.shape[2],
+                        1,
+                        mK.shape[1] // 4,
+                        mK.shape[0] * (mK.shape[1] // 4) * mK.shape[2],
+                    ),
+                ),
+            )
             if const_expr(self.use_tma_K and self.kv_is_fp8)
             else mK
         )
@@ -1172,6 +1183,17 @@ class SM120ForwardKernel:
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         wait_for_q_consumed = False
+        sKRawU32 = (
+            cute.make_tensor(
+                cute.recast_ptr(sKRaw.iterator, dtype=cutlass.Uint32),
+                cute.make_layout(
+                    (self.tile_n, self.tile_hdim // 4, self.num_stages),
+                    stride=(self.tile_hdim // 4, 1, self.tile_n * (self.tile_hdim // 4)),
+                ),
+            )
+            if const_expr(self.kv_is_fp8)
+            else None
+        )
         while work_tile.is_valid_tile:
             if const_expr(self.Q_in_regs) and wait_for_q_consumed:
                 cute.arch.barrier(
@@ -1263,14 +1285,11 @@ class SM120ForwardKernel:
                             0,
                             cute.make_layout(1),
                             mK[None, None, head_idx_kv, src_idx],
-                            cute.recast_tensor(
-                                sKRaw[
-                                    None,
-                                    None,
-                                    kv_producer_state.index if const_expr(self.num_stages > 1) else 0,
-                                ],
-                                cutlass.Uint32,
-                            ),
+                            sKRawU32[
+                                None,
+                                None,
+                                kv_producer_state.index if const_expr(self.num_stages > 1) else 0,
+                            ],
                             single_stage=True,
                         )
                         load_K_page(
