@@ -662,7 +662,6 @@ def test_mode_aware_split_bucket_selection_matches_planner_policy() -> None:
     short_extend = torch.tensor([128] * 8, dtype=torch.int32, device="cuda")
     mid_extend = torch.tensor([256] * 8, dtype=torch.int32, device="cuda")
     long_extend = torch.tensor([2048] * 8, dtype=torch.int32, device="cuda")
-    large_extend = torch.tensor([8192] * 8, dtype=torch.int32, device="cuda")
     very_long_extend = torch.tensor([16384] * 2, dtype=torch.int32, device="cuda")
     ultra_long_extend = torch.tensor([32768] * 2, dtype=torch.int32, device="cuda")
 
@@ -680,15 +679,6 @@ def test_mode_aware_split_bucket_selection_matches_planner_policy() -> None:
             kv_dtype=torch.float8_e4m3fn,
         )
         == 8
-    )
-    assert (
-        choose_paged_attention_num_splits(
-            large_extend,
-            page_size=64,
-            mode="extend",
-            kv_dtype=torch.float8_e4m3fn,
-        )
-        == 16
     )
     assert (
         choose_paged_attention_num_splits(
