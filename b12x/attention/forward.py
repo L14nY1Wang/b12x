@@ -108,47 +108,19 @@ def convert_fp8_fragment_to_bf16(
     src: cute.Tensor,
     transpose: cutlass.Constexpr = False,
 ):
-    dst_u32 = cute.flatten(cute.recast_tensor(dst, cutlass.Uint32))
-    if const_expr(not transpose):
-        src_u8 = cute.flatten(cute.recast_tensor(src, cutlass.Uint8))
-        num_packed = cute.size(dst_u32.shape) // 2
-        full_blocks = num_packed // 4
-        shift8 = cutlass.Uint32(8)
-        shift16 = cutlass.Uint32(16)
-        shift24 = cutlass.Uint32(24)
-        for block_idx in cutlass.range_constexpr(full_blocks):
-            base = block_idx * 16
-            for lane_idx in cutlass.range_constexpr(4):
-                packed = (
-                    cutlass.Uint32(src_u8[base + lane_idx + 0])
-                    | (cutlass.Uint32(src_u8[base + lane_idx + 4]) << shift8)
-                    | (cutlass.Uint32(src_u8[base + lane_idx + 8]) << shift16)
-                    | (cutlass.Uint32(src_u8[base + lane_idx + 12]) << shift24)
-                )
-                bf2_lo, bf2_hi = fp8x4_e4m3_to_bfloat2x2(packed)
-                packed_idx = block_idx * 4 + lane_idx
-                dst_u32[2 * packed_idx + 0] = bf2_lo
-                dst_u32[2 * packed_idx + 1] = bf2_hi
-        for packed_idx in cutlass.range_constexpr(full_blocks * 4, num_packed):
-            base = packed_idx * 4
-            packed = (
-                cutlass.Uint32(src_u8[base + 0])
-                | (cutlass.Uint32(src_u8[base + 1]) << shift8)
-                | (cutlass.Uint32(src_u8[base + 2]) << shift16)
-                | (cutlass.Uint32(src_u8[base + 3]) << shift24)
-            )
-            bf2_lo, bf2_hi = fp8x4_e4m3_to_bfloat2x2(packed)
-            dst_u32[2 * packed_idx + 0] = bf2_lo
-            dst_u32[2 * packed_idx + 1] = bf2_hi
-        return
-
-    src_u32 = cute.flatten(cute.recast_tensor(src, cutlass.Uint32))
-    num_packed = cute.size(src_u32.shape)
-    for packed_idx in cutlass.range_constexpr(num_packed):
-        packed = src_u32[packed_idx]
+    src_u8 = cute.flatten(cute.recast_tensor(src, cutlass.Uint8))
+    dst_u32 = cute.recast_tensor(dst, cutlass.Uint32)
+    num_packed = cute.size(dst_u32.shape) // 2
+    for i in cutlass.range_constexpr(num_packed):
+        packed = (
+            cutlass.Uint32(src_u8[4 * i + 0])
+            | (cutlass.Uint32(src_u8[4 * i + 1]) << cutlass.Uint32(8))
+            | (cutlass.Uint32(src_u8[4 * i + 2]) << cutlass.Uint32(16))
+            | (cutlass.Uint32(src_u8[4 * i + 3]) << cutlass.Uint32(24))
+        )
         bf2_lo, bf2_hi = fp8x4_e4m3_to_bfloat2x2(packed)
-        dst_u32[2 * packed_idx + 0] = bf2_lo
-        dst_u32[2 * packed_idx + 1] = bf2_hi
+        dst_u32[2 * i + 0] = bf2_lo
+        dst_u32[2 * i + 1] = bf2_hi
 
 
 @cute.jit
@@ -341,12 +313,18 @@ class SM120ForwardKernel:
             else None
         )
         self.sK_raw_layout = (
-            cute.make_layout((self.tile_n, self.tile_hdim, self.num_stages))
+            cute.make_layout(
+                (self.tile_n, self.tile_hdim, self.num_stages),
+                stride=(self.tile_hdim, 1, self.tile_n * self.tile_hdim),
+            )
             if const_expr(self.kv_is_fp8)
             else None
         )
         self.sV_raw_layout = (
-            cute.make_layout((self.tile_n, self.tile_hdimv, self.num_stages))
+            cute.make_layout(
+                (self.tile_n, self.tile_hdimv, self.num_stages),
+                stride=(self.tile_hdimv, 1, self.tile_n * self.tile_hdimv),
+            )
             if const_expr(self.kv_is_fp8)
             else None
         )
@@ -973,12 +951,22 @@ class SM120ForwardKernel:
             else storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
         )
         sKRaw = (
-            storage.sK_raw.get_tensor(cute.make_layout((self.tile_n, self.tile_hdim, self.num_stages)))
+            storage.sK_raw.get_tensor(
+                cute.make_layout(
+                    (self.tile_n, self.tile_hdim, self.num_stages),
+                    stride=(self.tile_hdim, 1, self.tile_n * self.tile_hdim),
+                )
+            )
             if const_expr(self.kv_is_fp8)
             else None
         )
         sVRaw = (
-            storage.sV_raw.get_tensor(cute.make_layout((self.tile_n, self.tile_hdimv, self.num_stages)))
+            storage.sV_raw.get_tensor(
+                cute.make_layout(
+                    (self.tile_n, self.tile_hdimv, self.num_stages),
+                    stride=(self.tile_hdimv, 1, self.tile_n * self.tile_hdimv),
+                )
+            )
             if const_expr(self.kv_is_fp8)
             else None
         )
@@ -1081,64 +1069,19 @@ class SM120ForwardKernel:
         src_idx: Int32,
         stage_idx: Int32,
         tile_hdim_x: cutlass.Constexpr,
-        transpose_packed_words: cutlass.Constexpr = False,
     ):
         lane = cute.arch.lane_idx()
         del batch_idx
         mXu32 = cute.recast_tensor(mX, cutlass.Uint32)
         sXu32 = cute.recast_tensor(sX, cutlass.Uint32)
         words_per_row = tile_hdim_x // 4
-        if const_expr(not transpose_packed_words):
-            total_packed = self.tile_n * words_per_row
-            for idx_iter in cutlass.range_constexpr(cute.ceil_div(total_packed, cute.arch.WARP_SIZE)):
-                packed_idx = lane + idx_iter * cute.arch.WARP_SIZE
-                if packed_idx < total_packed:
-                    row = packed_idx // words_per_row
-                    col_word = packed_idx - row * words_per_row
-                    sXu32[row, col_word, stage_idx] = mXu32[row, col_word, head_idx_kv, src_idx]
-            return
-
-        row_blocks = self.tile_n // 4
-        total_tiles = row_blocks * words_per_row
-        shift8 = cutlass.Uint32(8)
-        shift16 = cutlass.Uint32(16)
-        shift24 = cutlass.Uint32(24)
-        mask = cutlass.Uint32(0xFF)
-        for idx_iter in cutlass.range_constexpr(cute.ceil_div(total_tiles, cute.arch.WARP_SIZE)):
-            tile_idx = lane + idx_iter * cute.arch.WARP_SIZE
-            if tile_idx < total_tiles:
-                row_block = tile_idx // words_per_row
-                col_word = tile_idx - row_block * words_per_row
-                row = row_block * 4
-                col = col_word * 4
-                packed0 = mXu32[row + 0, col_word, head_idx_kv, src_idx]
-                packed1 = mXu32[row + 1, col_word, head_idx_kv, src_idx]
-                packed2 = mXu32[row + 2, col_word, head_idx_kv, src_idx]
-                packed3 = mXu32[row + 3, col_word, head_idx_kv, src_idx]
-                sXu32[row_block, col + 0, stage_idx] = (
-                    (packed0 & mask)
-                    | ((packed1 & mask) << shift8)
-                    | ((packed2 & mask) << shift16)
-                    | ((packed3 & mask) << shift24)
-                )
-                sXu32[row_block, col + 1, stage_idx] = (
-                    ((packed0 >> shift8) & mask)
-                    | (((packed1 >> shift8) & mask) << shift8)
-                    | (((packed2 >> shift8) & mask) << shift16)
-                    | (((packed3 >> shift8) & mask) << shift24)
-                )
-                sXu32[row_block, col + 2, stage_idx] = (
-                    ((packed0 >> shift16) & mask)
-                    | (((packed1 >> shift16) & mask) << shift8)
-                    | (((packed2 >> shift16) & mask) << shift16)
-                    | (((packed3 >> shift16) & mask) << shift24)
-                )
-                sXu32[row_block, col + 3, stage_idx] = (
-                    ((packed0 >> shift24) & mask)
-                    | (((packed1 >> shift24) & mask) << shift8)
-                    | (((packed2 >> shift24) & mask) << shift16)
-                    | (((packed3 >> shift24) & mask) << shift24)
-                )
+        total_packed = self.tile_n * words_per_row
+        for idx_iter in cutlass.range_constexpr(cute.ceil_div(total_packed, cute.arch.WARP_SIZE)):
+            packed_idx = lane + idx_iter * cute.arch.WARP_SIZE
+            if packed_idx < total_packed:
+                row = packed_idx // words_per_row
+                col_word = packed_idx - row * words_per_row
+                sXu32[row, col_word, stage_idx] = mXu32[row, col_word, head_idx_kv, src_idx]
 
     @cute.jit
     def dequant_fp8_stage_shared(
@@ -1294,7 +1237,6 @@ class SM120ForwardKernel:
                         src_idx,
                         kv_producer_state.index,
                         self.tile_hdim,
-                        transpose_packed_words=False,
                     )
                     pipeline_k.producer_commit(kv_producer_state)
                 pipeline_v.producer_acquire(kv_producer_state)
@@ -1309,7 +1251,6 @@ class SM120ForwardKernel:
                         src_idx,
                         kv_producer_state.index,
                         self.tile_hdimv,
-                        transpose_packed_words=True,
                     )
                     pipeline_v.producer_commit(kv_producer_state)
                 kv_producer_state.advance()
