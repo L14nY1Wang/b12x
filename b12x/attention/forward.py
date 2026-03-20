@@ -270,7 +270,10 @@ class SM120ForwardKernel:
             raise TypeError("K and V tensors must have the same data type")
         if const_expr(mQ_type not in [cutlass.Float16, cutlass.BFloat16]):
             raise TypeError("Q/O tensors must be Float16 or BFloat16")
-        if const_expr(mK_type not in [cutlass.Float16, cutlass.BFloat16, cutlass.Float8E4M3FN]):
+        k_type_valid = mK_type in [cutlass.Float16, cutlass.BFloat16, cutlass.Float8E4M3FN]
+        if const_expr(self.kv_is_fp8):
+            k_type_valid = k_type_valid or (mK_type == cutlass.Uint8) or (mK_type == cutlass.Uint32)
+        if const_expr(not k_type_valid):
             raise TypeError("K/V tensors must be Float16, BFloat16, or Float8E4M3FN")
         if const_expr(mLSE_type not in [None, Float32]):
             raise TypeError("LSE tensor must be Float32")
@@ -289,7 +292,9 @@ class SM120ForwardKernel:
         if const_expr(mFp8Lut_type not in [None, Float32]):
             raise TypeError("fp8 LUT tensor must be Float32")
         assert mQ_type == self.dtype
-        assert mK_type == self.kv_dtype
+        assert mK_type == self.kv_dtype or (
+            self.kv_is_fp8 and mK_type in (cutlass.Uint8, cutlass.Uint32)
+        )
 
     def _setup_attributes(self):
         sQ_layout_atom, sK_layout_atom, sV_layout_atom, sO_layout_atom, sP_layout_atom = (
@@ -679,6 +684,10 @@ class SM120ForwardKernel:
         self.num_producer_regs = 80
         self.use_tma_Q = True
         self.use_tma_KV = mK.element_type in [cutlass.Float16, cutlass.BFloat16]
+        self.use_tma_K = self.use_tma_KV or (
+            self.kv_is_fp8 and const_expr(mPageTable is not None) and mPageTable.shape[1] > 8
+        )
+        self.use_tma_V = self.use_tma_KV
         self.use_tma_O = False
         if const_expr(not self.use_tma_KV and self.dtype != cutlass.BFloat16):
             assert mFp8Lut is not None, "FP8 KV path requires an FP8 lookup table"
@@ -720,13 +729,23 @@ class SM120ForwardKernel:
             mO = pack_gqa_layout(mO, self.qhead_per_kvhead, nheads_kv, head_idx=2)
             if const_expr(mLSE is not None):
                 mLSE = pack_gqa_layout(mLSE, self.qhead_per_kvhead, nheads_kv, head_idx=1)
+        mK_tma_src = (
+            cute.recast_tensor(mK, cutlass.Uint32)
+            if const_expr(self.use_tma_K and self.kv_is_fp8)
+            else mK
+        )
 
         gmem_tiled_copy_Q = cpasync.CopyBulkTensorTileG2SOp()
         gmem_tiled_copy_KV = cpasync.CopyBulkTensorTileG2SOp()
         gmem_tiled_copy_O = cpasync.CopyBulkTensorTileS2GOp()
+        sK_tma_layout = (
+            cute.make_layout((self.tile_n, self.tile_hdim // 4))
+            if const_expr(self.use_tma_K and self.kv_is_fp8)
+            else cute.select(self.sK_layout, mode=[0, 1])
+        )
         self.tma_copy_bytes = {
             "Q": cute.size_in_bytes(mQ.element_type, self.sQ_layout),
-            "K": cute.size_in_bytes(mK.element_type, cute.select(self.sK_layout, mode=[0, 1])),
+            "K": cute.size_in_bytes(mK_tma_src.element_type, sK_tma_layout),
             "V": cute.size_in_bytes(mV.element_type, cute.select(self.sV_layout, mode=[0, 1])),
         }
         if const_expr(mPageTable is not None):
@@ -782,14 +801,18 @@ class SM120ForwardKernel:
             )
         tma_atom_K, tma_tensor_K = (None, None)
         tma_atom_V, tma_tensor_V = (None, None)
-        if const_expr(self.use_tma_KV):
+        if const_expr(self.use_tma_K):
             tma_atom_K, tma_tensor_K = cpasync.make_tiled_tma_atom(
                 gmem_tiled_copy_KV,
-                mK,
-                cute.select(self.sK_layout, mode=[0, 1]),
-                (self.tile_n, self.tile_hdim),
+                mK_tma_src,
+                sK_tma_layout,
+                (
+                    self.tile_n,
+                    self.tile_hdim // 4 if const_expr(self.kv_is_fp8) else self.tile_hdim,
+                ),
                 1,
             )
+        if const_expr(self.use_tma_V):
             tma_atom_V, tma_tensor_V = cpasync.make_tiled_tma_atom(
                 gmem_tiled_copy_KV,
                 mV,
@@ -799,8 +822,8 @@ class SM120ForwardKernel:
             )
         self.kernel(
             tma_tensor_Q,
-            tma_tensor_K if const_expr(self.use_tma_KV) else mK,
-            tma_tensor_V if const_expr(self.use_tma_KV) else mV,
+            tma_tensor_K if const_expr(self.use_tma_K) else mK,
+            tma_tensor_V if const_expr(self.use_tma_V) else mV,
             tma_tensor_O if const_expr(self.use_tma_O) else mO,
             mLSE,
             mCuSeqlensQ,
@@ -812,8 +835,8 @@ class SM120ForwardKernel:
             mVDescale,
             mFp8Lut,
             tma_atom_Q,
-            tma_atom_K if const_expr(self.use_tma_KV) else None,
-            tma_atom_V if const_expr(self.use_tma_KV) else None,
+            tma_atom_K if const_expr(self.use_tma_K) else None,
+            tma_atom_V if const_expr(self.use_tma_V) else None,
             tma_atom_O,
             softmax_scale_log2,
             softmax_scale,
@@ -883,8 +906,9 @@ class SM120ForwardKernel:
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         if warp_idx == 0:
             cpasync.prefetch_descriptor(tma_atom_Q)
-            if const_expr(self.use_tma_KV):
+            if const_expr(self.use_tma_K):
                 cpasync.prefetch_descriptor(tma_atom_K)
+            if const_expr(self.use_tma_V):
                 cpasync.prefetch_descriptor(tma_atom_V)
             if const_expr(tma_atom_O is not None):
                 cpasync.prefetch_descriptor(tma_atom_O)
@@ -896,50 +920,66 @@ class SM120ForwardKernel:
             cute.arch.mbarrier_init(mbar_ptr_Q, 1)
         cute.arch.sync_threads()
 
-        if const_expr(self.use_tma_KV):
-            pipeline_kv_consumer_group = cutlass.pipeline.CooperativeGroup(
+        if const_expr(self.use_tma_K):
+            pipeline_k_consumer_group = cutlass.pipeline.CooperativeGroup(
                 cutlass.pipeline.Agent.Thread, self.num_compute_warps
             )
-            pipeline_kv_producer_group = cutlass.pipeline.CooperativeGroup(
+            pipeline_k_producer_group = cutlass.pipeline.CooperativeGroup(
                 cutlass.pipeline.Agent.Thread
             )
             pipeline_k = pipeline.PipelineTmaAsync.create(
                 barrier_storage=storage.mbar_ptr_K.data_ptr(),
                 num_stages=self.num_stages,
-                producer_group=pipeline_kv_producer_group,
-                consumer_group=pipeline_kv_consumer_group,
+                producer_group=pipeline_k_producer_group,
+                consumer_group=pipeline_k_consumer_group,
                 tx_count=self.tma_copy_bytes["K"],
                 defer_sync=True,
+            )
+        else:
+            # PipelineAsync barriers are not warp-gated. Use actual thread counts or
+            # the producer/consumer arrive counts diverge and the launch can fault.
+            pipeline_k_consumer_group = cutlass.pipeline.CooperativeGroup(
+                cutlass.pipeline.Agent.Thread, self.num_mma_threads
+            )
+            pipeline_k_producer_group = cutlass.pipeline.CooperativeGroup(
+                cutlass.pipeline.Agent.Thread, self.num_producer_threads
+            )
+            pipeline_k = pipeline.PipelineAsync.create(
+                barrier_storage=storage.mbar_ptr_K.data_ptr(),
+                num_stages=self.num_stages,
+                producer_group=pipeline_k_producer_group,
+                consumer_group=pipeline_k_consumer_group,
+                defer_sync=True,
+            )
+        if const_expr(self.use_tma_V):
+            pipeline_v_consumer_group = cutlass.pipeline.CooperativeGroup(
+                cutlass.pipeline.Agent.Thread, self.num_compute_warps
+            )
+            pipeline_v_producer_group = cutlass.pipeline.CooperativeGroup(
+                cutlass.pipeline.Agent.Thread
             )
             pipeline_v = pipeline.PipelineTmaAsync.create(
                 barrier_storage=storage.mbar_ptr_V.data_ptr(),
                 num_stages=self.num_stages,
-                producer_group=pipeline_kv_producer_group,
-                consumer_group=pipeline_kv_consumer_group,
+                producer_group=pipeline_v_producer_group,
+                consumer_group=pipeline_v_consumer_group,
                 tx_count=self.tma_copy_bytes["V"],
                 defer_sync=False,
             )
         else:
             # PipelineAsync barriers are not warp-gated. Use actual thread counts or
             # the producer/consumer arrive counts diverge and the launch can fault.
-            pipeline_kv_consumer_group = cutlass.pipeline.CooperativeGroup(
+            pipeline_v_consumer_group = cutlass.pipeline.CooperativeGroup(
                 cutlass.pipeline.Agent.Thread, self.num_mma_threads
             )
-            pipeline_kv_producer_group = cutlass.pipeline.CooperativeGroup(
+            pipeline_v_producer_group = cutlass.pipeline.CooperativeGroup(
                 cutlass.pipeline.Agent.Thread, self.num_producer_threads
-            )
-            pipeline_k = pipeline.PipelineAsync.create(
-                barrier_storage=storage.mbar_ptr_K.data_ptr(),
-                num_stages=self.num_stages,
-                producer_group=pipeline_kv_producer_group,
-                consumer_group=pipeline_kv_consumer_group,
-                defer_sync=True,
             )
             pipeline_v = pipeline.PipelineAsync.create(
                 barrier_storage=storage.mbar_ptr_V.data_ptr(),
                 num_stages=self.num_stages,
-                producer_group=pipeline_kv_producer_group,
-                consumer_group=pipeline_kv_consumer_group,
+                producer_group=pipeline_v_producer_group,
+                consumer_group=pipeline_v_consumer_group,
                 defer_sync=False,
             )
 
@@ -1189,7 +1229,16 @@ class SM120ForwardKernel:
             if const_expr(mPageTable is not None):
                 mK_cur = mK[None, None, head_idx_kv, None]
                 mV_cur = mV[None, None, head_idx_kv, None]
-                gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (0, 0, None))
+                gK = cute.local_tile(
+                    mK_cur,
+                    (
+                        self.tile_n,
+                        self.tile_hdim // 4
+                        if const_expr(self.use_tma_K and self.kv_is_fp8)
+                        else self.tile_hdim,
+                    ),
+                    (0, 0, None),
+                )
                 gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (0, 0, None))
             else:
                 mK_cur = (
@@ -1202,17 +1251,33 @@ class SM120ForwardKernel:
                     if const_expr(cute.rank(mV) == 4)
                     else mV[None, None, head_idx_kv]
                 )
-                gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (None, 0))
-                gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (None, 0))
-            if const_expr(self.use_tma_KV):
-                load_K, _, _ = copy_utils.tma_get_copy_fn(
-                    tma_atom_K, 0, cute.make_layout(1), gK, sK
+                gK = cute.local_tile(
+                    mK_cur,
+                    (
+                        self.tile_n,
+                        self.tile_hdim // 4
+                        if const_expr(self.use_tma_K and self.kv_is_fp8)
+                        else self.tile_hdim,
+                    ),
+                    (None, 0),
                 )
-                load_K = copy_utils.tma_producer_copy_fn(load_K, pipeline_k)
+                gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (None, 0))
+            if const_expr(self.use_tma_K):
+                if const_expr(not self.kv_is_fp8):
+                    load_K, _, _ = copy_utils.tma_get_copy_fn(
+                        tma_atom_K,
+                        0,
+                        cute.make_layout(1),
+                        gK,
+                        sK,
+                    )
+                    load_K = copy_utils.tma_producer_copy_fn(load_K, pipeline_k)
+            if const_expr(self.use_tma_V):
                 load_V, _, _ = copy_utils.tma_get_copy_fn(
                     tma_atom_V, 0, cute.make_layout(1), gV, sV
                 )
                 load_V = copy_utils.tma_producer_copy_fn(load_V, pipeline_v)
+
 
             n_block_min, n_block_max = block_info.get_n_block_min_max(
                 seqlen, m_block, split_idx, self.num_splits
@@ -1226,8 +1291,28 @@ class SM120ForwardKernel:
                 n_block = n_block_max - 1 - n_tile
                 src_idx = mPageTable[batch_idx, n_block] if const_expr(mPageTable is not None) else n_block
                 pipeline_k.producer_acquire(kv_producer_state)
-                if const_expr(self.use_tma_KV):
-                    load_K(src_idx=src_idx, producer_state=kv_producer_state)
+                if const_expr(self.use_tma_K):
+                    if const_expr(self.kv_is_fp8):
+                        load_K_page, _, _ = copy_utils.tma_get_copy_fn(
+                            tma_atom_K,
+                            0,
+                            cute.make_layout(1),
+                            mK[None, None, head_idx_kv, src_idx],
+                            cute.recast_tensor(
+                                sKRaw[
+                                    None,
+                                    None,
+                                    kv_producer_state.index if const_expr(self.num_stages > 1) else 0,
+                                ],
+                                cutlass.Uint32,
+                            ),
+                            single_stage=True,
+                        )
+                        load_K_page(
+                            tma_bar_ptr=pipeline_k.producer_get_barrier(kv_producer_state),
+                        )
+                    else:
+                        load_K(src_idx=src_idx, producer_state=kv_producer_state)
                 else:
                     self.load_paged_kv_stage_raw(
                         mK,
@@ -1240,7 +1325,7 @@ class SM120ForwardKernel:
                     )
                     pipeline_k.producer_commit(kv_producer_state)
                 pipeline_v.producer_acquire(kv_producer_state)
-                if const_expr(self.use_tma_KV):
+                if const_expr(self.use_tma_V):
                     load_V(src_idx=src_idx, producer_state=kv_producer_state)
                 else:
                     self.load_paged_kv_stage_raw(
@@ -1312,6 +1397,8 @@ class SM120ForwardKernel:
         is_first_n_block: cutlass.Constexpr = False,
     ):
         pipeline_k.consumer_wait(kv_consumer_state, pipeline_k.consumer_try_wait(kv_consumer_state))
+        if const_expr(self.use_tma_K and self.kv_is_fp8):
+            cute.arch.fence_proxy("async.shared", space="cta")
         acc_shape_S = thr_mma_qk.partition_shape_C((self.tile_m, self.tile_n))
         acc_S = cute.make_fragment(acc_shape_S, Float32)
         acc_S.fill(0.0)
