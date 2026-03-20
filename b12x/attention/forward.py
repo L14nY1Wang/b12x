@@ -1475,9 +1475,14 @@ class SM120ForwardKernel:
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         base_softmax_scale_log2 = softmax_scale_log2
+        softmax_num_rows = (
+            cutlass.min(acc_O.shape[0][0] * acc_O.shape[1], self.qhead_per_kvhead)
+            if const_expr(self.decode_direct_scheduler and self.pack_gqa)
+            else acc_O.shape[0][0] * acc_O.shape[1]
+        )
         softmax = Softmax.create(
             softmax_scale_log2,
-            num_rows=acc_O.shape[0][0] * acc_O.shape[1],
+            num_rows=softmax_num_rows,
             softmax_scale=softmax_scale,
         )
         q_consumer_phase = Int32(0)
