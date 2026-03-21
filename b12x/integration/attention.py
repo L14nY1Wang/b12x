@@ -1033,6 +1033,7 @@ def _validate_paged_workspace(
 def _build_split_lut(
     plan: PagedAttentionPlan,
     max_pages_per_req: int,
+    batch: int,
 ) -> torch.Tensor:
     """Build a dense LUT mapping max_pages -> num_splits.
 
@@ -1078,10 +1079,11 @@ def _build_split_lut(
                 promote_buckets = tuple(b for b in buckets if b <= 16)
             # Occupancy-based promotion.
             target_ctas = torch.cuda.get_device_properties(device).multi_processor_count
+            logical_num_head = plan.num_kv_heads if plan.num_q_heads != plan.num_kv_heads else plan.num_q_heads
             blocks_per_split = (
-                plan.key.k_cache_shape[0] // page_size  # num_batch approximation
+                batch
                 * ((q_rows_per_batch + tile_m - 1) // tile_m if q_rows_per_batch > 0 else 1)
-                * (plan.num_kv_heads if plan.num_q_heads != plan.num_kv_heads else plan.num_q_heads)
+                * logical_num_head
             ) if q_rows_per_batch > 0 else 1
             useful_cap = max(1, mp // 2) if mp > 1 else 1
             for bucket in promote_buckets:
@@ -1134,7 +1136,7 @@ def allocate_paged_attention_workspace_for_plan(
             dtype=torch.float32,
             device=plan.device,
         )
-        split_lut = _build_split_lut(plan, max_pages_per_req)
+        split_lut = _build_split_lut(plan, max_pages_per_req, batch)
         num_splits_buf = torch.zeros(1, dtype=torch.int32, device=plan.device)
     return PagedAttentionWorkspace(
         device=plan.device,
