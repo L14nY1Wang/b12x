@@ -1197,7 +1197,7 @@ def create_paged_attention_plan(
             num_splits = 24
         elif auto_num_splits and max_pages >= 128 and 16 in buckets:
             num_splits = 16
-    if auto_num_splits and kv_dtype == _FP8_KV_DTYPE and mode == "decode" and num_splits > 1:
+    if auto_num_splits and mode == "decode" and num_splits > 1:
         num_splits = _promote_fp8_paged_splits_for_occupancy(
             initial_splits=num_splits,
             split_buckets=buckets,
