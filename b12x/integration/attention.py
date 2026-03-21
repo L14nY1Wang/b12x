@@ -245,24 +245,33 @@ def _promote_fp8_paged_splits_for_occupancy(
     max_pages: int,
     tile_m: int,
     device: torch.device,
+    q_rows_per_batch: int = 0,
 ) -> int:
     total_q, q_heads, _ = q_shape
     _, _, kv_heads, _ = k_cache_shape
     num_batch, _ = page_table_shape
-    logical_total_q_rows = total_q * (q_heads // kv_heads)
+    qhead_per_kvhead = q_heads // kv_heads
     logical_num_head = kv_heads if q_heads != kv_heads else q_heads
-    total_blocks_max = _estimate_varlen_scheduler_blocks(
-        logical_total_q_rows=logical_total_q_rows,
-        num_batch=num_batch,
-        tile_m=tile_m,
-    )
+    # Use exact decode grid when direct scheduling is active, otherwise
+    # fall back to the varlen estimate for extend/mixed shapes.
+    if q_rows_per_batch > 0:
+        blocks_per_split = num_batch * ((q_rows_per_batch + tile_m - 1) // tile_m) * logical_num_head
+    else:
+        logical_total_q_rows = total_q * qhead_per_kvhead
+        blocks_per_split = _estimate_varlen_scheduler_blocks(
+            logical_total_q_rows=logical_total_q_rows,
+            num_batch=num_batch,
+            tile_m=tile_m,
+        )
+    # Cap splits so every split gets at least 2 KV pages.
+    useful_splits_cap = max(1, max_pages // 2) if max_pages > 1 else 1
     target_ctas = torch.cuda.get_device_properties(device).multi_processor_count
     chosen = initial_splits
     for bucket in split_buckets:
-        if bucket < initial_splits or bucket > max_pages:
+        if bucket < initial_splits or bucket > max_pages or bucket > useful_splits_cap:
             continue
         chosen = bucket
-        if total_blocks_max * logical_num_head * bucket >= target_ctas:
+        if blocks_per_split * bucket >= target_ctas:
             break
     return chosen
 
@@ -1207,6 +1216,7 @@ def create_paged_attention_plan(
             max_pages=max_pages,
             tile_m=kernel_config.tile_m,
             device=device,
+            q_rows_per_batch=q_rows_per_batch,
         )
     _, q_heads, head_dim_q = q_shape
     return _get_paged_attention_plan(
