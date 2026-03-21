@@ -1236,9 +1236,10 @@ def create_paged_attention_plan(
         inferred_mode = infer_paged_attention_mode(cu_seqlens_q)
         mode = inferred_mode
     elif not capturing:
-        inferred_mode = infer_paged_attention_mode(cu_seqlens_q)
-        if mode != inferred_mode:
-            raise ValueError(f"paged attention mode mismatch: requested {mode}, inferred {inferred_mode}")
+        # Trust the caller's mode — sglang may send extend-mode batches where
+        # every request happens to have q_len=1, which looks like decode to
+        # the inferrer but is semantically an extend.
+        pass
     auto_num_splits = num_splits in (None, 0)
     if auto_num_splits:
         if capturing:
