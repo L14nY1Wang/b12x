@@ -18,7 +18,6 @@ import sys
 from typing import Callable, List
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-sys.path.insert(0, "/home/luke/projects/flashinfer")
 
 import torch
 

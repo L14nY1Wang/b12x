@@ -15,7 +15,7 @@ import urllib.error
 import urllib.request
 
 
-MODEL_PATH = "/data/models/Qwen3.5-397B-A17B-NVFP4"
+MODEL_PATH = os.environ.get("B12X_MODEL_PATH", "/data/models/Qwen3.5-397B-A17B-NVFP4")
 
 
 def _http_get(url: str, *, timeout: float) -> str:
@@ -135,7 +135,7 @@ def main() -> None:
     with log_path.open("w") as log_file:
         proc = subprocess.Popen(
             cmd,
-            cwd="/home/luke/projects/sglang",
+            cwd=os.environ.get("SGLANG_ROOT"),
             env=env,
             stdout=log_file,
             stderr=subprocess.STDOUT,

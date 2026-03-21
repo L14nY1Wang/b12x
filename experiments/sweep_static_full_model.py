@@ -13,7 +13,6 @@ import torch
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, "/home/luke/projects/flashinfer")
 
 from benchmarks.benchmark_moe import (
     MODEL_PATH,
