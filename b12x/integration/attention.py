@@ -44,21 +44,6 @@ def _contiguous_stride(shape: tuple[int, ...]) -> tuple[int, ...]:
     return tuple(stride)
 
 
-def _lse_shape(q_shape: tuple[int, ...]) -> tuple[int, ...]:
-    if len(q_shape) == 3:
-        seqlen_q, q_heads, _ = q_shape
-        return (q_heads, seqlen_q)
-    batch, seqlen_q, q_heads, _ = q_shape
-    return (batch, q_heads, seqlen_q)
-
-
-def _token_major_lse_shape(q_shape: tuple[int, ...]) -> tuple[int, int]:
-    if len(q_shape) != 3:
-        raise ValueError(f"expected rank-3 q shape for paged attention, got {q_shape}")
-    total_q, q_heads, _ = q_shape
-    return (total_q, q_heads)
-
-
 def _paged_lse_storage_shape(q_shape: tuple[int, ...]) -> tuple[int, int]:
     if len(q_shape) != 3:
         raise ValueError(f"expected rank-3 q shape for paged attention, got {q_shape}")
@@ -87,38 +72,6 @@ def _fp8_e4m3_lut(device_index: int) -> torch.Tensor:
     return values.view(torch.float8_e4m3fn).to(torch.float32).contiguous()
 
 
-def _seq_dims(shape: tuple[int, ...]) -> tuple[tuple[int, ...], int, int, int]:
-    if len(shape) == 3:
-        seqlen, num_heads, head_dim = shape
-        return (), seqlen, num_heads, head_dim
-    if len(shape) == 4:
-        batch, seqlen, num_heads, head_dim = shape
-        return (batch,), seqlen, num_heads, head_dim
-    raise ValueError(f"expected rank-3 or rank-4 tensor shape, got {shape}")
-
-
-def _attention_logical_dims(
-    q_shape: tuple[int, ...],
-    k_shape: tuple[int, ...],
-) -> tuple[int, int, int, int, int, int, int, int]:
-    batch_dims, seqlen_q, q_heads, _ = _seq_dims(q_shape)
-    _, seqlen_k, kv_heads, _ = _seq_dims(k_shape)
-    num_batch = batch_dims[0] if batch_dims else 1
-    qhead_per_kvhead = q_heads // kv_heads
-    logical_q_rows_static = seqlen_q * qhead_per_kvhead
-    logical_total_q_rows = logical_q_rows_static * num_batch
-    return (
-        num_batch,
-        q_heads,
-        kv_heads,
-        qhead_per_kvhead,
-        seqlen_q,
-        seqlen_k,
-        logical_q_rows_static,
-        logical_total_q_rows,
-    )
-
-
 def _paged_attention_logical_dims(
     q_shape: tuple[int, ...],
     k_cache_shape: tuple[int, ...],
@@ -140,16 +93,6 @@ def _paged_attention_logical_dims(
         logical_q_rows_static,
         logical_total_q_rows,
     )
-
-
-def _select_tile_shape(head_dim: int, *, causal: bool) -> tuple[int, int]:
-    if head_dim <= 64:
-        return (128, 128)
-    if head_dim <= 128:
-        return (128, 64)
-    if head_dim == 256:
-        return (64, 32 if causal else 48)
-    raise ValueError(f"unsupported head_dim={head_dim} for the current b12x attention path")
 
 
 def _select_paged_tile_shape(head_dim: int, *, causal: bool, page_size: int) -> tuple[int, int]:
@@ -325,41 +268,6 @@ def _promote_fp8_paged_splits_for_occupancy(
         if total_blocks_max * logical_num_head * bucket >= target_ctas:
             break
     return chosen
-
-
-def _validate_forward_inputs(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], torch.device, torch.dtype]:
-    if q.ndim not in (3, 4):
-        raise ValueError(f"q must be rank-3 or rank-4, got rank {q.ndim}")
-    if q.ndim != k.ndim or q.ndim != v.ndim:
-        raise ValueError("q, k, and v must have the same rank")
-    if q.device.type != "cuda" or k.device != q.device or v.device != q.device:
-        raise ValueError("q, k, and v must all be CUDA tensors on the same device")
-    if q.dtype != k.dtype or q.dtype != v.dtype:
-        raise ValueError("q, k, and v must have the same dtype")
-    if q.dtype not in (torch.bfloat16, torch.float16):
-        raise TypeError(f"unsupported dtype {q.dtype}; expected torch.bfloat16 or torch.float16")
-    if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
-        raise ValueError("q, k, and v must all be contiguous")
-
-    q_shape = _normalize_tensor_shape(q)
-    k_shape = _normalize_tensor_shape(k)
-    v_shape = _normalize_tensor_shape(v)
-    batch_q, _, q_heads, q_head_dim = _seq_dims(q_shape)
-    batch_k, _, kv_heads, k_head_dim = _seq_dims(k_shape)
-    batch_v, _, v_heads, v_head_dim = _seq_dims(v_shape)
-    if batch_q != batch_k or batch_q != batch_v:
-        raise ValueError("q, k, and v must have matching batch dimensions")
-    if q_head_dim != k_head_dim or q_head_dim != v_head_dim:
-        raise ValueError("q, k, and v must have matching head dimensions in the initial path")
-    if kv_heads != v_heads:
-        raise ValueError("k and v must have the same number of KV heads")
-    if q_heads % kv_heads != 0:
-        raise ValueError(f"q_heads={q_heads} must be divisible by kv_heads={kv_heads}")
-    return q_shape, k_shape, v_shape, q.device, q.dtype
 
 
 def _inspect_paged_forward_inputs(
@@ -557,30 +465,6 @@ def choose_paged_attention_num_splits(
     return chosen
 
 
-def _validate_attention_inputs_against_plan(
-    *,
-    q_shape: tuple[int, ...],
-    k_shape: tuple[int, ...],
-    v_shape: tuple[int, ...],
-    device: torch.device,
-    dtype: torch.dtype,
-    plan: AttentionPlan,
-) -> None:
-    expected = (
-        plan.q_shape,
-        plan.k_shape,
-        plan.v_shape,
-        plan.device,
-        plan.dtype,
-    )
-    actual = (q_shape, k_shape, v_shape, device, dtype)
-    if expected != actual:
-        raise ValueError(
-            "attention plan mismatch: "
-            f"expected q/k/v/device/dtype={expected}, got {actual}"
-        )
-
-
 def _validate_paged_inputs_against_plan(
     *,
     q_shape: tuple[int, ...],
@@ -626,26 +510,6 @@ def _validate_paged_inputs_against_plan(
 
 
 @dataclass(frozen=True, kw_only=True)
-class AttentionPlanKey:
-    q_shape: tuple[int, ...]
-    k_shape: tuple[int, ...]
-    v_shape: tuple[int, ...]
-    device_index: int
-    dtype: torch.dtype
-    causal: bool
-    tile_m: int
-    tile_n: int
-    num_batch: int
-    num_q_heads: int
-    num_kv_heads: int
-    qhead_per_kvhead: int
-    seqlen_q_static: int
-    seqlen_k_static: int
-    logical_q_rows_static: int
-    logical_total_q_rows: int
-
-
-@dataclass(frozen=True, kw_only=True)
 class PagedAttentionPlanKey:
     q_shape: tuple[int, ...]
     k_cache_shape: tuple[int, ...]
@@ -677,22 +541,6 @@ class PagedAttentionPlanKey:
 
 
 @dataclass(frozen=True, kw_only=True)
-class AttentionPlan:
-    """Exact-shape launch contract for one contiguous attention shape."""
-
-    key: AttentionPlanKey
-    compiled: object = field(repr=False, compare=False)
-    cutlass_dtype: type[cutlass.Numeric] = field(repr=False, compare=False)
-
-    def __getattr__(self, name: str):
-        return getattr(self.key, name)
-
-    @property
-    def device(self) -> torch.device:
-        return torch.device("cuda", self.key.device_index)
-
-
-@dataclass(frozen=True, kw_only=True)
 class PagedAttentionPlan:
     """Exact-shape launch contract for one paged attention shape."""
 
@@ -707,23 +555,6 @@ class PagedAttentionPlan:
     @property
     def device(self) -> torch.device:
         return torch.device("cuda", self.key.device_index)
-
-
-@dataclass(kw_only=True)
-class AttentionWorkspace:
-    """Reusable exact-shape output buffers for one contiguous attention plan."""
-
-    q_shape: tuple[int, ...]
-    k_shape: tuple[int, ...]
-    v_shape: tuple[int, ...]
-    device: torch.device
-    dtype: torch.dtype
-    causal: bool
-    tile_m: int
-    tile_n: int
-    output: torch.Tensor
-    lse: torch.Tensor
-    plan_key: AttentionPlanKey | None = None
 
 
 @dataclass(kw_only=True)
@@ -757,16 +588,6 @@ class PagedAttentionWorkspace:
 
 
 @dataclass
-class AttentionWorkspacePool:
-    """Caller-owned exact-shape workspace cache partitioned by CUDA stream."""
-
-    workspaces: dict[tuple[int, AttentionPlanKey], AttentionWorkspace] = field(default_factory=dict)
-
-    def clear(self) -> None:
-        self.workspaces.clear()
-
-
-@dataclass
 class PagedAttentionWorkspacePool:
     """Caller-owned exact-shape paged workspace cache partitioned by CUDA stream."""
 
@@ -776,104 +597,6 @@ class PagedAttentionWorkspacePool:
 
     def clear(self) -> None:
         self.workspaces.clear()
-
-
-class _AttentionForwardLaunch:
-    def __init__(
-        self,
-        *,
-        q_shape: tuple[int, ...],
-        k_shape: tuple[int, ...],
-        v_shape: tuple[int, ...],
-        dtype: torch.dtype,
-        causal: bool,
-        tile_m: int,
-        tile_n: int,
-    ):
-        self._q_shape = q_shape
-        self._k_shape = k_shape
-        self._v_shape = v_shape
-        self._o_shape = q_shape
-        self._lse_shape = _lse_shape(q_shape)
-        self._q_stride = _contiguous_stride(q_shape)
-        self._k_stride = _contiguous_stride(k_shape)
-        self._v_stride = _contiguous_stride(v_shape)
-        self._o_stride = _contiguous_stride(q_shape)
-        self._lse_stride = _contiguous_stride(self._lse_shape)
-        self._dtype = _torch_to_cutlass_dtype(dtype)
-        (
-            self._num_batch,
-            q_heads,
-            kv_heads,
-            qhead_per_kvhead,
-            self._seqlen_q_static,
-            self._seqlen_k_static,
-            self._logical_q_rows_static,
-            self._logical_total_q_rows,
-        ) = _attention_logical_dims(q_shape, k_shape)
-        _, _, _, head_dim = _seq_dims(q_shape)
-        _, _, _, head_dim_k = _seq_dims(k_shape)
-        _, _, _, head_dim_v = _seq_dims(v_shape)
-        if not SM120ForwardKernel.can_implement(
-            self._dtype,
-            head_dim,
-            head_dim_v,
-            tile_m,
-            tile_n,
-            1,
-            160,
-            causal,
-            False,
-            kv_dtype=self._dtype,
-        ):
-            raise TypeError(
-                "b12x attention launch is unsupported with "
-                f"dtype={dtype}, q_shape={q_shape}, k_shape={k_shape}, v_shape={v_shape}, "
-                f"causal={causal}, tile=({tile_m}, {tile_n})"
-            )
-        self._kernel = SM120ForwardKernel(
-            self._dtype,
-            head_dim,
-            head_dim_v=head_dim_v,
-            qhead_per_kvhead=qhead_per_kvhead,
-            is_causal=causal,
-            pack_gqa=qhead_per_kvhead != 1,
-            tile_m=tile_m,
-            tile_n=tile_n,
-        )
-        assert head_dim == head_dim_k
-
-    @cute.jit
-    def __call__(
-        self,
-        q_ptr: cute.Pointer,
-        k_ptr: cute.Pointer,
-        v_ptr: cute.Pointer,
-        o_ptr: cute.Pointer,
-        lse_ptr: cute.Pointer,
-        softmax_scale: float,
-        current_stream: cuda.CUstream,
-    ):
-        q_tensor = cute.make_tensor(q_ptr, layout=cute.make_layout(self._q_shape, stride=self._q_stride))
-        k_tensor = cute.make_tensor(k_ptr, layout=cute.make_layout(self._k_shape, stride=self._k_stride))
-        v_tensor = cute.make_tensor(v_ptr, layout=cute.make_layout(self._v_shape, stride=self._v_stride))
-        o_tensor = cute.make_tensor(o_ptr, layout=cute.make_layout(self._o_shape, stride=self._o_stride))
-        lse_tensor = cute.make_tensor(
-            lse_ptr,
-            layout=cute.make_layout(self._lse_shape, stride=self._lse_stride),
-        )
-        self._kernel(
-            q_tensor,
-            k_tensor,
-            v_tensor,
-            o_tensor,
-            lse_tensor,
-            softmax_scale,
-            logical_num_batch_static=self._num_batch,
-            logical_seqlen_q_static=self._seqlen_q_static,
-            logical_seqlen_k_static=self._seqlen_k_static,
-            stream=current_stream,
-        )
 
 
 class _PagedAttentionForwardLaunch:
@@ -1135,38 +858,6 @@ class _PagedAttentionCombineLaunch:
 
 
 @functools.cache
-def _compile_attention(
-    q_shape: tuple[int, ...],
-    k_shape: tuple[int, ...],
-    v_shape: tuple[int, ...],
-    dtype: torch.dtype,
-    causal: bool,
-    tile_m: int,
-    tile_n: int,
-):
-    cutlass_dtype = _torch_to_cutlass_dtype(dtype)
-    launch = _AttentionForwardLaunch(
-        q_shape=q_shape,
-        k_shape=k_shape,
-        v_shape=v_shape,
-        dtype=dtype,
-        causal=causal,
-        tile_m=tile_m,
-        tile_n=tile_n,
-    )
-    return cute.compile(
-        launch,
-        make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=4),
-        1.0,
-        current_cuda_stream(),
-    )
-
-
-@functools.cache
 def _compile_paged_attention(
     q_shape: tuple[int, ...],
     k_cache_shape: tuple[int, ...],
@@ -1252,59 +943,6 @@ def _compile_paged_attention_combine(
         make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16),
         make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=4),
         current_cuda_stream(),
-    )
-
-
-@functools.cache
-def _get_attention_plan(
-    q_shape: tuple[int, ...],
-    k_shape: tuple[int, ...],
-    v_shape: tuple[int, ...],
-    device_index: int,
-    dtype: torch.dtype,
-    causal: bool,
-    tile_m: int,
-    tile_n: int,
-) -> AttentionPlan:
-    (
-        num_batch,
-        num_q_heads,
-        num_kv_heads,
-        qhead_per_kvhead,
-        seqlen_q_static,
-        seqlen_k_static,
-        logical_q_rows_static,
-        logical_total_q_rows,
-    ) = _attention_logical_dims(q_shape, k_shape)
-    return AttentionPlan(
-        key=AttentionPlanKey(
-            q_shape=q_shape,
-            k_shape=k_shape,
-            v_shape=v_shape,
-            device_index=device_index,
-            dtype=dtype,
-            causal=causal,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            num_batch=num_batch,
-            num_q_heads=num_q_heads,
-            num_kv_heads=num_kv_heads,
-            qhead_per_kvhead=qhead_per_kvhead,
-            seqlen_q_static=seqlen_q_static,
-            seqlen_k_static=seqlen_k_static,
-            logical_q_rows_static=logical_q_rows_static,
-            logical_total_q_rows=logical_total_q_rows,
-        ),
-        compiled=_compile_attention(
-            q_shape,
-            k_shape,
-            v_shape,
-            dtype,
-            causal,
-            tile_m,
-            tile_n,
-        ),
-        cutlass_dtype=_torch_to_cutlass_dtype(dtype),
     )
 
 
@@ -1408,48 +1046,9 @@ def _get_paged_attention_plan(
 
 def clear_attention_caches() -> None:
     """Clear global compile caches owned by the b12x attention integration."""
-    _compile_attention.cache_clear()
     _compile_paged_attention.cache_clear()
     _compile_paged_attention_combine.cache_clear()
-    _get_attention_plan.cache_clear()
     _get_paged_attention_plan.cache_clear()
-
-
-def _validate_workspace(
-    workspace: AttentionWorkspace,
-    *,
-    plan: AttentionPlan,
-) -> None:
-    expected = (
-        plan.q_shape,
-        plan.k_shape,
-        plan.v_shape,
-        plan.device,
-        plan.dtype,
-        plan.causal,
-        plan.tile_m,
-        plan.tile_n,
-    )
-    actual = (
-        workspace.q_shape,
-        workspace.k_shape,
-        workspace.v_shape,
-        workspace.device,
-        workspace.dtype,
-        workspace.causal,
-        workspace.tile_m,
-        workspace.tile_n,
-    )
-    if expected != actual:
-        raise ValueError(
-            "workspace shape mismatch: "
-            f"expected q/k/v/device/dtype/causal/tile={expected}, got {actual}"
-        )
-    if workspace.plan_key is not None and workspace.plan_key != plan.key:
-        raise ValueError(
-            "workspace plan mismatch: "
-            f"expected {workspace.plan_key}, got {plan.key}"
-        )
 
 
 def _validate_paged_workspace(
@@ -1542,25 +1141,6 @@ def _validate_paged_workspace(
             )
 
 
-def allocate_attention_workspace_for_plan(plan: AttentionPlan) -> AttentionWorkspace:
-    """Allocate reusable scratch for one exact contiguous attention plan."""
-    output = torch.empty(plan.q_shape, dtype=plan.dtype, device=plan.device)
-    lse = torch.empty(_lse_shape(plan.q_shape), dtype=torch.float32, device=plan.device)
-    return AttentionWorkspace(
-        q_shape=plan.q_shape,
-        k_shape=plan.k_shape,
-        v_shape=plan.v_shape,
-        device=plan.device,
-        dtype=plan.dtype,
-        causal=plan.causal,
-        tile_m=plan.tile_m,
-        tile_n=plan.tile_n,
-        output=output,
-        lse=lse,
-        plan_key=plan.key,
-    )
-
-
 def allocate_paged_attention_workspace_for_plan(plan: PagedAttentionPlan) -> PagedAttentionWorkspace:
     """Allocate reusable scratch for one exact paged attention plan."""
     output = torch.empty(plan.q_shape, dtype=plan.dtype, device=plan.device)
@@ -1612,34 +1192,9 @@ def allocate_paged_attention_workspace_for_plan(plan: PagedAttentionPlan) -> Pag
     )
 
 
-def allocate_attention_workspace_pool() -> AttentionWorkspacePool:
-    """Allocate an explicit caller-owned workspace pool for contiguous attention."""
-    return AttentionWorkspacePool()
-
-
 def allocate_paged_attention_workspace_pool() -> PagedAttentionWorkspacePool:
     """Allocate an explicit caller-owned workspace pool for paged attention."""
     return PagedAttentionWorkspacePool()
-
-
-def _resolve_attention_workspace(
-    workspace: AttentionWorkspace | AttentionWorkspacePool,
-    *,
-    plan: AttentionPlan,
-) -> AttentionWorkspace:
-    if isinstance(workspace, AttentionWorkspace):
-        _validate_workspace(workspace, plan=plan)
-        return workspace
-    if not isinstance(workspace, AttentionWorkspacePool):
-        raise TypeError("workspace must be an AttentionWorkspace or AttentionWorkspacePool")
-
-    stream_key = int(torch.cuda.current_stream(plan.device).cuda_stream)
-    key = (stream_key, plan.key)
-    resolved = workspace.workspaces.get(key)
-    if resolved is None:
-        resolved = allocate_attention_workspace_for_plan(plan)
-        workspace.workspaces[key] = resolved
-    return resolved
 
 
 def _resolve_paged_attention_workspace(
@@ -1662,30 +1217,6 @@ def _resolve_paged_attention_workspace(
         resolved = allocate_paged_attention_workspace_for_plan(plan)
         workspace.workspaces[key] = resolved
     return resolved
-
-
-def create_attention_plan(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    *,
-    causal: bool = True,
-    tile_shape: tuple[int, int] | None = None,
-) -> AttentionPlan:
-    """Create one exact contiguous attention launch plan."""
-    q_shape, k_shape, v_shape, device, dtype = _validate_forward_inputs(q, k, v)
-    _, _, _, head_dim = _seq_dims(q_shape)
-    tile_m, tile_n = tile_shape or _select_tile_shape(head_dim, causal=causal)
-    return _get_attention_plan(
-        q_shape,
-        k_shape,
-        v_shape,
-        _cuda_device_index(device),
-        dtype,
-        causal,
-        tile_m,
-        tile_n,
-    )
 
 
 def create_paged_attention_plan(
@@ -1820,25 +1351,6 @@ def create_paged_attention_plan(
     )
 
 
-def allocate_attention_workspace(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    *,
-    causal: bool = True,
-    tile_shape: tuple[int, int] | None = None,
-) -> AttentionWorkspace:
-    """Allocate one exact-shape workspace for `b12x_attention_forward`."""
-    plan = create_attention_plan(
-        q,
-        k,
-        v,
-        causal=causal,
-        tile_shape=tile_shape,
-    )
-    return allocate_attention_workspace_for_plan(plan)
-
-
 def allocate_paged_attention_workspace(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -1907,73 +1419,6 @@ def _combine_split_partials(
         ),
         current_cuda_stream(),
     )
-
-
-def b12x_attention_forward(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    *,
-    workspace: AttentionWorkspace | AttentionWorkspacePool,
-    plan: AttentionPlan | None = None,
-    softmax_scale: float | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Execute contiguous self-attention using the transplanted SM120 kernel."""
-    q_shape, k_shape, v_shape, device, dtype = _validate_forward_inputs(q, k, v)
-    if plan is None:
-        if isinstance(workspace, AttentionWorkspacePool):
-            raise TypeError("workspace pools require an explicit AttentionPlan")
-        resolved_plan = _get_attention_plan(
-            q_shape,
-            k_shape,
-            v_shape,
-            _cuda_device_index(workspace.device),
-            workspace.dtype,
-            workspace.causal,
-            workspace.tile_m,
-            workspace.tile_n,
-        )
-    else:
-        resolved_plan = plan
-    _validate_attention_inputs_against_plan(
-        q_shape=q_shape,
-        k_shape=k_shape,
-        v_shape=v_shape,
-        device=device,
-        dtype=dtype,
-        plan=resolved_plan,
-    )
-    resolved_workspace = _resolve_attention_workspace(workspace, plan=resolved_plan)
-    _, seqlen_q, _, head_dim = _seq_dims(q_shape)
-    _, seqlen_k, _, _ = _seq_dims(k_shape)
-    if seqlen_q == 1 and seqlen_k == 1:
-        raise ValueError(
-            "b12x attention does not currently support the single-token single-key corner "
-            "(seqlen_q=1, seqlen_k=1)"
-    )
-    if softmax_scale is None:
-        softmax_scale = head_dim ** -0.5
-
-    resolved_plan.compiled(
-        make_ptr(resolved_plan.cutlass_dtype, q.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(resolved_plan.cutlass_dtype, k.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(resolved_plan.cutlass_dtype, v.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(
-            resolved_plan.cutlass_dtype,
-            resolved_workspace.output.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        ),
-        make_ptr(
-            cutlass.Float32,
-            resolved_workspace.lse.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=4,
-        ),
-        float(softmax_scale),
-        current_cuda_stream(),
-    )
-    return resolved_workspace.output, resolved_workspace.lse
 
 
 def b12x_paged_attention_forward(
@@ -2220,27 +1665,18 @@ def b12x_paged_extend(
 
 
 __all__ = [
-    "AttentionPlan",
-    "AttentionPlanKey",
-    "AttentionWorkspace",
-    "AttentionWorkspacePool",
     "PagedAttentionPlan",
     "PagedAttentionPlanKey",
     "PagedAttentionWorkspace",
     "PagedAttentionWorkspacePool",
-    "allocate_attention_workspace",
-    "allocate_attention_workspace_pool",
-    "allocate_attention_workspace_for_plan",
     "allocate_paged_attention_workspace",
     "allocate_paged_attention_workspace_pool",
     "allocate_paged_attention_workspace_for_plan",
-    "b12x_attention_forward",
     "b12x_paged_decode",
     "b12x_paged_attention_forward",
     "b12x_paged_extend",
     "choose_paged_attention_num_splits",
     "clear_attention_caches",
-    "create_attention_plan",
     "create_paged_attention_plan",
     "infer_paged_attention_mode",
 ]

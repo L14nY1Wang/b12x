@@ -3,14 +3,11 @@ from __future__ import annotations
 import pytest
 import torch
 
-from b12x.attention.reference import attention_reference, paged_attention_reference
+from b12x.attention.reference import paged_attention_reference
 from b12x.integration.attention import (
-    allocate_attention_workspace_for_plan,
     allocate_paged_attention_workspace_for_plan,
-    b12x_attention_forward,
     b12x_paged_attention_forward,
     clear_attention_caches,
-    create_attention_plan,
     create_paged_attention_plan,
 )
 
@@ -25,33 +22,6 @@ def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
     a_f = a.to(torch.float32).reshape(-1)
     b_f = b.to(torch.float32).reshape(-1)
     return torch.nn.functional.cosine_similarity(a_f, b_f, dim=0).item()
-
-
-def test_contiguous_attention_replays_under_cuda_graph() -> None:
-    require_sm120()
-    clear_attention_caches()
-
-    torch.manual_seed(71)
-    q = torch.randn(1, 48, 8, 256, device="cuda", dtype=torch.bfloat16) / 4
-    k = torch.randn(1, 48, 1, 256, device="cuda", dtype=torch.bfloat16) / 4
-    v = torch.randn(1, 48, 1, 256, device="cuda", dtype=torch.bfloat16) / 4
-    plan = create_attention_plan(q, k, v, causal=True)
-    workspace = allocate_attention_workspace_for_plan(plan)
-
-    b12x_attention_forward(q, k, v, workspace=workspace, plan=plan)
-    torch.cuda.synchronize()
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        b12x_attention_forward(q, k, v, workspace=workspace, plan=plan)
-
-    graph.replay()
-    torch.cuda.synchronize()
-
-    ref_out, ref_lse = attention_reference(q, k, v, causal=True)
-    assert (workspace.output - ref_out).abs().max().item() <= 0.02
-    assert (workspace.lse - ref_lse).abs().max().item() <= 0.03
-    assert _cosine_similarity(workspace.output, ref_out) >= 0.99999
 
 
 @torch.inference_mode()
