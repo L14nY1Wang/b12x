@@ -35,14 +35,14 @@ class PagedAttentionCombineKernel:
         dtype_partial: Type[cutlass.Numeric],
         *,
         head_dim: int,
-        num_splits: int,
+        max_num_splits: int,
         tile_k: int = 32,
         num_threads: int = 32,
     ):
         self.dtype = dtype
         self.dtype_partial = dtype_partial
         self.head_dim = head_dim
-        self.num_splits = num_splits
+        self.max_num_splits = max_num_splits
         self.tile_k = tile_k
         self.num_threads = num_threads
 
@@ -52,7 +52,7 @@ class PagedAttentionCombineKernel:
         dtype_partial,
         *,
         head_dim: int,
-        num_splits: int,
+        max_num_splits: int,
         tile_k: int,
         num_threads: int,
     ) -> bool:
@@ -62,7 +62,7 @@ class PagedAttentionCombineKernel:
             return False
         if head_dim <= 0 or head_dim % 8 != 0:
             return False
-        if num_splits <= 1 or num_splits > 32:
+        if max_num_splits <= 1 or max_num_splits > 32:
             return False
         if tile_k != 32:
             return False
@@ -77,12 +77,13 @@ class PagedAttentionCombineKernel:
         mLSE_partial: cute.Tensor,
         mO: cute.Tensor,
         mLSE: cute.Tensor,
+        num_splits: Int32,
         stream: cuda.CUstream,
     ):
         if const_expr(len(mO_partial.shape) != 4):
-            raise ValueError("mO_partial must have shape (num_splits, total_q, num_heads, head_dim)")
+            raise ValueError("mO_partial must have shape (max_num_splits, total_q, num_heads, head_dim)")
         if const_expr(len(mLSE_partial.shape) != 3):
-            raise ValueError("mLSE_partial must have shape (num_splits, num_heads, total_q)")
+            raise ValueError("mLSE_partial must have shape (max_num_splits, num_heads, total_q)")
         if const_expr(len(mO.shape) != 3):
             raise ValueError("mO must have shape (total_q, num_heads, head_dim)")
         if const_expr(len(mLSE.shape) != 2):
@@ -93,10 +94,10 @@ class PagedAttentionCombineKernel:
             raise TypeError("mO dtype must match dtype")
         if const_expr(mLSE_partial.element_type != Float32 or mLSE.element_type != Float32):
             raise TypeError("mLSE tensors must be Float32")
-        if const_expr(mO_partial.shape[0] != self.num_splits):
-            raise ValueError(f"mO_partial split dimension must be {self.num_splits}")
-        if const_expr(mLSE_partial.shape[0] != self.num_splits):
-            raise ValueError(f"mLSE_partial split dimension must be {self.num_splits}")
+        if const_expr(mO_partial.shape[0] != self.max_num_splits):
+            raise ValueError(f"mO_partial split dimension must be {self.max_num_splits}")
+        if const_expr(mLSE_partial.shape[0] != self.max_num_splits):
+            raise ValueError(f"mLSE_partial split dimension must be {self.max_num_splits}")
         if const_expr(mO_partial.shape[2] != mO.shape[1]):
             raise ValueError("mO_partial num_heads must match mO num_heads")
         if const_expr(mO_partial.shape[3] != mO.shape[2]):
@@ -107,7 +108,7 @@ class PagedAttentionCombineKernel:
             self.dtype,
             self.dtype_partial,
             head_dim=self.head_dim,
-            num_splits=self.num_splits,
+            max_num_splits=self.max_num_splits,
             tile_k=self.tile_k,
             num_threads=self.num_threads,
         )):
@@ -116,7 +117,7 @@ class PagedAttentionCombineKernel:
         total_q = mO.shape[0]
         num_heads = mO.shape[1]
         grid = (total_q, num_heads, 1)
-        self.kernel(mO_partial, mLSE_partial, mO, mLSE).launch(
+        self.kernel(mO_partial, mLSE_partial, mO, mLSE, num_splits).launch(
             grid=grid,
             block=[self.num_threads, 1, 1],
             stream=stream,
@@ -129,13 +130,14 @@ class PagedAttentionCombineKernel:
         mLSE_partial: cute.Tensor,
         mO: cute.Tensor,
         mLSE: cute.Tensor,
+        num_splits: Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         row_idx, head_idx, _ = cute.arch.block_idx()
         lane = tidx % cute.arch.WARP_SIZE
         warp_idx = tidx // cute.arch.WARP_SIZE
 
-        lane_active = lane < self.num_splits
+        lane_active = lane < num_splits
         split_lse = -Float32.inf
         if lane_active:
             split_lse = mLSE_partial[lane, head_idx, row_idx]
@@ -164,8 +166,8 @@ class PagedAttentionCombineKernel:
             Float32,
         )
         accums.fill(0.0)
-        for split_idx in cutlass.range_constexpr(self.num_splits):
-            weight = cute.arch.shuffle_sync(split_weight, Int32(split_idx))
+        for split_idx in cutlass.range(num_splits, unroll=8):
+            weight = cute.arch.shuffle_sync(split_weight, split_idx)
             for idx_iter in cutlass.range_constexpr(num_elems_per_thread):
                 k_idx = tidx + idx_iter * self.num_threads
                 if k_idx < self.head_dim:

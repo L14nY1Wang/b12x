@@ -764,7 +764,7 @@ class _PagedAttentionCombineLaunch:
             self._dtype,
             self._dtype,
             head_dim=head_dim,
-            num_splits=num_splits,
+            max_num_splits=num_splits,
             tile_k=tile_k,
             num_threads=num_threads,
         ):
@@ -777,7 +777,7 @@ class _PagedAttentionCombineLaunch:
             self._dtype,
             self._dtype,
             head_dim=head_dim,
-            num_splits=num_splits,
+            max_num_splits=num_splits,
             tile_k=tile_k,
             num_threads=num_threads,
         )
@@ -790,6 +790,7 @@ class _PagedAttentionCombineLaunch:
         output_ptr: cute.Pointer,
         lse_ptr: cute.Pointer,
         total_q: Int32,
+        num_splits: Int32,
         current_stream: cuda.CUstream,
     ):
         q_plane = self._q_heads * self._head_dim
@@ -820,6 +821,7 @@ class _PagedAttentionCombineLaunch:
             split_lse_tensor,
             output_tensor,
             lse_tensor,
+            num_splits,
             stream=current_stream,
         )
 
@@ -907,6 +909,7 @@ def _compile_paged_attention_combine(
         make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16),
         make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=4),
         Int32(1),
+        Int32(num_splits),
         current_cuda_stream(),
     )
 
@@ -1319,6 +1322,7 @@ def _combine_split_partials(
             assumed_align=4,
         ),
         total_q,
+        Int32(plan.num_splits),
         current_cuda_stream(),
     )
 
