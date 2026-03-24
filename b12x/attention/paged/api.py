@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from functools import lru_cache
+import os
+from typing import Literal
 
 import cutlass
 import torch
@@ -55,10 +57,20 @@ def _as_int32_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return tensor if tensor.dtype == torch.int32 else tensor.to(torch.int32)
 
 
-@lru_cache(maxsize=32)
+def _attn_turbo_enabled(attn_mode: Literal["default", "turbo"] | None) -> bool:
+    if attn_mode == "turbo":
+        return True
+    if attn_mode == "default":
+        return False
+    return os.environ.get("B12X_ATTN", "").upper() == "TURBO"
+
+
+@lru_cache(maxsize=64)
 def _build_forward_kernel(
     traits: PagedForwardTraits,
     split_kv: bool,
+    mxfp8_turbo: bool,
+    enable_mxfp8_pv: bool,
 ) -> PagedForwardKernel:
     return PagedForwardKernel(
         _torch_to_cutlass_dtype(traits.q_dtype),
@@ -67,6 +79,8 @@ def _build_forward_kernel(
         _torch_to_cutlass_dtype(traits.o_dtype),
         traits=traits,
         split_kv=split_kv,
+        mxfp8_turbo=mxfp8_turbo,
+        enable_mxfp8_pv=enable_mxfp8_pv,
     )
 
 
@@ -125,9 +139,13 @@ def paged_attention_forward(
         raise ValueError("fp8 paged caches require k_descale and v_descale")
 
     traits = select_paged_forward_traits_from_plan(plan)
+    mxfp8_turbo = _attn_turbo_enabled(workspace.attn_mode) and plan.kv_dtype == torch.float8_e4m3fn
+    enable_mxfp8_pv = mxfp8_turbo and plan.mode == "decode" and plan.kv_chunk_size <= 384
     forward_kernel = _build_forward_kernel(
         traits,
         plan.split_kv,
+        mxfp8_turbo,
+        enable_mxfp8_pv,
     )
     forward_output = workspace.tmp_output if plan.split_kv else output
     forward_lse = workspace.tmp_lse if plan.split_kv else workspace.lse

@@ -248,6 +248,7 @@ def _capture_backend_graph(
     k_descale: torch.Tensor | None,
     v_descale: torch.Tensor | None,
     warmup: int,
+    b12x_attn_mode: str,
 ) -> BackendCapture:
     output = torch.empty_like(q)
     mode = "decode" if int(q.shape[0]) == int(page_table.shape[0]) else "extend"
@@ -257,6 +258,7 @@ def _capture_backend_graph(
         k_cache=k_cache,
         v_cache=v_cache,
         use_cuda_graph=True,
+        attn_mode=b12x_attn_mode,
     )
     workspace.prepare(
         page_table,
@@ -403,6 +405,7 @@ def main() -> None:
     parser.add_argument("--replays", type=int, default=200)
     parser.add_argument("--flashinfer-workspace-mb", type=int, default=512)
     parser.add_argument("--fixed-split-pages", type=int, default=0)
+    parser.add_argument("--b12x-attn-mode", choices=["default", "turbo"], default="default")
     parser.add_argument("--compare-fa2", action="store_true", default=True)
     parser.add_argument("--no-compare-fa2", action="store_false", dest="compare_fa2")
     parser.add_argument("--check", action="store_true")
@@ -437,6 +440,7 @@ def main() -> None:
             "q_dtype": str(dtype),
             "kv_dtype": str(kv_dtype),
             "fixed_split_pages": args.fixed_split_pages,
+            "b12x_attn_mode": args.b12x_attn_mode,
             "replays": args.replays,
             "flashinfer_fa2": args.compare_fa2,
         },
@@ -479,6 +483,7 @@ def main() -> None:
             k_descale=k_descale,
             v_descale=v_descale,
             warmup=args.warmup,
+            b12x_attn_mode=args.b12x_attn_mode,
         )
         backend_times_ms = _bench_graph(backend_capture.graph, replays=args.replays)
         backend_metrics = CaseMetrics(

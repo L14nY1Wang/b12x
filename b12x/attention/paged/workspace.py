@@ -35,6 +35,7 @@ class PagedAttentionWorkspace:
     num_kv_heads: int
     head_dim_qk: int
     head_dim_vo: int
+    attn_mode: Literal["default", "turbo"] | None = None
     page_size: int = 64
     use_cuda_graph: bool = False
     request_indices: torch.Tensor | None = None
@@ -72,6 +73,7 @@ class PagedAttentionWorkspace:
         max_total_q: int,
         num_cache_pages: int,
         use_cuda_graph: bool = False,
+        attn_mode: Literal["default", "turbo"] | None = None,
     ) -> PagedAttentionWorkspace:
         device = _canonical_device(device)
         if max_total_q <= 0:
@@ -98,6 +100,7 @@ class PagedAttentionWorkspace:
             num_kv_heads=num_kv_heads,
             head_dim_qk=head_dim_qk,
             head_dim_vo=head_dim_vo,
+            attn_mode=attn_mode,
             page_size=page_size,
             use_cuda_graph=use_cuda_graph,
             _plan_q=plan_q,
@@ -114,6 +117,7 @@ class PagedAttentionWorkspace:
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
         use_cuda_graph: bool = False,
+        attn_mode: Literal["default", "turbo"] | None = None,
     ) -> PagedAttentionWorkspace:
         if q.ndim != 3:
             raise ValueError(f"q must have shape [total_q, q_heads, head_dim], got {tuple(q.shape)}")
@@ -132,6 +136,7 @@ class PagedAttentionWorkspace:
             max_total_q=int(q.shape[0]),
             num_cache_pages=int(k_cache.shape[0]),
             use_cuda_graph=use_cuda_graph,
+            attn_mode=attn_mode,
         )
 
     @property
@@ -191,6 +196,7 @@ class PagedAttentionWorkspace:
             fixed_split_size=-1 if fixed_split_size is None else int(fixed_split_size),
             disable_split_kv=disable_split_kv,
             enable_cuda_graph=False,
+            graph_chunk_policy=self.use_cuda_graph,
         )
         self._ensure_capacity(plan)
         self._copy_runtime_metadata(page_table, cache_seqlens, cu_seqlens_q)

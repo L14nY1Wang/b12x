@@ -126,6 +126,7 @@ def _make_workspace(
     v_cache: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     use_cuda_graph: bool = False,
+    attn_mode: str | None = None,
 ) -> PagedAttentionWorkspace:
     return PagedAttentionWorkspace.for_tensors(
         mode=infer_paged_attention_mode(cu_seqlens_q),
@@ -133,6 +134,7 @@ def _make_workspace(
         k_cache=k_cache,
         v_cache=v_cache,
         use_cuda_graph=use_cuda_graph,
+        attn_mode=attn_mode,
     )
 
 
@@ -209,6 +211,29 @@ def test_paged_workspace_exposes_primary_backend_metadata() -> None:
     assert plan.split_kv is True
     assert plan.total_q == q.shape[0]
     assert plan.page_table_shape == tuple(page_table.shape)
+
+
+def test_paged_workspace_preserves_opt_in_attention_mode() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    q, k_cache, v_cache, _page_table, _cache_seqlens_t, cu_seqlens_q = _make_paged_inputs(
+        q_seqlens=[1, 1, 1, 1],
+        cache_seqlens=[64, 64, 64, 64],
+        page_size=64,
+        seed=31,
+    )
+    workspace = _make_workspace(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        cu_seqlens_q=cu_seqlens_q,
+        use_cuda_graph=True,
+        attn_mode="turbo",
+    )
+
+    assert workspace.attn_mode == "turbo"
+    assert workspace.use_cuda_graph is True
 
 
 def test_paged_workspace_matches_reference_for_fp8_kv_cache() -> None:
@@ -434,6 +459,39 @@ def test_graph_workspace_reuses_stable_metadata_buffers_for_smaller_replay() -> 
         workspace.cu_seqlens_q.data_ptr(),
     )
     assert workspace.active_total_q == q1.shape[0]
+
+
+def test_graph_workspace_uses_narrower_fp8_extend_chunks_at_8192() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
+        q_seqlens=[6] * 8,
+        cache_seqlens=[8192] * 8,
+        page_size=64,
+        seed=73,
+        page_table_width=128,
+        num_pages=2048,
+    )
+    k_fp8, v_fp8, _, _ = _quantize_paged_kv_cache_e4m3(
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+    )
+    workspace = _make_workspace(
+        q=q,
+        k_cache=k_fp8,
+        v_cache=v_fp8,
+        cu_seqlens_q=cu_seqlens_q,
+        use_cuda_graph=True,
+    )
+    workspace.prepare(page_table, cache_seqlens, cu_seqlens_q)
+
+    assert workspace.plan.mode == "extend"
+    assert workspace.plan.kv_dtype == torch.float8_e4m3fn
+    assert workspace.plan.kv_chunk_size == 3 * 64
+    assert workspace.plan.split_kv is True
 
 
 def test_graph_workspace_rejects_capacity_growth() -> None:

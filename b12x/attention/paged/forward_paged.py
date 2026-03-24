@@ -24,6 +24,7 @@ from b12x.cute.fp4 import (
     bf16_rowsum_m16k16_f32,
     bfloat2_mul,
     broadcast_f32_to_bfloat2,
+    cvt_bf16x2_to_e4m3x2,
     fp8x4_e4m3_to_bfloat2x2,
     ldmatrix_m8n8x4_b16,
     ldmatrix_m8n8x4_left_half_b16,
@@ -31,6 +32,7 @@ from b12x.cute.fp4 import (
     ldmatrix_m8n8x4_trans_b16,
     ldmatrix_m8n8x4_trans_left_half_b16,
     ldmatrix_m8n8x4_trans_right_half_b16,
+    mxfp8_mma_m16n8k32_f32_e4m3,
     pack_f32x2_to_bfloat2,
     frag_layout_swizzle_16b_to_8b,
     frag_layout_swizzle_16b_to_8b_trans,
@@ -300,6 +302,139 @@ def _literal_qk_mma_into_sfrag_fp8_raw(
 
 
 @cute.jit
+def _literal_qk_mma_into_sfrag_mxfp8_raw(
+    s_frag: cute.Tensor,
+    q_base_addr: Int32,
+    k_base_addr: Int32,
+    lane,
+    warp_q_idx,
+    warp_kv_idx,
+    row_base,
+    num_mma_q,
+    num_mma_kv,
+    num_mma_d_qk,
+    upcast_stride_q,
+    upcast_stride_k,
+):
+    unit_scale = Uint32(0x7F7F7F7F)
+    mask16 = Uint32(0xFFFF)
+    shift16 = Uint32(16)
+    q_offset = _permuted_offset_128b(
+        warp_q_idx * num_mma_q * 16 + lane % 16,
+        lane // 16,
+        upcast_stride_q,
+    )
+    k_offset = _permuted_offset_128b(
+        row_base + warp_kv_idx * num_mma_kv * 16 + 8 * (lane // 16) + lane % 8,
+        (lane % 16) // 8,
+        upcast_stride_k,
+    )
+    for mma_pair in cutlass.range_constexpr(num_mma_d_qk // 2):
+        a_regs_k0 = cute.make_rmem_tensor(
+            cute.make_layout((num_mma_q, 4), stride=(4, 1)),
+            Uint32,
+        )
+        a_regs_k1 = cute.make_rmem_tensor(
+            cute.make_layout((num_mma_q, 4), stride=(4, 1)),
+            Uint32,
+        )
+
+        q_offset_cur = q_offset
+        for mma_q in cutlass.range_constexpr(num_mma_q):
+            a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(_smem_addr_from_b128_offset(q_base_addr, q_offset_cur))
+            a_regs_k0[mma_q, 0] = a0
+            a_regs_k0[mma_q, 1] = a1
+            a_regs_k0[mma_q, 2] = a2
+            a_regs_k0[mma_q, 3] = a3
+            q_offset_cur = _advance_offset_by_row_128b(q_offset_cur, 16, upcast_stride_q)
+
+        mma_d0 = mma_pair * 2
+        q_offset_mid = _advance_offset_by_column_128b_2(q_offset_cur, mma_d0) - Int32(
+            num_mma_q * 16 * upcast_stride_q
+        )
+        q_offset_cur = q_offset_mid
+        for mma_q in cutlass.range_constexpr(num_mma_q):
+            a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(_smem_addr_from_b128_offset(q_base_addr, q_offset_cur))
+            a_regs_k1[mma_q, 0] = a0
+            a_regs_k1[mma_q, 1] = a1
+            a_regs_k1[mma_q, 2] = a2
+            a_regs_k1[mma_q, 3] = a3
+            q_offset_cur = _advance_offset_by_row_128b(q_offset_cur, 16, upcast_stride_q)
+        q_offset = _advance_offset_by_column_128b_2(q_offset_cur, mma_d0 + 1) - Int32(
+            num_mma_q * 16 * upcast_stride_q
+        )
+
+        k_offset_cur = k_offset
+        for mma_kv in cutlass.range_constexpr(num_mma_kv):
+            b0_k0, b1_k0 = ldmatrix_m8n8x4_left_half_b16(
+                _smem_addr_from_b128_offset(k_base_addr, k_offset_cur)
+            )
+            b0_k1, b1_k1 = ldmatrix_m8n8x4_right_half_b16(
+                _smem_addr_from_b128_offset(k_base_addr, k_offset_cur)
+            )
+            b0_k0 = frag_layout_swizzle_16b_to_8b(b0_k0)
+            b1_k0 = frag_layout_swizzle_16b_to_8b(b1_k0)
+            b0_k1 = frag_layout_swizzle_16b_to_8b(b0_k1)
+            b1_k1 = frag_layout_swizzle_16b_to_8b(b1_k1)
+            k_offset_cur = _advance_offset_by_row_128b(k_offset_cur, 16, upcast_stride_k)
+
+            for mma_q in cutlass.range_constexpr(num_mma_q):
+                qa0 = (cvt_bf16x2_to_e4m3x2(a_regs_k0[mma_q, 0]) & mask16) | (
+                    (cvt_bf16x2_to_e4m3x2(a_regs_k1[mma_q, 0]) & mask16) << shift16
+                )
+                qa1 = (cvt_bf16x2_to_e4m3x2(a_regs_k0[mma_q, 1]) & mask16) | (
+                    (cvt_bf16x2_to_e4m3x2(a_regs_k1[mma_q, 1]) & mask16) << shift16
+                )
+                qa2 = (cvt_bf16x2_to_e4m3x2(a_regs_k0[mma_q, 2]) & mask16) | (
+                    (cvt_bf16x2_to_e4m3x2(a_regs_k1[mma_q, 2]) & mask16) << shift16
+                )
+                qa3 = (cvt_bf16x2_to_e4m3x2(a_regs_k0[mma_q, 3]) & mask16) | (
+                    (cvt_bf16x2_to_e4m3x2(a_regs_k1[mma_q, 3]) & mask16) << shift16
+                )
+
+                d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
+                    s_frag[mma_q, mma_kv, 0],
+                    s_frag[mma_q, mma_kv, 1],
+                    s_frag[mma_q, mma_kv, 2],
+                    s_frag[mma_q, mma_kv, 3],
+                    qa0,
+                    qa1,
+                    qa2,
+                    qa3,
+                    b0_k0,
+                    b0_k1,
+                    unit_scale,
+                    unit_scale,
+                )
+                d4, d5, d6, d7 = mxfp8_mma_m16n8k32_f32_e4m3(
+                    s_frag[mma_q, mma_kv, 4],
+                    s_frag[mma_q, mma_kv, 5],
+                    s_frag[mma_q, mma_kv, 6],
+                    s_frag[mma_q, mma_kv, 7],
+                    qa0,
+                    qa1,
+                    qa2,
+                    qa3,
+                    b1_k0,
+                    b1_k1,
+                    unit_scale,
+                    unit_scale,
+                )
+                s_frag[mma_q, mma_kv, 0] = d0
+                s_frag[mma_q, mma_kv, 1] = d1
+                s_frag[mma_q, mma_kv, 2] = d2
+                s_frag[mma_q, mma_kv, 3] = d3
+                s_frag[mma_q, mma_kv, 4] = d4
+                s_frag[mma_q, mma_kv, 5] = d5
+                s_frag[mma_q, mma_kv, 6] = d6
+                s_frag[mma_q, mma_kv, 7] = d7
+
+        k_offset = _advance_offset_by_column_128b_2(k_offset_cur, mma_pair) - Int32(
+            num_mma_kv * 16 * upcast_stride_k
+        )
+
+
+@cute.jit
 def _literal_pv_mma_into_ofrag_bf16_packed(
     o_frag: cute.Tensor,
     p_frag: cute.Tensor,
@@ -449,6 +584,116 @@ def _literal_pv_mma_into_ofrag_fp8_raw(
 
 
 @cute.jit
+def _literal_pv_mma_into_ofrag_mxfp8_raw(
+    o_frag: cute.Tensor,
+    p_frag: cute.Tensor,
+    v_base_addr: Int32,
+    lane,
+    warp_kv_idx,
+    row_base,
+    num_mma_q,
+    num_mma_kv,
+    num_mma_d_vo,
+    upcast_stride_v,
+    v_scale,
+):
+    unit_scale = Uint32(0x7F7F7F7F)
+    mask16 = Uint32(0xFFFF)
+    shift16 = Uint32(16)
+    v_scale_bf2 = broadcast_f32_to_bfloat2(v_scale)
+    v_offset = _permuted_offset_128b(
+        row_base + warp_kv_idx * num_mma_kv * 16 + lane % 16,
+        lane // 16,
+        upcast_stride_v,
+    )
+    for mma_pair in cutlass.range_constexpr(num_mma_kv // 2):
+        a_regs = cute.make_rmem_tensor(
+            cute.make_layout((num_mma_q, 4), stride=(4, 1)),
+            Uint32,
+        )
+        mma_kv0 = mma_pair * 2
+        mma_kv1 = mma_kv0 + 1
+        for mma_q in cutlass.range_constexpr(num_mma_q):
+            a_regs[mma_q, 0] = (cvt_bf16x2_to_e4m3x2(bfloat2_mul(p_frag[mma_q, mma_kv0, 0], v_scale_bf2)) & mask16) | (
+                (cvt_bf16x2_to_e4m3x2(bfloat2_mul(p_frag[mma_q, mma_kv1, 0], v_scale_bf2)) & mask16) << shift16
+            )
+            a_regs[mma_q, 1] = (cvt_bf16x2_to_e4m3x2(bfloat2_mul(p_frag[mma_q, mma_kv0, 1], v_scale_bf2)) & mask16) | (
+                (cvt_bf16x2_to_e4m3x2(bfloat2_mul(p_frag[mma_q, mma_kv1, 1], v_scale_bf2)) & mask16) << shift16
+            )
+            a_regs[mma_q, 2] = (cvt_bf16x2_to_e4m3x2(bfloat2_mul(p_frag[mma_q, mma_kv0, 2], v_scale_bf2)) & mask16) | (
+                (cvt_bf16x2_to_e4m3x2(bfloat2_mul(p_frag[mma_q, mma_kv1, 2], v_scale_bf2)) & mask16) << shift16
+            )
+            a_regs[mma_q, 3] = (cvt_bf16x2_to_e4m3x2(bfloat2_mul(p_frag[mma_q, mma_kv0, 3], v_scale_bf2)) & mask16) | (
+                (cvt_bf16x2_to_e4m3x2(bfloat2_mul(p_frag[mma_q, mma_kv1, 3], v_scale_bf2)) & mask16) << shift16
+            )
+
+        v_offset_k0 = v_offset
+        v_offset_k1 = _advance_offset_by_row_128b(v_offset, 16, upcast_stride_v)
+        for mma_d in cutlass.range_constexpr(num_mma_d_vo):
+            if const_expr(mma_d % 2 == 0):
+                b0_k0, b1_k0 = ldmatrix_m8n8x4_trans_left_half_b16(
+                    _smem_addr_from_b128_offset(v_base_addr, v_offset_k0)
+                )
+                b0_k1, b1_k1 = ldmatrix_m8n8x4_trans_left_half_b16(
+                    _smem_addr_from_b128_offset(v_base_addr, v_offset_k1)
+                )
+            else:
+                b0_k0, b1_k0 = ldmatrix_m8n8x4_trans_right_half_b16(
+                    _smem_addr_from_b128_offset(v_base_addr, v_offset_k0)
+                )
+                b0_k1, b1_k1 = ldmatrix_m8n8x4_trans_right_half_b16(
+                    _smem_addr_from_b128_offset(v_base_addr, v_offset_k1)
+                )
+            b0_k0 = frag_layout_swizzle_16b_to_8b_trans(b0_k0)
+            b1_k0 = frag_layout_swizzle_16b_to_8b_trans(b1_k0)
+            b0_k1 = frag_layout_swizzle_16b_to_8b_trans(b0_k1)
+            b1_k1 = frag_layout_swizzle_16b_to_8b_trans(b1_k1)
+
+            for mma_q in cutlass.range_constexpr(num_mma_q):
+                d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
+                    o_frag[mma_q, mma_d, 0],
+                    o_frag[mma_q, mma_d, 1],
+                    o_frag[mma_q, mma_d, 2],
+                    o_frag[mma_q, mma_d, 3],
+                    a_regs[mma_q, 0],
+                    a_regs[mma_q, 1],
+                    a_regs[mma_q, 2],
+                    a_regs[mma_q, 3],
+                    b0_k0,
+                    b0_k1,
+                    unit_scale,
+                    unit_scale,
+                )
+                d4, d5, d6, d7 = mxfp8_mma_m16n8k32_f32_e4m3(
+                    o_frag[mma_q, mma_d, 4],
+                    o_frag[mma_q, mma_d, 5],
+                    o_frag[mma_q, mma_d, 6],
+                    o_frag[mma_q, mma_d, 7],
+                    a_regs[mma_q, 0],
+                    a_regs[mma_q, 1],
+                    a_regs[mma_q, 2],
+                    a_regs[mma_q, 3],
+                    b1_k0,
+                    b1_k1,
+                    unit_scale,
+                    unit_scale,
+                )
+                o_frag[mma_q, mma_d, 0] = d0
+                o_frag[mma_q, mma_d, 1] = d1
+                o_frag[mma_q, mma_d, 2] = d2
+                o_frag[mma_q, mma_d, 3] = d3
+                o_frag[mma_q, mma_d, 4] = d4
+                o_frag[mma_q, mma_d, 5] = d5
+                o_frag[mma_q, mma_d, 6] = d6
+                o_frag[mma_q, mma_d, 7] = d7
+            if const_expr(mma_d % 2 == 1):
+                v_offset_k0 = _advance_offset_by_column_128b_2(v_offset_k0, mma_d // 2)
+                v_offset_k1 = _advance_offset_by_column_128b_2(v_offset_k1, mma_d // 2)
+
+        v_offset = _advance_offset_by_row_128b(v_offset, 32, upcast_stride_v)
+
+
+@cute.jit
 def _literal_update_mdo_states_fp32_pack_p(
     s_frag: cute.Tensor,
     o_frag: cute.Tensor,
@@ -537,6 +782,8 @@ class PagedForwardKernel:
         *,
         traits: PagedForwardTraits,
         split_kv: bool,
+        mxfp8_turbo: bool = False,
+        enable_mxfp8_pv: bool = False,
     ):
         self.dtype_q = dtype_q
         self.dtype_kv = dtype_kv
@@ -556,6 +803,20 @@ class PagedForwardKernel:
             1
             if traits.num_warps_kv > 1 or self.kv_is_fp8
             else (2 if q_stage_bytes + 2 * kv_stage_bytes <= traits.max_smem_per_threadblock else 1)
+        )
+        self.use_mxfp8_qk = (
+            mxfp8_turbo
+            and self.kv_is_fp8
+            and dtype_q == cutlass.BFloat16
+            and traits.head_dim_qk % 32 == 0
+            and traits.num_mma_d_qk % 2 == 0
+        )
+        self.use_mxfp8_pv = (
+            enable_mxfp8_pv
+            and self.kv_is_fp8
+            and dtype_q == cutlass.BFloat16
+            and traits.num_warps_kv == 1
+            and traits.num_mma_kv % 2 == 0
         )
         self.softmax_scale_log2 = Float32((traits.head_dim_qk ** -0.5) * attention_utils.LOG2_E)
 
@@ -1028,6 +1289,9 @@ class PagedForwardKernel:
         split_store_v128 = const_expr(
             self.split_kv and self.traits.num_warps_kv == 1 and self.dtype_o == cutlass.BFloat16
         )
+        final_store_v128 = const_expr(
+            not self.split_kv and self.traits.num_warps_kv == 1 and self.dtype_o == cutlass.BFloat16
+        )
         sOStage = cute.make_tensor(
             sQ.iterator,
             cute.make_layout(
@@ -1213,7 +1477,47 @@ class PagedForwardKernel:
 
             subtile_base = Int32(0) if const_expr(self.traits.num_warps_kv == 1) else warp_kv_base
             for _ in cutlass.range_constexpr(1):
-                if const_expr(self.kv_is_fp8):
+                if const_expr(self.use_mxfp8_qk):
+                    k_smem_base_addr = shared_ptr_to_u32(sKStageBytes.iterator + Int32(consume_stage_idx * k_stage_bytes))
+                    frag_S = cute.make_rmem_tensor(
+                        cute.make_layout(
+                            (num_mma_q, num_mma_kv, 8),
+                            stride=(num_mma_kv * 8, 8, 1),
+                        ),
+                        Float32,
+                    )
+                    frag_S.fill(0.0)
+                    _literal_qk_mma_into_sfrag_mxfp8_raw(
+                        frag_S,
+                        q_smem_base_addr,
+                        k_smem_base_addr,
+                        lane,
+                        warp_q_idx,
+                        warp_kv_idx,
+                        Int32(0) if const_expr(self.traits.num_warps_kv > 1) else subtile_base,
+                        num_mma_q,
+                        num_mma_kv,
+                        self.traits.num_mma_d_qk,
+                        tc_upcast_stride_qk,
+                        self.traits.upcast_stride_k,
+                    )
+                    for mma_q in cutlass.range_constexpr(num_mma_q):
+                        for mma_kv in cutlass.range_constexpr(num_mma_kv):
+                            for reg_id in cutlass.range_constexpr(8):
+                                row_slot = (reg_id % 4) // 2
+                                key_local = (
+                                    warp_kv_base + mma_kv * 16 + lane_pair_base + 8 * (reg_id // 4) + (reg_id % 2)
+                                )
+                                valid = row_valid[mma_q, row_slot] != 0
+                                if valid:
+                                    valid = valid and key_local < tile_tokens
+                                if valid:
+                                    valid = valid and (tile_base + key_local) <= causal_k_limit[mma_q, row_slot]
+                                if valid:
+                                    frag_S[mma_q, mma_kv, reg_id] = frag_S[mma_q, mma_kv, reg_id] * k_scale
+                                else:
+                                    frag_S[mma_q, mma_kv, reg_id] = Float32(-Float32.inf)
+                elif const_expr(self.kv_is_fp8):
                     k_smem_base_addr = shared_ptr_to_u32(sKStageBytes.iterator + Int32(consume_stage_idx * k_stage_bytes))
                     frag_S = cute.make_rmem_tensor(
                         cute.make_layout(
@@ -1383,7 +1687,22 @@ class PagedForwardKernel:
                     cute.arch.cp_async_wait_group(1)
                     cute.arch.sync_threads()
 
-                if const_expr(self.kv_is_fp8):
+                if const_expr(self.use_mxfp8_pv):
+                    v_smem_base_addr = shared_ptr_to_u32(sVStageBytes.iterator + Int32(consume_stage_idx * v_stage_bytes))
+                    _literal_pv_mma_into_ofrag_mxfp8_raw(
+                        o_frag,
+                        p_frag,
+                        v_smem_base_addr,
+                        lane,
+                        warp_kv_idx,
+                        Int32(0) if const_expr(self.traits.num_warps_kv > 1) else subtile_base,
+                        num_mma_q,
+                        num_mma_kv,
+                        num_mma_d_vo,
+                        self.traits.upcast_stride_v,
+                        v_scale,
+                    )
+                elif const_expr(self.kv_is_fp8):
                     v_smem_base_addr = shared_ptr_to_u32(sVStageBytes.iterator + Int32(consume_stage_idx * v_stage_bytes))
                     _literal_pv_mma_into_ofrag_fp8_raw(
                         o_frag,
@@ -1486,122 +1805,179 @@ class PagedForwardKernel:
             cute.arch.sync_threads()
 
         store_enabled = valid_work and warp_kv_idx == 0
-        for mma_q in cutlass.range_constexpr(num_mma_q):
-            for row_slot in cutlass.range_constexpr(2):
-                packed_row_local = row_local_idx[mma_q, row_slot]
-                q_head_idx = q_head_idx_frag[mma_q, row_slot]
-                q_row_idx = q_row_idx_frag[mma_q, row_slot]
-                token_local = q_token_local[mma_q, row_slot]
-                valid_row_store = row_valid[mma_q, row_slot] != 0
-                merged_m = Float32(-Float32.inf)
-                merged_d = Float32(1.0)
-                if valid_row_store:
-                    if const_expr(self.traits.num_warps_kv > 1):
-                        for kv_warp in cutlass.range_constexpr(self.traits.num_warps_kv):
-                            part_m = sSyncMD[kv_warp, packed_row_local, 0]
-                            part_d = sSyncMD[kv_warp, packed_row_local, 1]
-                            if merged_m == -Float32.inf:
-                                merged_m = part_m
-                                merged_d = part_d
-                            elif part_m != -Float32.inf:
-                                new_m = attention_utils.fmax(merged_m, part_m)
-                                merged_d = Float32(
-                                    merged_d * cute.math.exp2(merged_m - new_m, fastmath=True)
-                                    + part_d * cute.math.exp2(part_m - new_m, fastmath=True)
-                                )
-                                merged_m = new_m
-                    else:
-                        merged_m = m_frag[mma_q, row_slot]
-                        merged_d = d_frag[mma_q, row_slot]
-
-                for mma_d in cutlass.range_constexpr(num_mma_d_vo):
-                    dim_low = mma_d * 16 + lane_pair_base
-                    dim_high = dim_low + 8
-                    reg_base = row_slot * 2
-                    out_low0 = Float32(0.0)
-                    out_low1 = Float32(0.0)
-                    out_high0 = Float32(0.0)
-                    out_high1 = Float32(0.0)
-                    if valid_row_store and merged_m != -Float32.inf:
-                        if const_expr(self.traits.num_warps_kv > 1):
-                            acc_low0 = Float32(0.0)
-                            acc_low1 = Float32(0.0)
-                            acc_high0 = Float32(0.0)
-                            acc_high1 = Float32(0.0)
+        packed_row_local = Int32(0)
+        q_head_idx = Int32(0)
+        q_row_idx = Int32(0)
+        token_local = Int32(0)
+        partial_row_idx = Int32(0)
+        if const_expr(self.traits.num_warps_kv > 1):
+            if store_enabled:
+                for mma_q in cutlass.range_constexpr(num_mma_q):
+                    for row_slot in cutlass.range_constexpr(2):
+                        packed_row_local = row_local_idx[mma_q, row_slot]
+                        q_head_idx = q_head_idx_frag[mma_q, row_slot]
+                        q_row_idx = q_row_idx_frag[mma_q, row_slot]
+                        token_local = q_token_local[mma_q, row_slot]
+                        valid_row_store = row_valid[mma_q, row_slot] != 0
+                        merged_m = Float32(-Float32.inf)
+                        merged_d = Float32(1.0)
+                        inv_d = Float32(0.0)
+                        merge_scale = cute.make_rmem_tensor(
+                            cute.make_layout((self.traits.num_warps_kv,), stride=(1,)),
+                            Float32,
+                        )
+                        merge_scale.fill(0.0)
+                        if valid_row_store:
                             for kv_warp in cutlass.range_constexpr(self.traits.num_warps_kv):
                                 part_m = sSyncMD[kv_warp, packed_row_local, 0]
-                                scale = (
-                                    Float32(0.0)
-                                    if part_m == -Float32.inf
-                                    else cute.math.exp2(part_m - merged_m, fastmath=True)
-                                )
-                                acc_low0 += sSyncO[kv_warp, packed_row_local, dim_low + 0] * scale
-                                acc_low1 += sSyncO[kv_warp, packed_row_local, dim_low + 1] * scale
-                                acc_high0 += sSyncO[kv_warp, packed_row_local, dim_high + 0] * scale
-                                acc_high1 += sSyncO[kv_warp, packed_row_local, dim_high + 1] * scale
+                                part_d = sSyncMD[kv_warp, packed_row_local, 1]
+                                if merged_m == -Float32.inf:
+                                    merged_m = part_m
+                                    merged_d = part_d
+                                elif part_m != -Float32.inf:
+                                    new_m = attention_utils.fmax(merged_m, part_m)
+                                    merged_d = Float32(
+                                        merged_d * _exp2_approx_ftz_f32(merged_m - new_m)
+                                        + part_d * _exp2_approx_ftz_f32(part_m - new_m)
+                                    )
+                                    merged_m = new_m
+                            if merged_m != -Float32.inf:
+                                inv_d = cute.arch.rcp_approx(merged_d)
+                                for kv_warp in cutlass.range_constexpr(self.traits.num_warps_kv):
+                                    part_m = sSyncMD[kv_warp, packed_row_local, 0]
+                                    merge_scale[kv_warp] = (
+                                        Float32(0.0)
+                                        if part_m == -Float32.inf
+                                        else _exp2_approx_ftz_f32(part_m - merged_m)
+                                    )
+
+                        for mma_d in cutlass.range_constexpr(num_mma_d_vo):
+                            dim_low = mma_d * 16 + lane_pair_base
+                            dim_high = dim_low + 8
+                            out_low0 = Float32(0.0)
+                            out_low1 = Float32(0.0)
+                            out_high0 = Float32(0.0)
+                            out_high1 = Float32(0.0)
+                            if valid_row_store and merged_m != -Float32.inf:
+                                acc_low0 = Float32(0.0)
+                                acc_low1 = Float32(0.0)
+                                acc_high0 = Float32(0.0)
+                                acc_high1 = Float32(0.0)
+                                for kv_warp in cutlass.range_constexpr(self.traits.num_warps_kv):
+                                    scale = merge_scale[kv_warp]
+                                    acc_low0 += sSyncO[kv_warp, packed_row_local, dim_low + 0] * scale
+                                    acc_low1 += sSyncO[kv_warp, packed_row_local, dim_low + 1] * scale
+                                    acc_high0 += sSyncO[kv_warp, packed_row_local, dim_high + 0] * scale
+                                    acc_high1 += sSyncO[kv_warp, packed_row_local, dim_high + 1] * scale
+                                out_low0 = acc_low0 * inv_d
+                                out_low1 = acc_low1 * inv_d
+                                out_high0 = acc_high0 * inv_d
+                                out_high1 = acc_high1 * inv_d
+
+                            if valid_row_store:
+                                if const_expr(self.dtype_o == cutlass.BFloat16):
+                                    sDecodeStageU32[0, packed_row_local, dim_low // 2] = pack_f32x2_to_bfloat2(
+                                        out_low0, out_low1
+                                    )
+                                    sDecodeStageU32[0, packed_row_local, dim_high // 2] = pack_f32x2_to_bfloat2(
+                                        out_high0, out_high1
+                                    )
+                                elif split_store_v128:
+                                    sOStageU32[packed_row_local, dim_low // 2] = pack_f32x2_to_bfloat2(out_low0, out_low1)
+                                    sOStageU32[packed_row_local, dim_high // 2] = pack_f32x2_to_bfloat2(
+                                        out_high0, out_high1
+                                    )
+                                elif final_store_v128:
+                                    sOStageU32[packed_row_local, dim_low // 2] = pack_f32x2_to_bfloat2(out_low0, out_low1)
+                                    sOStageU32[packed_row_local, dim_high // 2] = pack_f32x2_to_bfloat2(
+                                        out_high0, out_high1
+                                    )
+                                elif const_expr(self.split_kv):
+                                    partial_row_idx = request_partial_start + token_local * num_chunks_kv + kv_tile_idx
+                                    mO[partial_row_idx, q_head_idx, dim_low + 0] = out_low0.to(self.dtype_o)
+                                    mO[partial_row_idx, q_head_idx, dim_low + 1] = out_low1.to(self.dtype_o)
+                                    mO[partial_row_idx, q_head_idx, dim_high + 0] = out_high0.to(self.dtype_o)
+                                    mO[partial_row_idx, q_head_idx, dim_high + 1] = out_high1.to(self.dtype_o)
+                                else:
+                                    mO[q_row_idx, q_head_idx, dim_low + 0] = out_low0.to(self.dtype_o)
+                                    mO[q_row_idx, q_head_idx, dim_low + 1] = out_low1.to(self.dtype_o)
+                                    mO[q_row_idx, q_head_idx, dim_high + 0] = out_high0.to(self.dtype_o)
+                                    mO[q_row_idx, q_head_idx, dim_high + 1] = out_high1.to(self.dtype_o)
+                        if valid_row_store and lane_pair_base == 0:
+                            row_lse = (
+                                Float32(-Float32.inf)
+                                if merged_m == -Float32.inf
+                                else Float32(merged_m + cute.math.log2(merged_d, fastmath=True))
+                            )
+                            if const_expr(self.split_kv):
+                                partial_row_idx = request_partial_start + token_local * num_chunks_kv + kv_tile_idx
+                                mLSE[partial_row_idx, q_head_idx] = row_lse
+                            else:
+                                mLSE[q_head_idx, q_row_idx] = row_lse
+        else:
+            for mma_q in cutlass.range_constexpr(num_mma_q):
+                for row_slot in cutlass.range_constexpr(2):
+                    packed_row_local = row_local_idx[mma_q, row_slot]
+                    q_head_idx = q_head_idx_frag[mma_q, row_slot]
+                    q_row_idx = q_row_idx_frag[mma_q, row_slot]
+                    token_local = q_token_local[mma_q, row_slot]
+                    valid_row_store = row_valid[mma_q, row_slot] != 0
+                    merged_m = Float32(-Float32.inf)
+                    merged_d = Float32(1.0)
+                    inv_d = Float32(0.0)
+                    if store_enabled and valid_row_store:
+                        merged_m = m_frag[mma_q, row_slot]
+                        merged_d = d_frag[mma_q, row_slot]
+                        if merged_m != -Float32.inf:
                             inv_d = cute.arch.rcp_approx(merged_d)
-                            out_low0 = acc_low0 * inv_d
-                            out_low1 = acc_low1 * inv_d
-                            out_high0 = acc_high0 * inv_d
-                            out_high1 = acc_high1 * inv_d
-                        else:
-                            inv_d = cute.arch.rcp_approx(merged_d)
+
+                    for mma_d in cutlass.range_constexpr(num_mma_d_vo):
+                        dim_low = mma_d * 16 + lane_pair_base
+                        dim_high = dim_low + 8
+                        reg_base = row_slot * 2
+                        out_low0 = Float32(0.0)
+                        out_low1 = Float32(0.0)
+                        out_high0 = Float32(0.0)
+                        out_high1 = Float32(0.0)
+                        if store_enabled and valid_row_store and merged_m != -Float32.inf:
                             out_low0 = o_frag[mma_q, mma_d, reg_base + 0] * inv_d
                             out_low1 = o_frag[mma_q, mma_d, reg_base + 1] * inv_d
                             out_high0 = o_frag[mma_q, mma_d, reg_base + 4] * inv_d
                             out_high1 = o_frag[mma_q, mma_d, reg_base + 5] * inv_d
 
-                    if store_enabled and valid_row_store:
-                        if const_expr(self.traits.num_warps_kv > 1 and self.dtype_o == cutlass.BFloat16):
-                            sDecodeStageU32[0, packed_row_local, dim_low // 2] = pack_f32x2_to_bfloat2(out_low0, out_low1)
-                            sDecodeStageU32[0, packed_row_local, dim_high // 2] = pack_f32x2_to_bfloat2(out_high0, out_high1)
-                            if lane_pair_base == 0:
-                                if const_expr(self.split_kv):
-                                    partial_row_idx = request_partial_start + token_local * num_chunks_kv + kv_tile_idx
-                                    mLSE[partial_row_idx, q_head_idx] = (
-                                        Float32(-Float32.inf)
-                                        if merged_m == -Float32.inf
-                                        else Float32(merged_m + cute.math.log2(merged_d, fastmath=True))
-                                    )
-                                else:
-                                    mLSE[q_head_idx, q_row_idx] = (
-                                        Float32(-Float32.inf)
-                                        if merged_m == -Float32.inf
-                                        else Float32(merged_m + cute.math.log2(merged_d, fastmath=True))
-                                    )
-                        elif split_store_v128:
-                            sOStageU32[packed_row_local, dim_low // 2] = pack_f32x2_to_bfloat2(out_low0, out_low1)
-                            sOStageU32[packed_row_local, dim_high // 2] = pack_f32x2_to_bfloat2(out_high0, out_high1)
-                            if lane_pair_base == 0:
+                        if store_enabled and valid_row_store:
+                            if split_store_v128:
+                                sOStageU32[packed_row_local, dim_low // 2] = pack_f32x2_to_bfloat2(out_low0, out_low1)
+                                sOStageU32[packed_row_local, dim_high // 2] = pack_f32x2_to_bfloat2(
+                                    out_high0, out_high1
+                                )
+                            elif final_store_v128:
+                                sOStageU32[packed_row_local, dim_low // 2] = pack_f32x2_to_bfloat2(out_low0, out_low1)
+                                sOStageU32[packed_row_local, dim_high // 2] = pack_f32x2_to_bfloat2(
+                                    out_high0, out_high1
+                                )
+                            elif const_expr(self.split_kv):
                                 partial_row_idx = request_partial_start + token_local * num_chunks_kv + kv_tile_idx
-                                mLSE[partial_row_idx, q_head_idx] = (
-                                    Float32(-Float32.inf)
-                                    if merged_m == -Float32.inf
-                                    else Float32(merged_m + cute.math.log2(merged_d, fastmath=True))
-                                )
-                        elif const_expr(self.split_kv):
+                                mO[partial_row_idx, q_head_idx, dim_low + 0] = out_low0.to(self.dtype_o)
+                                mO[partial_row_idx, q_head_idx, dim_low + 1] = out_low1.to(self.dtype_o)
+                                mO[partial_row_idx, q_head_idx, dim_high + 0] = out_high0.to(self.dtype_o)
+                                mO[partial_row_idx, q_head_idx, dim_high + 1] = out_high1.to(self.dtype_o)
+                            else:
+                                mO[q_row_idx, q_head_idx, dim_low + 0] = out_low0.to(self.dtype_o)
+                                mO[q_row_idx, q_head_idx, dim_low + 1] = out_low1.to(self.dtype_o)
+                                mO[q_row_idx, q_head_idx, dim_high + 0] = out_high0.to(self.dtype_o)
+                                mO[q_row_idx, q_head_idx, dim_high + 1] = out_high1.to(self.dtype_o)
+                    if store_enabled and valid_row_store and lane_pair_base == 0:
+                        row_lse = (
+                            Float32(-Float32.inf)
+                            if merged_m == -Float32.inf
+                            else Float32(merged_m + cute.math.log2(merged_d, fastmath=True))
+                        )
+                        if const_expr(self.split_kv):
                             partial_row_idx = request_partial_start + token_local * num_chunks_kv + kv_tile_idx
-                            mO[partial_row_idx, q_head_idx, dim_low + 0] = out_low0.to(self.dtype_o)
-                            mO[partial_row_idx, q_head_idx, dim_low + 1] = out_low1.to(self.dtype_o)
-                            mO[partial_row_idx, q_head_idx, dim_high + 0] = out_high0.to(self.dtype_o)
-                            mO[partial_row_idx, q_head_idx, dim_high + 1] = out_high1.to(self.dtype_o)
-                            if lane_pair_base == 0:
-                                mLSE[partial_row_idx, q_head_idx] = (
-                                    Float32(-Float32.inf)
-                                    if merged_m == -Float32.inf
-                                    else Float32(merged_m + cute.math.log2(merged_d, fastmath=True))
-                                )
+                            mLSE[partial_row_idx, q_head_idx] = row_lse
                         else:
-                            mO[q_row_idx, q_head_idx, dim_low + 0] = out_low0.to(self.dtype_o)
-                            mO[q_row_idx, q_head_idx, dim_low + 1] = out_low1.to(self.dtype_o)
-                            mO[q_row_idx, q_head_idx, dim_high + 0] = out_high0.to(self.dtype_o)
-                            mO[q_row_idx, q_head_idx, dim_high + 1] = out_high1.to(self.dtype_o)
-                            if lane_pair_base == 0:
-                                mLSE[q_head_idx, q_row_idx] = (
-                                    Float32(-Float32.inf)
-                                    if merged_m == -Float32.inf
-                                    else Float32(merged_m + cute.math.log2(merged_d, fastmath=True))
-                                )
+                            mLSE[q_head_idx, q_row_idx] = row_lse
 
         if const_expr(decode_store_v128):
             if valid_work:
@@ -1665,3 +2041,31 @@ class PagedForwardKernel:
                         sOStageU32[packed_row_local, u32_idx + 3],
                     )
                     split_chunk_linear_idx += self.traits.num_threads
+
+        if final_store_v128:
+            if valid_work:
+                cute.arch.sync_threads()
+                final_chunks_per_row = self.traits.head_dim_vo // 8
+                final_chunk_linear_idx = tidx
+                final_total_chunks = packed_tile_rows * final_chunks_per_row
+                while final_chunk_linear_idx < final_total_chunks:
+                    packed_row_local = final_chunk_linear_idx // final_chunks_per_row
+                    chunk_idx = final_chunk_linear_idx - packed_row_local * final_chunks_per_row
+                    packed_q_idx = packed_tile_start + packed_row_local
+                    token_local = packed_q_idx // group_size
+                    q_group_lane = packed_q_idx - token_local * group_size
+                    q_head_idx = kv_head_idx * group_size + q_group_lane
+                    q_row_idx = q_start + token_local
+                    u32_idx = chunk_idx * 4
+                    gmem_elem_offset = (
+                        ((q_row_idx * mO.shape[1] + q_head_idx) * self.traits.head_dim_vo)
+                        + chunk_idx * 8
+                    )
+                    st_global_v4_u32(
+                        get_ptr_as_int64(mOFlat, gmem_elem_offset),
+                        sOStageU32[packed_row_local, u32_idx + 0],
+                        sOStageU32[packed_row_local, u32_idx + 1],
+                        sOStageU32[packed_row_local, u32_idx + 2],
+                        sOStageU32[packed_row_local, u32_idx + 3],
+                    )
+                    final_chunk_linear_idx += self.traits.num_threads

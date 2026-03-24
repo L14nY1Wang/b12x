@@ -4,6 +4,12 @@ import math
 
 import torch
 
+from benchmarks.benchmark_paged_attention import (
+    _capture_backend_graph,
+    _capture_flashinfer_fa2_graph,
+    _make_uniform_paged_inputs,
+    _quantize_paged_kv_cache_global_e4m3,
+)
 from b12x.attention.reference import paged_attention_reference
 from b12x.integration.attention import PagedAttentionWorkspace
 
@@ -24,13 +30,70 @@ def _make_workspace(
     v_cache: torch.Tensor,
     *,
     mode: str,
+    attn_mode: str | None = None,
 ) -> PagedAttentionWorkspace:
     return PagedAttentionWorkspace.for_tensors(
         mode=mode,
         q=q,
         k_cache=k_cache,
         v_cache=v_cache,
+        attn_mode=attn_mode,
     )
+
+
+def _run_turbo_decode_graph_check(
+    *,
+    cache_seqlen: int,
+) -> tuple[torch.Tensor, torch.Tensor, str]:
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_uniform_paged_inputs(
+        batch=8,
+        q_seqlen=1,
+        cache_seqlen=cache_seqlen,
+        page_size=64,
+        q_heads=8,
+        kv_heads=1,
+        head_dim=256,
+        dtype=torch.bfloat16,
+        seed=1,
+    )
+    k_fp8, v_fp8, k_descale, v_descale, k_scale, v_scale = _quantize_paged_kv_cache_global_e4m3(
+        k_cache,
+        v_cache,
+        batch=8,
+        kv_heads=1,
+    )
+    backend = _capture_backend_graph(
+        q=q,
+        k_cache=k_fp8,
+        v_cache=v_fp8,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        fixed_split_pages=None,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        warmup=1,
+        b12x_attn_mode="turbo",
+    )
+    _fa2_graph, fa2_out = _capture_flashinfer_fa2_graph(
+        q=q,
+        k_cache=k_fp8,
+        v_cache=v_fp8,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        q_seqlen=1,
+        page_size=64,
+        q_heads=8,
+        kv_heads=1,
+        head_dim=256,
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.float8_e4m3fn,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        workspace_bytes=512 * 1024 * 1024,
+        warmup=1,
+    )
+    return backend.output, fa2_out, backend.plan_desc
 
 
 @torch.inference_mode()
@@ -122,6 +185,15 @@ def test_paged_forward_matches_reference_without_split_fp8_decode_batch8() -> No
 
 
 @torch.inference_mode()
+def test_paged_forward_turbo_matches_reference_without_split_fp8_decode_batch8() -> None:
+    require_sm120()
+    output, fa2_out, plan_desc = _run_turbo_decode_graph_check(cache_seqlen=64)
+    assert plan_desc == "chunk=128,nosplit"
+    assert (output - fa2_out).abs().max().item() <= 0.02
+    assert _cosine_similarity(output, fa2_out) >= 0.998
+
+
+@torch.inference_mode()
 def test_paged_forward_matches_reference_without_split_bf16_extend() -> None:
     require_sm120()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
@@ -202,6 +274,15 @@ def test_paged_forward_matches_reference_with_split_fp8_kv() -> None:
     assert (output - ref_out).abs().max().item() <= 0.05
     assert (lse_natural - ref_lse).abs().max().item() <= 0.08
     assert _cosine_similarity(output, ref_out) >= 0.999
+
+
+@torch.inference_mode()
+def test_paged_forward_turbo_matches_reference_with_split_fp8_decode() -> None:
+    require_sm120()
+    output, fa2_out, plan_desc = _run_turbo_decode_graph_check(cache_seqlen=8192)
+    assert plan_desc == "chunk=384,split"
+    assert (output - fa2_out).abs().max().item() <= 0.01
+    assert _cosine_similarity(output, fa2_out) >= 0.998
 
 
 @torch.inference_mode()

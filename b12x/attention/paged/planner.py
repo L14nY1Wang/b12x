@@ -33,6 +33,20 @@ _PAGED_EXTEND_FP8_CHUNK_TABLE_PAGES = (
     (1024, 12),
     (2048, 12),
 )
+_PAGED_EXTEND_FP8_GRAPH_CHUNK_TABLE_PAGES = (
+    (1, 1),
+    (2, 1),
+    (4, 1),
+    (8, 1),
+    (16, 1),
+    (32, 2),
+    (64, 3),
+    (128, 3),
+    (256, 6),
+    (512, 12),
+    (1024, 12),
+    (2048, 12),
+)
 _PAGED_EXTEND_BF16_CHUNK_TABLE_PAGES = (
     (1, 1),
     (2, 1),
@@ -166,6 +180,7 @@ def _paged_chunk_table_pages(
     head_dim_vo: int,
     gqa_group_size: int,
     max_effective_kv_pages: int,
+    graph_chunk_policy: bool,
 ) -> int | None:
     """Explicit table-driven chunk override for the tuned serving matrix.
 
@@ -180,9 +195,14 @@ def _paged_chunk_table_pages(
     if q_dtype != torch.bfloat16:
         return None
     if mode == "extend" and kv_dtype == _FP8_KV_DTYPE:
+        table = (
+            _PAGED_EXTEND_FP8_GRAPH_CHUNK_TABLE_PAGES
+            if graph_chunk_policy
+            else _PAGED_EXTEND_FP8_CHUNK_TABLE_PAGES
+        )
         return _lookup_chunk_pages_from_table(
             max_effective_kv_pages,
-            _PAGED_EXTEND_FP8_CHUNK_TABLE_PAGES,
+            table,
         )
     if mode == "decode" and kv_dtype == _FP8_KV_DTYPE:
         return _lookup_chunk_pages_from_table(
@@ -220,6 +240,7 @@ class PagedPlanKey:
     fixed_split_size: int
     disable_split_kv: bool
     enable_cuda_graph: bool
+    graph_chunk_policy: bool
     max_batch_size_if_split: int
     padded_batch_size: int
     new_batch_size: int
@@ -261,6 +282,7 @@ def create_paged_plan(
     fixed_split_size: int = -1,
     disable_split_kv: bool = False,
     enable_cuda_graph: bool = False,
+    graph_chunk_policy: bool = False,
     max_batch_size_if_split: int | None = None,
     window_left: int = -1,
 ) -> PagedPlan:
@@ -359,6 +381,7 @@ def create_paged_plan(
             head_dim_vo=head_dim_vo,
             gqa_group_size=gqa_group_size,
             max_effective_kv_pages=max(max(effective_kv_len_arr), 1),
+            graph_chunk_policy=graph_chunk_policy,
         )
         if heuristic_kv_chunk_size_pages is not None:
             split_kv = False
@@ -424,6 +447,7 @@ def create_paged_plan(
         fixed_split_size=fixed_split_size,
         disable_split_kv=disable_split_kv,
         enable_cuda_graph=enable_cuda_graph,
+        graph_chunk_policy=graph_chunk_policy,
         max_batch_size_if_split=max_batch_size_if_split,
         padded_batch_size=padded_batch_size,
         new_batch_size=new_batch_size,
