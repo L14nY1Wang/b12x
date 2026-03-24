@@ -37,7 +37,7 @@ python -m pip install -e '.[dev]'
 ## Package layout
 
 - `b12x.attention`
-  - SM120 paged attention forward kernel (TMA-based KV, FP8 KV cache, split-KV)
+  - Primary SM120 paged attention backend (split-KV, BF16/FP8 KV, exact host planning)
 - `b12x.cute`
   - Low-level CuTe and FP4 helpers
 - `b12x.gemm`
@@ -51,10 +51,11 @@ python -m pip install -e '.[dev]'
 - `b12x.sglang`
   - Thin `sglang` integration shims
 
-## Attention runtime contract (experimental)
+## Attention runtime contract
 
-**The attention kernel is a work in progress.** It is functional and passes correctness
-tests but has not been tuned to the same degree as the MoE kernels.
+Paged attention now routes through the primary `b12x.attention.paged` backend.
+It is narrow by design and tuned for the Blackwell serving matrix this repo
+cares about.
 
 - `b12x.integration.attention.create_paged_attention_plan` builds an exact-shape launch plan for one paged attention configuration.
 - `allocate_paged_attention_workspace_for_plan` allocates reusable scratch buffers for a plan.
@@ -62,10 +63,16 @@ tests but has not been tuned to the same degree as the MoE kernels.
 - `b12x_paged_attention_forward` executes the kernel given a plan and workspace.
 - Page size is fixed at 64.
 - Supported KV dtypes: BF16, FP16, FP8 E4M3.
-- FP8 KV uses TMA loads with in-kernel BF16 dequant. Per-head descale tensors are optional.
-- Split-KV is automatic outside CUDA graph capture; inside capture, `num_splits` must be explicit.
-- GQA with arbitrary ratios is supported. When `tile_m % qhead_per_kvhead != 0`, Q loads fall back from TMA to per-thread async copies automatically.
+- FP8 KV uses raw-byte staging with in-kernel descale. Per-head descale tensors are required for FP8 KV.
+- Split-KV chunking is automatic by default. `fixed_split_size` pins chunk size in pages for exact-shape benchmarking or graph replay.
+- GQA with arbitrary ratios is supported.
 - During CUDA graph capture, `output=` must be caller-owned and stable across replays.
+
+## Acknowledgement
+
+The paged attention planner, split/merge structure, and benchmark methodology
+were developed by studying FlashInfer's paged attention kernels. `b12x` ships
+its own SM120-first implementation and does not depend on FlashInfer at runtime.
 
 ## MoE runtime contract
 
@@ -111,9 +118,17 @@ tests but has not been tuned to the same degree as the MoE kernels.
 ### Tests
 
 - `tests/test_paged_attention_workspace_api.py`
-  - Paged attention workspace and plan correctness across shapes, dtypes, and split counts
+  - Public paged attention plan, workspace, and wrapper correctness
 - `tests/test_attention_cuda_graphs.py`
   - CUDA graph capture and replay for paged attention, including FP8 KV and small GQA ratios
+- `tests/test_attention_paged_forward.py`
+  - Primary paged forward kernel exactness against the reference path
+- `tests/test_attention_paged_merge.py`
+  - Persistent split-merge exactness
+- `tests/test_attention_paged_planner.py`
+  - Exact host plan metadata and explicit chunk-table coverage
+- `tests/test_attention_paged_traits.py`
+  - Forward-trait selection for the supported serving families
 - `tests/test_tp_moe_reference.py`
   - Independent oracle-backed MoE correctness test
 - `tests/test_moe_equivalence.py`

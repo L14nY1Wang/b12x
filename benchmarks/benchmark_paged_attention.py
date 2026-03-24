@@ -107,6 +107,13 @@ class CaseMetrics:
     min_us: float
 
 
+@dataclass(frozen=True)
+class BackendCapture:
+    graph: torch.cuda.CUDAGraph
+    output: torch.Tensor
+    plan_desc: str
+
+
 def _build_shape_cases(
     *,
     batch: int,
@@ -231,7 +238,7 @@ def _make_flashinfer_page_metadata(
     return qo_indptr, paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len
 
 
-def _capture_b12x_graph(
+def _capture_backend_graph(
     *,
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -239,11 +246,13 @@ def _capture_b12x_graph(
     page_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
-    num_splits: int,
+    fixed_split_pages: int | None,
     k_descale: torch.Tensor | None,
     v_descale: torch.Tensor | None,
     warmup: int,
-) -> tuple[torch.cuda.CUDAGraph, torch.Tensor, int]:
+) -> BackendCapture:
+    output = torch.empty_like(q)
+
     plan = create_paged_attention_plan(
         q,
         k_cache,
@@ -252,12 +261,13 @@ def _capture_b12x_graph(
         cache_seqlens,
         cu_seqlens_q,
         causal=True,
-        num_splits=num_splits,
+        fixed_split_size=fixed_split_pages,
     )
     workspace = allocate_paged_attention_workspace_for_plan(
-        plan, total_q=q.shape[0], batch=page_table.shape[0],
+        plan,
+        total_q=q.shape[0],
+        batch=page_table.shape[0],
     )
-    output = torch.empty_like(q)
 
     def run() -> None:
         b12x_paged_attention_forward(
@@ -271,11 +281,15 @@ def _capture_b12x_graph(
             plan=plan,
             k_descale=k_descale,
             v_descale=v_descale,
-            output=output,
         )
 
     graph = _capture_graph(run, warmup=warmup)
-    return graph, output, plan.num_splits
+    chunk_desc = f"chunk={plan.kv_chunk_size}"
+    if plan.split_kv:
+        chunk_desc += ",split"
+    else:
+        chunk_desc += ",nosplit"
+    return BackendCapture(graph=graph, output=output, plan_desc=chunk_desc)
 
 
 def _capture_flashinfer_fa2_graph(
@@ -396,7 +410,7 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--replays", type=int, default=200)
     parser.add_argument("--flashinfer-workspace-mb", type=int, default=512)
-    parser.add_argument("--num-splits", type=int, default=1)
+    parser.add_argument("--fixed-split-pages", type=int, default=0)
     parser.add_argument("--compare-fa2", action="store_true", default=True)
     parser.add_argument("--no-compare-fa2", action="store_false", dest="compare_fa2")
     parser.add_argument("--check", action="store_true")
@@ -430,7 +444,7 @@ def main() -> None:
             "head_dim": args.head_dim,
             "q_dtype": str(dtype),
             "kv_dtype": str(kv_dtype),
-            "num_splits": args.num_splits,
+            "fixed_split_pages": args.fixed_split_pages,
             "replays": args.replays,
             "flashinfer_fa2": args.compare_fa2,
         },
@@ -462,23 +476,23 @@ def main() -> None:
                 batch=case.batch,
                 kv_heads=args.kv_heads,
             )
-        b12x_graph, b12x_output, b12x_num_splits = _capture_b12x_graph(
+        backend_capture = _capture_backend_graph(
             q=q,
             k_cache=k_cache,
             v_cache=v_cache,
             page_table=page_table,
             cache_seqlens=cache_seqlens_tensor,
             cu_seqlens_q=cu_seqlens_q,
-            num_splits=args.num_splits,
+            fixed_split_pages=args.fixed_split_pages if args.fixed_split_pages > 0 else None,
             k_descale=k_descale,
             v_descale=v_descale,
             warmup=args.warmup,
         )
-        b12x_times_ms = _bench_graph(b12x_graph, replays=args.replays)
-        b12x_metrics = CaseMetrics(
+        backend_times_ms = _bench_graph(backend_capture.graph, replays=args.replays)
+        backend_metrics = CaseMetrics(
             backend="b12x",
-            median_us=statistics.median(b12x_times_ms) * 1000.0,
-            min_us=min(b12x_times_ms) * 1000.0,
+            median_us=statistics.median(backend_times_ms) * 1000.0,
+            min_us=min(backend_times_ms) * 1000.0,
         )
 
         flashinfer_metrics: CaseMetrics | None = None
@@ -508,12 +522,12 @@ def main() -> None:
                 median_us=statistics.median(flashinfer_times_ms) * 1000.0,
                 min_us=min(flashinfer_times_ms) * 1000.0,
             )
-            speedups.append(flashinfer_metrics.median_us / b12x_metrics.median_us)
+            speedups.append(flashinfer_metrics.median_us / backend_metrics.median_us)
 
         check_suffix = ""
         if args.check and flashinfer_output is not None:
-            max_abs = (b12x_output - flashinfer_output).abs().max().item()
-            cos = _cosine_similarity(b12x_output, flashinfer_output)
+            max_abs = (backend_capture.output - flashinfer_output).abs().max().item()
+            cos = _cosine_similarity(backend_capture.output, flashinfer_output)
             check_suffix = f" max_abs={max_abs:.5f} cos={cos:.8f}"
 
         line = (
@@ -521,19 +535,21 @@ def main() -> None:
             f"bs={case.batch:2d} "
             f"q={case.q_seqlen:2d} "
             f"k={case.cache_seqlen:5d} "
-            f"splits={b12x_num_splits:2d} "
-            f"| b12x median={b12x_metrics.median_us:8.1f} us min={b12x_metrics.min_us:8.1f} us"
+            f"{backend_capture.plan_desc:>17s} "
+            f"| {backend_metrics.backend} median={backend_metrics.median_us:8.1f} us "
+            f"min={backend_metrics.min_us:8.1f} us"
         )
         if flashinfer_metrics is not None:
             line += (
                 f" | fa2 median={flashinfer_metrics.median_us:8.1f} us "
                 f"min={flashinfer_metrics.min_us:8.1f} us "
-                f"| fa2/b12x={flashinfer_metrics.median_us / b12x_metrics.median_us:6.3f}x"
+                f"| fa2/{backend_metrics.backend}="
+                f"{flashinfer_metrics.median_us / backend_metrics.median_us:6.3f}x"
             )
         print(line + check_suffix)
 
     if speedups:
-        print(f"geomean fa2/b12x speedup: {statistics.geometric_mean(speedups):.3f}x")
+        print(f"geomean fa2/b12x: {statistics.geometric_mean(speedups):.3f}x")
 
 
 if __name__ == "__main__":

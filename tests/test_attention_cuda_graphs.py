@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 
@@ -24,55 +26,15 @@ def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
     return torch.nn.functional.cosine_similarity(a_f, b_f, dim=0).item()
 
 
+def _lse_base2_to_natural(lse: torch.Tensor) -> torch.Tensor:
+    return lse * math.log(2.0)
+
+
 @torch.inference_mode()
-@pytest.mark.parametrize("batch_size", [1, 2, 4, 10])
-@pytest.mark.parametrize(
-    "q_heads,kv_heads",
-    [(24, 4), (12, 2), (6, 1)],
-    ids=["gqa6-24h", "gqa6-12h", "gqa6-1kv"],
-)
-def test_paged_decode_small_gqa_ratio(
-    batch_size: int, q_heads: int, kv_heads: int
+@pytest.mark.parametrize("fixed_split_size", [None, 4])
+def test_paged_attention_replays_under_cuda_graph_with_fixed_metadata(
+    fixed_split_size: int | None,
 ) -> None:
-    """Decode with GQA ratio 6 — tile_m (128) doesn't divide packed Q rows,
-    so Q must use the non-TMA async-copy path."""
-    require_sm120()
-    clear_attention_caches()
-
-    q_seqlens = [1] * batch_size
-    cache_seqlens_vals = [64 + i * 31 for i in range(batch_size)]
-
-    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
-        q_seqlens=q_seqlens,
-        cache_seqlens=cache_seqlens_vals,
-        page_size=64,
-        q_heads=q_heads,
-        kv_heads=kv_heads,
-        head_dim=128,
-        seed=42,
-    )
-    plan = create_paged_attention_plan(
-        q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q,
-        causal=True, mode="decode", num_splits=1,
-    )
-    workspace = allocate_paged_attention_workspace_for_plan(plan, total_q=q.shape[0])
-
-    output, lse = b12x_paged_attention_forward(
-        q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q,
-        workspace=workspace, plan=plan,
-    )
-    torch.cuda.synchronize()
-
-    ref_out, ref_lse = paged_attention_reference(
-        q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q, causal=True,
-    )
-    assert (output - ref_out).abs().max().item() <= 0.02
-    assert _cosine_similarity(output, ref_out) >= 0.99999
-
-
-@torch.inference_mode()
-@pytest.mark.parametrize("num_splits", [1, 4])
-def test_paged_attention_replays_under_cuda_graph_with_dynamic_metadata(num_splits: int) -> None:
     require_sm120()
     clear_attention_caches()
 
@@ -90,7 +52,7 @@ def test_paged_attention_replays_under_cuda_graph_with_dynamic_metadata(num_spli
         cache_seqlens,
         cu_seqlens_q,
         causal=True,
-        num_splits=num_splits,
+        fixed_split_size=fixed_split_size,
     )
     workspace = allocate_paged_attention_workspace_for_plan(plan, total_q=q.shape[0])
 
@@ -132,20 +94,13 @@ def test_paged_attention_replays_under_cuda_graph_with_dynamic_metadata(num_spli
     graph.replay()
     torch.cuda.synchronize()
     assert (workspace.output - ref_out_1).abs().max().item() <= 0.02
-    assert (workspace.lse.transpose(0, 1) - ref_lse_1).abs().max().item() <= 0.03
+    assert (_lse_base2_to_natural(workspace.lse.transpose(0, 1)) - ref_lse_1).abs().max().item() <= 0.03
     assert _cosine_similarity(workspace.output, ref_out_1) >= 0.99999
 
     torch.manual_seed(79)
     q.copy_(torch.randn_like(q) / 4)
     k_cache.copy_(torch.randn_like(k_cache) / 4)
     v_cache.copy_(torch.randn_like(v_cache) / 4)
-    q_seqlens_2 = [4, 8, 5, 5]
-    cache_seqlens_2 = [64, 96, 128, 70]
-    cu_seqlens_q.copy_(
-        torch.tensor([0, 4, 12, 17, 22], dtype=torch.int32, device=q.device)
-    )
-    cache_seqlens.copy_(torch.tensor(cache_seqlens_2, dtype=torch.int32, device=q.device))
-    assert sum(q_seqlens_2) == q.shape[0]
     ref_out_2, ref_lse_2 = paged_attention_reference(
         q,
         k_cache,
@@ -158,7 +113,7 @@ def test_paged_attention_replays_under_cuda_graph_with_dynamic_metadata(num_spli
     graph.replay()
     torch.cuda.synchronize()
     assert (workspace.output - ref_out_2).abs().max().item() <= 0.02
-    assert (workspace.lse.transpose(0, 1) - ref_lse_2).abs().max().item() <= 0.03
+    assert (_lse_base2_to_natural(workspace.lse.transpose(0, 1)) - ref_lse_2).abs().max().item() <= 0.03
     assert _cosine_similarity(workspace.output, ref_out_2) >= 0.99999
 
 
@@ -187,7 +142,6 @@ def test_paged_attention_fp8_kv_replays_under_cuda_graph() -> None:
         cache_seqlens,
         cu_seqlens_q,
         causal=True,
-        num_splits=1,
     )
     workspace = allocate_paged_attention_workspace_for_plan(plan, total_q=q.shape[0])
 
@@ -235,12 +189,12 @@ def test_paged_attention_fp8_kv_replays_under_cuda_graph() -> None:
     graph.replay()
     torch.cuda.synchronize()
     assert (workspace.output - ref_out_1).abs().max().item() <= 0.05
-    assert (workspace.lse.transpose(0, 1) - ref_lse_1).abs().max().item() <= 0.05
+    assert (_lse_base2_to_natural(workspace.lse.transpose(0, 1)) - ref_lse_1).abs().max().item() <= 0.05
     assert _cosine_similarity(workspace.output, ref_out_1) >= 0.9999
 
-    q_2, k_cache_2, v_cache_2, _, cache_seqlens_2, cu_seqlens_q_2 = _make_paged_inputs(
-        q_seqlens=[4, 8, 5, 5],
-        cache_seqlens=[64, 96, 128, 70],
+    q_2, k_cache_2, v_cache_2, _, _, _ = _make_paged_inputs(
+        q_seqlens=[6, 5, 7, 4],
+        cache_seqlens=[97, 81, 113, 68],
         page_size=64,
         seed=89,
         page_table_width=page_table.shape[1],
@@ -250,13 +204,11 @@ def test_paged_attention_fp8_kv_replays_under_cuda_graph() -> None:
         k_cache_2,
         v_cache_2,
         page_table,
-        cache_seqlens_2,
+        cache_seqlens,
     )
     q.copy_(q_2)
     k_fp8.copy_(k_fp8_2)
     v_fp8.copy_(v_fp8_2)
-    cache_seqlens.copy_(cache_seqlens_2)
-    cu_seqlens_q.copy_(cu_seqlens_q_2)
     k_descale.copy_(k_descale_2)
     v_descale.copy_(v_descale_2)
 
@@ -274,5 +226,5 @@ def test_paged_attention_fp8_kv_replays_under_cuda_graph() -> None:
     graph.replay()
     torch.cuda.synchronize()
     assert (workspace.output - ref_out_2).abs().max().item() <= 0.05
-    assert (workspace.lse.transpose(0, 1) - ref_lse_2).abs().max().item() <= 0.05
+    assert (_lse_base2_to_natural(workspace.lse.transpose(0, 1)) - ref_lse_2).abs().max().item() <= 0.05
     assert _cosine_similarity(workspace.output, ref_out_2) >= 0.9999

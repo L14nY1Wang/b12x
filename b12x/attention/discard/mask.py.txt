@@ -43,9 +43,13 @@ class AttentionMask:
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
     ) -> None:
-        del batch_idx, head_idx, mask_seqlen, mask_mod, aux_tensors, fastdiv_mods
+        del batch_idx, head_idx, mask_mod, aux_tensors, fastdiv_mods
+        if const_expr(not mask_seqlen and not mask_causal and not mask_local):
+            return
         acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S, transpose=self.swap_AB)
-        acc_shape = (self.tile_m, self.tile_n) if const_expr(not self.swap_AB) else (self.tile_n, self.tile_m)
+        acc_shape = (
+            (self.tile_m, self.tile_n) if const_expr(not self.swap_AB) else (self.tile_n, self.tile_m)
+        )
         cS = cute.make_identity_tensor(acc_shape)
         tScS_mn = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(cS), transpose=self.swap_AB)
         t0ScS_mn = layout_utils.reshape_acc_to_mn(
@@ -66,7 +70,9 @@ class AttentionMask:
             )
             for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
                 col_idx = t0ScS_mn[0, c][col_dim] + thr_col_offset + n_block * self.tile_n
-                masked = q_row_idx >= self.seqlen_q or col_idx >= self.seqlen_k
+                masked = False
+                if const_expr(mask_seqlen):
+                    masked = q_row_idx >= self.seqlen_q or col_idx >= self.seqlen_k
                 if const_expr(mask_causal):
                     masked = masked or col_idx >= q_row_idx + 1 + self.seqlen_k - self.seqlen_q
                 if const_expr(mask_local):
@@ -77,3 +83,17 @@ class AttentionMask:
                         masked = masked or col_idx >= anchor + self.window_size_right + 1
                 if masked:
                     acc_S_mn[r, c] = -Float32.inf
+
+    @cute.jit
+    def apply_no_mask(
+        self,
+        acc_S: cute.Tensor,
+        batch_idx: cutlass.Int32,
+        head_idx: cutlass.Int32,
+        m_block: cutlass.Int32,
+        n_block: cutlass.Int32,
+        thr_mma: cute.TiledMma,
+        aux_tensors: Optional[list] = None,
+        fastdiv_mods=(None, None),
+    ) -> None:
+        del acc_S, batch_idx, head_idx, m_block, n_block, thr_mma, aux_tensors, fastdiv_mods
