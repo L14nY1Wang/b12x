@@ -92,6 +92,33 @@ def test_request_finish_multiple_stop_tokens():
     assert req.finished_reason == "stop"
 
 
+def test_request_finish_multi_token_stop_sequence_strips_output():
+    req = Request(
+        rid=0, prompt_ids=[1],
+        sampling_params=SamplingParams(max_new_tokens=100, stop_sequences=[[10, 20, 30]]),
+    )
+    req.output_ids = [10, 20]
+    req.check_finished()
+    assert not req.is_finished
+
+    req.output_ids.append(30)
+    req.check_finished()
+    assert req.is_finished
+    assert req.finished_reason == "stop"
+    assert req.output_ids == []
+
+
+def test_request_stop_sequence_requires_full_suffix_match():
+    req = Request(
+        rid=0, prompt_ids=[1],
+        sampling_params=SamplingParams(max_new_tokens=100, stop_sequences=[[20, 30]]),
+    )
+    req.output_ids = [30]
+    req.check_finished()
+    assert not req.is_finished
+    assert req.output_ids == [30]
+
+
 def test_request_not_finished_without_stop():
     req = Request(
         rid=0, prompt_ids=[1],
@@ -834,8 +861,8 @@ def test_request_cancel():
     assert req.finished_reason == "cancelled"
 
 
-def test_preemption_resets_events():
-    """Preempted request has clean state for re-prefill."""
+def test_running_request_keeps_events_and_output_when_not_preempted():
+    """Visible output is preserved when admission applies backpressure."""
     sched = _make_scheduler(num_pages=2, max_running=4)
 
     req1 = Request(
@@ -851,7 +878,7 @@ def test_preemption_resets_events():
     assert req1.output_ids == [42]
     assert req1._token_event.is_set()
 
-    # Now submit a request that needs all pages — triggers preemption.
+    # Now submit a request that needs all pages.
     req2 = Request(
         rid=2,
         prompt_ids=list(range(100, 164)),
@@ -863,21 +890,17 @@ def test_preemption_resets_events():
     batch = sched.step()
     if batch.mode == "decode":
         sched.process_decode_output([100])
-    # Then admit req2 — preempts req1.
+    # Then try to admit req2.
     batch = sched.step()
-    while batch.mode != "prefill" or batch.requests[0].rid != 2:
-        if batch.mode == "decode":
-            sched.process_decode_output([100] * len(batch.requests))
-        batch = sched.step()
+    assert batch.mode == "decode"
 
-    # req1 was preempted, cleared, and immediately re-admitted from its
-    # cached checkpoint.
-    assert req1.output_ids == []
-    assert req1.checkpoint_len == 64
+    assert req1.output_ids == [42, 100]
+    assert req1.checkpoint_len == 0
     assert req1.prefill_progress == 64
-    assert req1.cache_len == 64
-    assert not req1._token_event.is_set()
+    assert req1.cache_len == 66
+    assert req1._token_event.is_set()
     assert req1.finished_reason is None
+    assert req2 in sched.waiting
 
 
 def test_mixed_workload_simulation():

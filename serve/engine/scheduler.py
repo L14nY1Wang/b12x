@@ -96,6 +96,8 @@ class BatchScheduler:
 
         Interleaving: after a prefill step, prefer decode if possible.
         """
+        self._prune_finished_requests()
+
         # Interleave: if last step was prefill, do decode first if possible.
         if self._last_was_prefill and self.running:
             self._last_was_prefill = False
@@ -351,14 +353,15 @@ class BatchScheduler:
         still_running = []
         for req in self.running:
             if req.is_finished:
-                self._finish_request(req)
+                self._finish_request(
+                    req,
+                    cache_terminal=req.finished_reason in {"length", "stop"},
+                )
                 finished.append(req)
             else:
                 still_running.append(req)
         self.running = still_running
-        self.finished.extend(finished)
-        if len(self.finished) > 1000:
-            self.finished = self.finished[-100:]
+        self._record_finished(finished)
         return finished
 
     def process_decode_output(self, next_token_ids: list[int]) -> list[Request]:
@@ -375,20 +378,24 @@ class BatchScheduler:
         still_running = []
         for req in self.running:
             if req.is_finished:
-                self._finish_request(req)
+                self._finish_request(
+                    req,
+                    cache_terminal=req.finished_reason in {"length", "stop"},
+                )
                 finished.append(req)
             else:
                 still_running.append(req)
         self.running = still_running
-        self.finished.extend(finished)
+        self._record_finished(finished)
 
         return finished
 
-    def _finish_request(self, req: Request) -> None:
+    def _finish_request(self, req: Request, *, cache_terminal: bool = True) -> None:
         """Clean up a finished request and release uncached request-local state."""
         self.stats_total_finished += 1
         pinned_checkpoint = req.checkpoint
-        self._materialize_terminal_checkpoint(req)
+        if cache_terminal:
+            self._materialize_terminal_checkpoint(req)
         self._unpin_checkpoint(pinned_checkpoint)
         uncached_pages = req.page_ids[req.checkpoint_len // _PAGE_SIZE:]
         if uncached_pages:
@@ -419,12 +426,62 @@ class BatchScheduler:
 
         return pt.to(self.device, non_blocking=True), cs.to(self.device, non_blocking=True)
 
-    def _preempt_oldest(self) -> None:
-        """Preempt the oldest running request to free pages."""
-        self.stats_preemptions += 1
-        if not self.running:
+    def _prune_finished_requests(self) -> None:
+        """Remove cancelled/timed-out requests before spending more GPU work on them."""
+        self.waiting = self._collect_finished_requests(self.waiting)
+        self.prefilling = self._collect_finished_requests(self.prefilling)
+        self.running = self._collect_finished_requests(self.running)
+
+    def _collect_finished_requests(self, reqs) -> list[Request] | deque[Request]:
+        kept = []
+        finished = []
+        for req in reqs:
+            req.check_finished()
+            if req.is_finished:
+                self._finish_request(req, cache_terminal=False)
+                finished.append(req)
+            else:
+                kept.append(req)
+        self._record_finished(finished)
+        if isinstance(reqs, deque):
+            return deque(kept)
+        return kept
+
+    def _record_finished(self, reqs: list[Request]) -> None:
+        if not reqs:
             return
-        victim = self.running.pop(0)
+        self.finished.extend(reqs)
+        if len(self.finished) > 1000:
+            self.finished = self.finished[-100:]
+
+    def fail_all(self, reason: str) -> None:
+        """Fail and release all in-flight requests."""
+        finished = []
+        for req in list(self.waiting) + self.prefilling + self.running:
+            if not req.is_finished:
+                req._mark_finished(reason)
+            self._finish_request(req, cache_terminal=False)
+            finished.append(req)
+
+        self.waiting = deque()
+        self.prefilling = []
+        self.running = []
+        self._record_finished(finished)
+
+    def _preempt_oldest(self) -> bool:
+        """Preempt the oldest safe-to-rewind running request to free pages."""
+        if not self.running:
+            return False
+
+        victim_idx = next(
+            (i for i, req in enumerate(self.running) if not req.output_ids),
+            None,
+        )
+        if victim_idx is None:
+            return False
+
+        self.stats_preemptions += 1
+        victim = self.running.pop(victim_idx)
 
         pinned_checkpoint = victim.checkpoint
         self._materialize_terminal_checkpoint(victim)
@@ -449,6 +506,7 @@ class BatchScheduler:
         victim._token_event.clear()
 
         self.waiting.append(victim)
+        return True
 
     def _pages_needed(self, req: Request) -> int:
         """Pages needed for this request's non-cached tokens."""

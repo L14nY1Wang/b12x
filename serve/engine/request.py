@@ -83,6 +83,15 @@ class Request:
             self._mark_finished("length")
             return
 
+        if self.output_ids and self.sampling_params.stop_sequences:
+            for stop_seq in self.sampling_params.stop_sequences:
+                if not stop_seq or len(self.output_ids) < len(stop_seq):
+                    continue
+                if self.output_ids[-len(stop_seq):] == stop_seq:
+                    del self.output_ids[-len(stop_seq):]
+                    self._mark_finished("stop")
+                    return
+
         if self.output_ids and self.sampling_params.stop_token_ids:
             if self.output_ids[-1] in self.sampling_params.stop_token_ids:
                 self._mark_finished("stop")

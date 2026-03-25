@@ -40,6 +40,20 @@ class GenerationResult:
     total_time_ms: float = 0.0
 
 
+def _should_enable_prefix_cache(
+    *,
+    is_hybrid: bool,
+    world_size: int,
+    has_state_snapshot_slots: bool,
+) -> bool:
+    """Decide whether prefix-cache reuse is safe for the current engine mode."""
+    if not is_hybrid:
+        return True
+    if world_size > 1:
+        return False
+    return has_state_snapshot_slots
+
+
 class ServingEngine:
     """Unified serving engine for all ranks."""
 
@@ -64,6 +78,7 @@ class ServingEngine:
         self._lock = threading.Lock()  # Guards scheduler + _next_rid.
         self._loop_running = False
         self._work_event = threading.Event()  # Wakes the server loop on submit.
+        self._loop_error: str | None = None
 
         if self.rank == 0:
             print(f"Loading model (TP={self.world_size})...")
@@ -236,13 +251,16 @@ class ServingEngine:
                 self.pool.v_cache[i].zero_()
 
         # Scheduler.
-        hybrid_prefix_cache = (
-            (not is_hybrid)
-            or (
+        hybrid_prefix_cache = _should_enable_prefix_cache(
+            is_hybrid=is_hybrid,
+            world_size=self.world_size,
+            has_state_snapshot_slots=(
                 linear_state_arena is not None
                 and linear_state_arena.num_snapshot_slots > 0
-            )
+            ),
         )
+        if self.rank == 0 and is_hybrid and self.world_size > 1:
+            print("Hybrid prefix cache disabled under TP until SSM snapshots are mirrored across ranks.")
 
         self.scheduler = BatchScheduler(
             cache=self.cache,
@@ -278,6 +296,7 @@ class ServingEngine:
         if params is None:
             params = SamplingParams()
         self._ensure_stop_ids(params)
+        self._raise_if_loop_unhealthy()
 
         req = Request(
             rid=self._next_rid,
@@ -397,6 +416,7 @@ class ServingEngine:
         """
         if hasattr(self, '_loop_thread') and self._loop_thread.is_alive():
             return
+        self._loop_error = None
         self._loop_running = True
         self._loop_thread = threading.Thread(target=self._server_loop, daemon=True)
         self._loop_thread.start()
@@ -407,19 +427,31 @@ class ServingEngine:
             self._loop_thread.join(timeout=5.0)
 
     def _has_server_loop(self) -> bool:
-        return self._loop_running
+        return (
+            self._loop_running
+            and hasattr(self, '_loop_thread')
+            and self._loop_thread.is_alive()
+        )
 
     def _server_loop(self) -> None:
         """Background loop: step while there's work, wait for signal otherwise."""
         torch.set_grad_enabled(False)
-        while self._loop_running:
+        try:
+            while self._loop_running:
+                with self._lock:
+                    has_work = self.scheduler.has_work
+                if has_work:
+                    self._step()
+                else:
+                    self._work_event.wait(timeout=0.1)
+                    self._work_event.clear()
+        except Exception as exc:
+            self._loop_error = f"{type(exc).__name__}: {exc}"
             with self._lock:
-                has_work = self.scheduler.has_work
-            if has_work:
-                self._step()
-            else:
-                self._work_event.wait(timeout=0.1)
-                self._work_event.clear()
+                self.scheduler.fail_all("engine_error")
+        finally:
+            self._loop_running = False
+            self._work_event.set()
 
     # -- core step ---------------------------------------------------------
 
@@ -513,6 +545,20 @@ class ServingEngine:
             ids.update(extra)
         params.stop_token_ids = list(ids)
 
+    def _raise_if_loop_unhealthy(self) -> None:
+        if self._loop_error is not None:
+            raise RuntimeError(f"server loop unhealthy: {self._loop_error}")
+
+    def server_loop_health(self) -> dict:
+        loop_alive = hasattr(self, '_loop_thread') and self._loop_thread.is_alive()
+        healthy = self._loop_error is None
+        return {
+            "running": self._loop_running,
+            "alive": loop_alive,
+            "healthy": healthy,
+            "last_error": self._loop_error,
+        }
+
     def _to_result(self, req: Request) -> GenerationResult:
         return GenerationResult(
             request_id=req.rid,
@@ -543,6 +589,7 @@ class ServingEngine:
             )
 
     def shutdown(self) -> None:
+        self.stop_server_loop()
         if self.rank == 0 and self.world_size > 1:
             # Send shutdown signal.
             header = torch.tensor([255, 0, 0, 0], dtype=torch.long, device=self.device)

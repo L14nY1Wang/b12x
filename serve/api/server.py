@@ -94,11 +94,13 @@ class ServingApp:
 
     async def _health(self):
         import serve
+        loop_health = self.engine.server_loop_health()
         return {
-            "status": "ok",
+            "status": "ok" if loop_health["healthy"] else "error",
             "version": serve.__version__,
             "model": self.model_name,
             "scheduler": self.engine.scheduler.stats,
+            "server_loop": loop_health,
         }
 
     async def _models(self):
@@ -237,20 +239,20 @@ class ServingApp:
     # -- helpers -----------------------------------------------------------
 
     def _to_sampling_params(self, req) -> SamplingParams:
-        stop_ids = None
+        stop_sequences = None
         if req.stop:
-            stop_ids = []
+            stop_sequences = []
             for s in req.stop:
                 ids = self.engine.tokenizer.encode(s, add_special_tokens=False)
                 if ids:
-                    stop_ids.append(ids[-1])
+                    stop_sequences.append(ids)
         return SamplingParams(
             temperature=req.temperature,
             top_p=req.top_p,
             top_k=req.top_k,
             repetition_penalty=req.repetition_penalty,
             max_new_tokens=req.max_tokens,
-            stop_token_ids=stop_ids,
+            stop_sequences=stop_sequences,
         )
 
     def _completion_response(self, text, result, obj_type):

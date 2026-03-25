@@ -53,6 +53,12 @@ def _make_mock_engine():
     )
     engine.tokenizer.decode.return_value = "hello world"
     engine._ensure_stop_ids = MagicMock()
+    engine.server_loop_health.return_value = {
+        "running": True,
+        "alive": True,
+        "healthy": True,
+        "last_error": None,
+    }
 
     return engine
 
@@ -61,7 +67,9 @@ def _make_mock_engine():
 def client():
     engine = _make_mock_engine()
     app = ServingApp(engine)
-    return TestClient(app.app)
+    test_client = TestClient(app.app)
+    test_client.engine = engine
+    return test_client
 
 
 def test_health(client):
@@ -71,6 +79,7 @@ def test_health(client):
     assert data["status"] == "ok"
     assert data["model"] == "test-model"
     assert "scheduler" in data
+    assert data["server_loop"]["healthy"] is True
     assert data["scheduler"]["finished"] == 5
 
 
@@ -159,15 +168,22 @@ def test_error_handling():
 
 
 def test_stop_strings_converted_to_ids(client):
-    """Stop strings are converted to token IDs via tokenizer."""
-    # The mock tokenizer.encode returns mock by default.
-    # Verify the request is accepted with stop strings.
+    """Stop strings are converted to full token sequences."""
+    client.engine.tokenizer.encode.side_effect = lambda text, add_special_tokens=False: {
+        "\n": [13],
+        "END": [42, 43, 44],
+    }[text]
+
     resp = client.post("/v1/completions", json={
         "prompt": "Hello",
         "max_tokens": 10,
         "stop": ["\n", "END"],
     })
     assert resp.status_code == 200
+    submit_args = client.engine.submit.call_args
+    params = submit_args.args[1]
+    assert params.stop_sequences == [[13], [42, 43, 44]]
+    assert params.stop_token_ids is None
     data = resp.json()
     assert "choices" in data
 
@@ -186,6 +202,23 @@ def test_health_shows_scheduler_stats(client):
     assert "preemptions" in sched
     assert "cache_pages" in sched
     assert "free_pages" in sched
+
+
+def test_health_reports_unhealthy_loop():
+    engine = _make_mock_engine()
+    engine.server_loop_health.return_value = {
+        "running": False,
+        "alive": False,
+        "healthy": False,
+        "last_error": "RuntimeError: boom",
+    }
+    app = ServingApp(engine)
+    client = TestClient(app.app)
+
+    resp = client.get("/health")
+    data = resp.json()
+    assert data["status"] == "error"
+    assert data["server_loop"]["last_error"] == "RuntimeError: boom"
 
 
 def test_models_response_format(client):

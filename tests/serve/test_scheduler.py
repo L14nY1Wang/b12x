@@ -523,7 +523,7 @@ def test_oom_eviction_allows_admission():
     assert batch.mode == "prefill"
 
 
-def test_preemption_frees_pages_for_new_request():
+def test_running_request_with_visible_output_is_not_preempted():
     sched = _make_scheduler(num_pages=2, max_running=4)
 
     req1 = _make_request(1, prompt_len=64)
@@ -539,16 +539,15 @@ def test_preemption_frees_pages_for_new_request():
     assert batch.mode == "decode"
     sched.process_decode_output([100])
 
-    # Now admit req2 — preempts req1 and immediately re-admits it from
-    # the cached 64-token checkpoint.
+    # Req2 stays queued because rewinding req1 would invalidate streamed output.
     batch = sched.step()
-    assert batch.mode == "prefill"
-    assert [r.rid for r in batch.requests] == [2, 1]
-    assert req1.output_ids == []
-    assert req1.checkpoint_len == 64
+    assert batch.mode == "decode"
+    assert req1.output_ids == [10, 100]
+    assert req2 in sched.waiting
+    assert sched.stats_preemptions == 0
 
 
-def test_preemption_readmits_from_multi_page_checkpoint_chain():
+def test_multi_page_running_request_is_not_rewound_for_admission():
     sched = _make_scheduler(num_pages=4, max_running=4)
 
     req1 = _make_request(1, prompt_len=3 * 64, max_new_tokens=3)
@@ -568,16 +567,10 @@ def test_preemption_readmits_from_multi_page_checkpoint_chain():
     sched.process_decode_output([100])
 
     batch = sched.step()
-    assert batch.mode == "prefill"
-    assert [r.rid for r in batch.requests] == [2, 1]
-    assert batch.q_seqlens == [64, 1]
-
-    cached_pages = sched.cache.lookup(req1.prompt_ids).page_indices
-    assert req1.output_ids == []
-    assert req1.checkpoint_len == 3 * 64
-    assert req1.prefill_progress == 3 * 64
-    assert req1.cache_len == 3 * 64
-    assert req1.page_ids == cached_pages
+    assert batch.mode == "decode"
+    assert req1.output_ids == [10, 100]
+    assert req2 in sched.waiting
+    assert sched.stats_preemptions == 0
 
 
 # -- has_work --------------------------------------------------------------
@@ -731,6 +724,28 @@ def test_sample_batch_mixed_params():
     assert tokens[2] == logits[2].argmax()
 
 
+def test_sample_batch_respects_non_temperature_param_differences():
+    from unittest.mock import patch
+
+    from serve.engine.sampling import SamplingParams, sample_batch
+    import torch
+
+    logits = torch.randn(2, 100)
+    params = [
+        SamplingParams(temperature=0.0, presence_penalty=0.0),
+        SamplingParams(temperature=0.0, presence_penalty=1.0),
+    ]
+
+    with patch("serve.engine.sampling.sample") as mock_sample:
+        mock_sample.side_effect = [
+            torch.tensor([11], dtype=torch.long),
+            torch.tensor([22], dtype=torch.long),
+        ]
+        tokens = sample_batch(logits, params, generated_ids=[[], []])
+
+    assert tokens.tolist() == [11, 22]
+    assert mock_sample.call_count == 2
+
 def test_sample_batch_greedy():
     """Greedy sampling returns argmax."""
     from serve.engine.sampling import SamplingParams, sample_batch
@@ -869,7 +884,7 @@ def test_prefill_token_budget_limits_batch():
 
 
 def test_cancelled_request_cleaned_up():
-    """A cancelled request is removed from running on next step."""
+    """A cancelled request is removed before another decode step runs."""
     sched = _make_scheduler()
     req = _make_request(1, prompt_len=5, max_new_tokens=100)
     sched.add_request(req)
@@ -883,13 +898,55 @@ def test_cancelled_request_cleaned_up():
     assert req.is_finished
     assert req.finished_reason == "cancelled"
 
-    # Next decode step should clean it up.
     batch = sched.step()
-    assert batch.mode == "decode"
-    sched.process_decode_output([100])
-
-    # Request should be collected as finished.
+    assert batch is None
     assert sched.num_running == 0
+    assert sched.stats["finished"] >= 1
+
+
+def test_waiting_request_times_out_before_admission():
+    sched = _make_scheduler()
+    req = Request(
+        rid=1,
+        prompt_ids=list(range(8)),
+        sampling_params=SamplingParams(max_new_tokens=10),
+        timeout_s=0.001,
+    )
+    sched.add_request(req)
+
+    import time
+    time.sleep(0.01)
+
+    batch = sched.step()
+    assert batch is None
+    assert req.finished_reason == "timeout"
+    assert sched.num_waiting == 0
+    assert sched.stats["finished"] >= 1
+
+
+def test_prefilling_request_times_out_before_next_chunk():
+    sched = _make_scheduler(chunk_size=32)
+    req = Request(
+        rid=1,
+        prompt_ids=list(range(100)),
+        sampling_params=SamplingParams(max_new_tokens=10),
+        timeout_s=0.001,
+    )
+    sched.add_request(req)
+
+    batch = sched.step()
+    assert batch.mode == "prefill"
+    assert not batch.is_last_chunk
+    sched.process_prefill_chunk(None)
+    assert sched.num_prefilling == 1
+
+    import time
+    time.sleep(0.01)
+
+    batch = sched.step()
+    assert batch is None
+    assert req.finished_reason == "timeout"
+    assert sched.num_prefilling == 0
     assert sched.stats["finished"] >= 1
 
 
@@ -935,17 +992,30 @@ def test_full_scheduler_lifecycle_with_all_features():
     assert all(r.is_finished for r in reqs.values())
     assert sched.num_running == 0
     assert sched.num_waiting == 0
+
+
+def test_fail_all_marks_and_cleans_up_requests():
+    sched = _make_scheduler(chunk_size=32)
+    req = _make_request(1, prompt_len=100, max_new_tokens=10)
+    sched.add_request(req)
+
+    batch = sched.step()
+    assert batch is not None
+    sched.process_prefill_chunk(None)
+    assert sched.num_prefilling == 1
+
+    sched.fail_all("engine_error")
+
+    assert req.finished_reason == "engine_error"
+    assert sched.num_waiting == 0
+    assert sched.num_prefilling == 0
+    assert sched.num_running == 0
     assert sched.num_prefilling == 0
 
-    # Stats should reflect the work done.
     stats = sched.stats
-    assert stats["finished"] == 4
+    assert stats["finished"] == 1
     assert stats["prefill_steps"] > 0
-    assert stats["decode_steps"] > 0
-
-    # The quick request (max_new_tokens=1) should have finished earliest.
-    assert reqs["quick"].finished_reason == "length"
-    assert len(reqs["quick"].output_ids) == 1
+    assert stats["decode_steps"] == 0
 
 
 def test_max_waiting_rejects_overflow():

@@ -21,6 +21,7 @@ class SamplingParams:
     frequency_penalty: float = 0.0   # Additive penalty proportional to frequency.
     max_new_tokens: int = 256
     stop_token_ids: list[int] | None = None
+    stop_sequences: list[list[int]] | None = None
 
     @staticmethod
     def greedy(max_new_tokens: int = 256, **kwargs) -> SamplingParams:
@@ -113,9 +114,7 @@ def sample_batch(
 
     # Check if all params are identical (common case: same API call).
     p0 = params_list[0]
-    if all(p.temperature == p0.temperature and p.top_p == p0.top_p
-           and p.top_k == p0.top_k and p.repetition_penalty == p0.repetition_penalty
-           for p in params_list[1:]):
+    if all(p == p0 for p in params_list[1:]):
         return sample(logits, p0, generated_ids)
 
     # Per-request sampling.
