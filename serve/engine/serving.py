@@ -73,6 +73,7 @@ class ServingEngine:
         model_path: str,
         device: str = "cuda",
         tp_group: Optional[TPGroup] = None,
+        load_backend: str = "auto",
         kv_dtype: torch.dtype = torch.bfloat16,
         warmup_prefill_lengths: list[int] | None = None,
         graph_batch_sizes: list[int] | None = None,
@@ -95,7 +96,12 @@ class ServingEngine:
         if self.rank == 0:
             print(f"Loading model (TP={self.world_size})...")
 
-        self.model = load_model(model_path, device=device, tp_group=tp_group)
+        self.model = load_model(
+            model_path,
+            device=device,
+            tp_group=tp_group,
+            load_backend=load_backend,
+        )
         self.cfg = self.model.config
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=False)
         if not self.tokenizer.chat_template:

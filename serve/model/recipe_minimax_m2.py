@@ -19,7 +19,7 @@ from serve.model.attention import B12xPagedAttention
 from serve.model.ffn import MoEFFN
 from serve.model.layer import TransformerLayer
 from serve.model.ops import make_norm
-from serve.tp.group import tp_shard_dim0, tp_shard_dim1, TPGroup
+from serve.tp.group import TPGroup
 
 
 @dataclass(frozen=True)
@@ -95,9 +95,9 @@ def extract_layer(
     )
 
     # -- MoE FFN -----------------------------------------------------------
-    gate_weight = loader.get(f"{prefix}.block_sparse_moe.gate.weight")
+    gate_weight = loader.tensor(f"{prefix}.block_sparse_moe.gate.weight")
     gate_bias_key = f"{prefix}.block_sparse_moe.e_score_correction_bias"
-    gate_bias = loader.get(gate_bias_key) if gate_bias_key in loader.keys() else None
+    gate_bias = loader.optional(gate_bias_key)
     experts = _pack_experts(loader, prefix, cfg, rank, world_size, device)
 
     ffn = MoEFFN(
@@ -107,8 +107,8 @@ def extract_layer(
     )
 
     # -- norms -------------------------------------------------------------
-    input_ln = loader.get(f"{prefix}.input_layernorm.weight")
-    post_attn_ln = loader.get(f"{prefix}.post_attention_layernorm.weight")
+    input_ln = loader.tensor(f"{prefix}.input_layernorm.weight")
+    post_attn_ln = loader.tensor(f"{prefix}.post_attention_layernorm.weight")
 
     return TransformerLayer(
         attn=attention, ffn=ffn,
@@ -132,13 +132,7 @@ def _pack_experts(
     """
     E = cfg.num_experts
     K = cfg.hidden_size
-    I_full = cfg.intermediate_size * world_size
     I_tp = cfg.intermediate_size
-
-    tp_off = rank * I_tp
-    tp_off_packed = rank * (I_tp // 2)
-    tp_sf_cols = I_tp // 16
-    tp_sf_off = rank * tp_sf_cols
 
     gate_w = torch.empty(E, I_tp, K // 2, dtype=torch.uint8, device=device)
     up_w = torch.empty(E, I_tp, K // 2, dtype=torch.uint8, device=device)
@@ -156,20 +150,20 @@ def _pack_experts(
     ep = f"{prefix}.block_sparse_moe.experts"
     for eid in range(E):
         # w1 = gate_proj, w3 = up_proj, w2 = down_proj.
-        gate_w[eid] = loader.get(f"{ep}.{eid}.w1.weight").narrow(0, tp_off, I_tp)
-        gate_sf[eid] = loader.get(f"{ep}.{eid}.w1.weight_scale").narrow(0, tp_off, I_tp)
-        gate_gs[eid] = loader.get(f"{ep}.{eid}.w1.weight_scale_2")
+        loader.load_into_dim0_shard(gate_w[eid], f"{ep}.{eid}.w1.weight", unit=I_tp, pad=False)
+        loader.load_into_dim0_shard(gate_sf[eid], f"{ep}.{eid}.w1.weight_scale", unit=I_tp, pad=False)
+        gate_gs[eid] = loader.scalar(f"{ep}.{eid}.w1.weight_scale_2")
         gate_is_key = f"{ep}.{eid}.w1.input_scale"
-        gate_is[eid] = loader.get(gate_is_key) if gate_is_key in loader.keys() else 1.0
+        gate_is[eid] = loader.scalar(gate_is_key, default=1.0)
 
-        up_w[eid] = loader.get(f"{ep}.{eid}.w3.weight").narrow(0, tp_off, I_tp)
-        up_sf[eid] = loader.get(f"{ep}.{eid}.w3.weight_scale").narrow(0, tp_off, I_tp)
+        loader.load_into_dim0_shard(up_w[eid], f"{ep}.{eid}.w3.weight", unit=I_tp, pad=False)
+        loader.load_into_dim0_shard(up_sf[eid], f"{ep}.{eid}.w3.weight_scale", unit=I_tp, pad=False)
 
-        down_w[eid] = loader.get(f"{ep}.{eid}.w2.weight").narrow(1, tp_off_packed, I_tp // 2)
-        down_sf[eid] = loader.get(f"{ep}.{eid}.w2.weight_scale").narrow(1, tp_sf_off, tp_sf_cols)
-        down_gs[eid] = loader.get(f"{ep}.{eid}.w2.weight_scale_2")
+        loader.load_into_dim1_shard(down_w[eid], f"{ep}.{eid}.w2.weight", unit=I_tp // 2, pad=False)
+        loader.load_into_dim1_shard(down_sf[eid], f"{ep}.{eid}.w2.weight_scale", unit=I_tp // 16, pad=False)
+        down_gs[eid] = loader.scalar(f"{ep}.{eid}.w2.weight_scale_2")
         down_is_key = f"{ep}.{eid}.w2.input_scale"
-        down_is[eid] = loader.get(down_is_key) if down_is_key in loader.keys() else 1.0
+        down_is[eid] = loader.scalar(down_is_key, default=1.0)
 
     # Pack: up first, gate second (matching b12x convention).
     w13 = torch.cat([up_w, gate_w], dim=1).contiguous()
@@ -198,15 +192,11 @@ def _pack_experts(
 
 def _load_sharded_dim0(loader, key: str, rank: int, world_size: int) -> torch.Tensor:
     """Load a tensor and shard along dim 0."""
-    t = loader.get(key)
-    if world_size == 1:
-        return t
-    return tp_shard_dim0(t, rank, world_size)
+    del rank, world_size
+    return loader.dim0_shard(key)
 
 
 def _load_sharded_dim1(loader, key: str, rank: int, world_size: int) -> torch.Tensor:
     """Load a tensor and shard along dim 1."""
-    t = loader.get(key)
-    if world_size == 1:
-        return t
-    return tp_shard_dim1(t, rank, world_size)
+    del rank, world_size
+    return loader.dim1_shard(key)

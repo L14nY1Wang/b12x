@@ -118,20 +118,17 @@ def build_config(hf_config, tp_world_size: int = 1) -> Qwen35ModelConfig:
 
 def _load(loader, key):
     """Load a weight, returning None if not found."""
-    try:
-        return loader.get(key)
-    except KeyError:
-        return None
+    return loader.optional(key)
 
 
 def _load_sharded_dim0(loader, key, rank, world_size):
-    w = loader.get(key)
-    return tp_shard_dim0(w, rank, world_size)
+    del rank, world_size
+    return loader.dim0_shard(key)
 
 
 def _load_sharded_dim1(loader, key, rank, world_size):
-    w = loader.get(key)
-    return tp_shard_dim1(w, rank, world_size)
+    del rank, world_size
+    return loader.dim1_shard(key)
 
 
 def extract_attention_layer(
@@ -149,17 +146,29 @@ def extract_attention_layer(
     # Q is doubled for output gate: [Q_real || Q_gate] interleaved per head.
     hd = cfg.head_dim
     q_unit = 2 * hd * cfg.num_kv_heads
-    q_weight = tp_shard_dim0(loader.get(f"{prefix}.self_attn.q_proj.weight"), rank, world_size, unit=q_unit)
-    kv_rank = rank // cfg.kv_head_replicas
+    q_weight = loader.dim0_shard(f"{prefix}.self_attn.q_proj.weight", unit=q_unit)
     kv_shard = cfg.num_kv_heads * hd
-    k_weight = loader.get(f"{prefix}.self_attn.k_proj.weight").narrow(0, kv_rank * kv_shard, kv_shard).contiguous()
-    v_weight = loader.get(f"{prefix}.self_attn.v_proj.weight").narrow(0, kv_rank * kv_shard, kv_shard).contiguous()
+    kv_logical_world = world_size // cfg.kv_head_replicas
+    k_weight = loader.dim0_shard(
+        f"{prefix}.self_attn.k_proj.weight",
+        unit=kv_shard,
+        shard_world_size=kv_logical_world,
+        replica_group_size=cfg.kv_head_replicas,
+        pad=False,
+    )
+    v_weight = loader.dim0_shard(
+        f"{prefix}.self_attn.v_proj.weight",
+        unit=kv_shard,
+        shard_world_size=kv_logical_world,
+        replica_group_size=cfg.kv_head_replicas,
+        pad=False,
+    )
     qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0).contiguous()
 
     # o_proj maps from Q_real heads only (not doubled). Must match Q head count.
-    o_proj_weight = tp_shard_dim1(loader.get(f"{prefix}.self_attn.o_proj.weight"), rank, world_size, unit=hd*cfg.num_kv_heads)
-    q_norm_w = loader.get(f"{prefix}.self_attn.q_norm.weight")  # Per-head, not sharded.
-    k_norm_w = loader.get(f"{prefix}.self_attn.k_norm.weight")  # Per-head, not sharded.
+    o_proj_weight = loader.dim1_shard(f"{prefix}.self_attn.o_proj.weight", unit=hd * cfg.num_kv_heads)
+    q_norm_w = loader.tensor(f"{prefix}.self_attn.q_norm.weight")  # Per-head, not sharded.
+    k_norm_w = loader.tensor(f"{prefix}.self_attn.k_norm.weight")  # Per-head, not sharded.
 
     attention = B12xPagedAttention(
         num_q_heads=cfg.num_q_heads, num_kv_heads=cfg.num_kv_heads,
@@ -171,8 +180,8 @@ def extract_attention_layer(
     )
 
     ffn = _build_moe_ffn(loader, prefix, cfg, device, rank, world_size, tp_group)
-    input_ln = loader.get(f"{prefix}.input_layernorm.weight").to(device)
-    post_attn_ln = loader.get(f"{prefix}.post_attention_layernorm.weight").to(device)
+    input_ln = loader.tensor(f"{prefix}.input_layernorm.weight").to(device)
+    post_attn_ln = loader.tensor(f"{prefix}.post_attention_layernorm.weight").to(device)
     gemma = cfg.gemma_norm
 
     return TransformerLayer(
@@ -194,10 +203,10 @@ def extract_linear_layer(
     # GDN weights — shard heads across TP (pad-and-shard for uneven TP).
     # in_proj_qkv is [Q_heads || K_heads || V_heads, hidden]. Split using checkpoint
     # tensor shape (not config, which has padded per-rank counts).
-    full_qkv = loader.get(f"{prefix}.linear_attn.in_proj_qkv.weight")
-    full_z = loader.get(f"{prefix}.linear_attn.in_proj_z.weight")
-    v_total_full = full_z.shape[0]  # in_proj_z has [V_total, hidden].
-    k_total_full = (full_qkv.shape[0] - v_total_full) // 2  # QKV = [2*K_total + V_total, hidden].
+    full_qkv_shape = loader.shape(f"{prefix}.linear_attn.in_proj_qkv.weight")
+    full_z_shape = loader.shape(f"{prefix}.linear_attn.in_proj_z.weight")
+    v_total_full = full_z_shape[0]  # in_proj_z has [V_total, hidden].
+    k_total_full = (full_qkv_shape[0] - v_total_full) // 2  # QKV = [2*K_total + V_total, hidden].
     kd = cfg.linear_head_k_dim
     vd = cfg.linear_head_v_dim
     # V heads must be sharded in groups that maintain the K:V head ratio.
@@ -206,24 +215,28 @@ def extract_linear_layer(
     v_per_k = full_num_v // full_num_k  # GQA ratio (e.g. 4).
     v_unit = vd * v_per_k  # Shard V in groups of v_per_k heads.
 
-    q_part, k_part, v_part = full_qkv.split([k_total_full, k_total_full, v_total_full], dim=0)
-    q_tp = tp_shard_dim0(q_part, rank, world_size, unit=kd)
-    k_tp = tp_shard_dim0(k_part, rank, world_size, unit=kd)
-    v_tp = tp_shard_dim0(v_part, rank, world_size, unit=v_unit)
+    qkv_key = f"{prefix}.linear_attn.in_proj_qkv.weight"
+    q_tp = loader.dim0_shard(qkv_key, start=0, length=k_total_full, unit=kd)
+    k_tp = loader.dim0_shard(qkv_key, start=k_total_full, length=k_total_full, unit=kd)
+    v_tp = loader.dim0_shard(qkv_key, start=2 * k_total_full, length=v_total_full, unit=v_unit)
     in_proj_qkv = torch.cat([q_tp, k_tp, v_tp], dim=0).contiguous()
-    in_proj_z = tp_shard_dim0(loader.get(f"{prefix}.linear_attn.in_proj_z.weight"), rank, world_size, unit=v_unit)
-    in_proj_a = tp_shard_dim0(loader.get(f"{prefix}.linear_attn.in_proj_a.weight"), rank, world_size, unit=v_per_k)
-    in_proj_b = tp_shard_dim0(loader.get(f"{prefix}.linear_attn.in_proj_b.weight"), rank, world_size, unit=v_per_k)
+    in_proj_z = loader.dim0_shard(f"{prefix}.linear_attn.in_proj_z.weight", unit=v_unit)
+    in_proj_a = loader.dim0_shard(f"{prefix}.linear_attn.in_proj_a.weight", unit=v_per_k)
+    in_proj_b = loader.dim0_shard(f"{prefix}.linear_attn.in_proj_b.weight", unit=v_per_k)
     # conv1d weight has same [Q || K || V] structure on dim 0.
-    full_conv = loader.get(f"{prefix}.linear_attn.conv1d.weight")
-    cq, ck, cv = full_conv.split([k_total_full, k_total_full, v_total_full], dim=0)
-    conv1d_w = torch.cat([tp_shard_dim0(cq, rank, world_size, unit=kd),
-                          tp_shard_dim0(ck, rank, world_size, unit=kd),
-                          tp_shard_dim0(cv, rank, world_size, unit=v_unit)], dim=0).contiguous()
-    out_proj = tp_shard_dim1(loader.get(f"{prefix}.linear_attn.out_proj.weight"), rank, world_size, unit=v_unit)
-    norm_w = loader.get(f"{prefix}.linear_attn.norm.weight")  # Per-head, not sharded.
-    A_log = tp_shard_dim0(loader.get(f"{prefix}.linear_attn.A_log"), rank, world_size, unit=v_per_k)
-    dt_bias = tp_shard_dim0(loader.get(f"{prefix}.linear_attn.dt_bias"), rank, world_size, unit=v_per_k)
+    conv_key = f"{prefix}.linear_attn.conv1d.weight"
+    conv1d_w = torch.cat(
+        [
+            loader.dim0_shard(conv_key, start=0, length=k_total_full, unit=kd),
+            loader.dim0_shard(conv_key, start=k_total_full, length=k_total_full, unit=kd),
+            loader.dim0_shard(conv_key, start=2 * k_total_full, length=v_total_full, unit=v_unit),
+        ],
+        dim=0,
+    ).contiguous()
+    out_proj = loader.dim1_shard(f"{prefix}.linear_attn.out_proj.weight", unit=v_unit)
+    norm_w = loader.tensor(f"{prefix}.linear_attn.norm.weight")  # Per-head, not sharded.
+    A_log = loader.dim0_shard(f"{prefix}.linear_attn.A_log", unit=v_per_k)
+    dt_bias = loader.dim0_shard(f"{prefix}.linear_attn.dt_bias", unit=v_per_k)
 
     linear_attn = GDNLinearAttention(
         num_k_heads=cfg.linear_num_k_heads,
@@ -246,9 +259,9 @@ def extract_linear_layer(
     )
 
     # MoE + norms (same for both layer types).
-    input_ln = loader.get(f"{prefix}.input_layernorm.weight").to(device)
+    input_ln = loader.tensor(f"{prefix}.input_layernorm.weight").to(device)
     ffn = _build_moe_ffn(loader, prefix, cfg, device, rank, world_size, tp_group)
-    post_attn_ln = loader.get(f"{prefix}.post_attention_layernorm.weight").to(device)
+    post_attn_ln = loader.tensor(f"{prefix}.post_attention_layernorm.weight").to(device)
     gemma = cfg.gemma_norm
 
     return TransformerLayer(
@@ -260,7 +273,7 @@ def extract_linear_layer(
 
 def _build_moe_ffn(loader, prefix, cfg, device, rank, world_size, tp_group):
     """Build the MoEFFN block shared by both attention and linear layers."""
-    gate_weight = loader.get(f"{prefix}.mlp.gate.weight").to(device)
+    gate_weight = loader.tensor(f"{prefix}.mlp.gate.weight").to(device)
     experts = _load_experts(loader, prefix, cfg, device, rank, world_size)
     shared_expert = _load_shared_expert(loader, prefix, device, rank, world_size)
     shared_gate = _load(loader, f"{prefix}.mlp.shared_expert_gate.weight")
@@ -284,23 +297,15 @@ def _load_experts(loader, prefix, cfg, device, rank=0, world_size=1):
 
     # Probe expert 0 for shapes.
     ep0 = f"{prefix}.mlp.experts.0"
-    gate_w0 = loader.get(f"{ep0}.gate_proj.weight")
-    down_w0 = loader.get(f"{ep0}.down_proj.weight")
-    gate_s0 = loader.get(f"{ep0}.gate_proj.weight_scale")
-    down_s0 = loader.get(f"{ep0}.down_proj.weight_scale")
+    gate_rows_tp, gate_cols = loader.dim0_shard_shape(f"{ep0}.gate_proj.weight", unit=8)
+    down_rows, down_cols_tp = loader.dim1_shard_shape(f"{ep0}.down_proj.weight", unit=8)
+    gate_s_rows_tp, gate_s_cols = loader.dim0_shard_shape(f"{ep0}.gate_proj.weight_scale", unit=8)
+    down_s_rows, down_s_cols_tp = loader.dim1_shard_shape(f"{ep0}.down_proj.weight_scale")
 
     # Compute per-rank shapes.
     # Shard gate and up SEPARATELY, then cat [up, gate] per rank.
     # This matches sglang's MergedColumnParallelLinear with load_up_proj_weight_first=True
     # where each rank's w13 = [up_shard, gate_shard].
-    gate_tp = tp_shard_dim0(gate_w0, 0, world_size, unit=8)
-    gate_rows_tp, gate_cols = gate_tp.shape
-    down_tp = tp_shard_dim1(down_w0, 0, world_size, unit=8)
-    down_rows, down_cols_tp = down_tp.shape
-    gate_s_tp = tp_shard_dim0(gate_s0, 0, world_size, unit=8)
-    gate_s_rows_tp, gate_s_cols = gate_s_tp.shape
-    down_s_tp = tp_shard_dim1(down_s0, 0, world_size)
-    down_s_rows, down_s_cols_tp = down_s_tp.shape
     w13_rows = gate_rows_tp * 2
     w13_weight = torch.empty(E, w13_rows, gate_cols, dtype=gate_w0.dtype, device=device)
     w13_scale = torch.empty(E, gate_s_rows_tp * 2, gate_s_cols, dtype=gate_s0.dtype, device=device)
@@ -313,21 +318,21 @@ def _load_experts(loader, prefix, cfg, device, rank=0, world_size=1):
 
     for e in range(E):
         ep = f"{prefix}.mlp.experts.{e}"
-        gate_w = tp_shard_dim0(loader.get(f"{ep}.gate_proj.weight"), rank, world_size, unit=8)
-        up_w = tp_shard_dim0(loader.get(f"{ep}.up_proj.weight"), rank, world_size, unit=8)
+        gate_w = loader.dim0_shard(f"{ep}.gate_proj.weight", unit=8)
+        up_w = loader.dim0_shard(f"{ep}.up_proj.weight", unit=8)
         w13_weight[e] = torch.cat([up_w, gate_w], dim=0).to(device)
 
-        gate_s = tp_shard_dim0(loader.get(f"{ep}.gate_proj.weight_scale"), rank, world_size, unit=8)
-        up_s = tp_shard_dim0(loader.get(f"{ep}.up_proj.weight_scale"), rank, world_size, unit=8)
+        gate_s = loader.dim0_shard(f"{ep}.gate_proj.weight_scale", unit=8)
+        up_s = loader.dim0_shard(f"{ep}.up_proj.weight_scale", unit=8)
         w13_scale[e] = torch.cat([up_s, gate_s], dim=0).to(device)
 
-        w2_weight[e] = tp_shard_dim1(loader.get(f"{ep}.down_proj.weight"), rank, world_size, unit=8).to(device)
-        w2_scale[e] = tp_shard_dim1(loader.get(f"{ep}.down_proj.weight_scale"), rank, world_size).to(device)
+        w2_weight[e] = loader.dim1_shard(f"{ep}.down_proj.weight", unit=8).to(device)
+        w2_scale[e] = loader.dim1_shard(f"{ep}.down_proj.weight_scale").to(device)
 
-        gate_is = _load(loader, f"{ep}.gate_proj.input_scale")
-        down_is = _load(loader, f"{ep}.down_proj.input_scale")
-        gate_s2 = _load(loader, f"{ep}.gate_proj.weight_scale_2")
-        down_s2 = _load(loader, f"{ep}.down_proj.weight_scale_2")
+        gate_is = loader.scalar(f"{ep}.gate_proj.input_scale", default=None)
+        down_is = loader.scalar(f"{ep}.down_proj.input_scale", default=None)
+        gate_s2 = loader.scalar(f"{ep}.gate_proj.weight_scale_2", default=None)
+        down_s2 = loader.scalar(f"{ep}.down_proj.weight_scale_2", default=None)
 
         # Store reciprocal input scales (matching sglang's w13_input_scale_quant).
         if gate_is is not None:
@@ -372,21 +377,17 @@ def _dequant_fp4(weight, scale, scale2):
 def _load_shared_expert(loader, prefix, device, rank=0, world_size=1):
     """Load shared expert weights (TP-sharded), dequantizing FP4 to BF16 if needed."""
     ep = f"{prefix}.mlp.shared_expert"
-    gate = _load(loader, f"{ep}.gate_proj.weight")
-    if gate is None:
+    gate_key = f"{ep}.gate_proj.weight"
+    if not loader.exists(gate_key):
         return None
 
-    if gate.dtype == torch.uint8:
+    if loader.dtype(gate_key) == torch.uint8:
         return _load_shared_expert_fp4(loader, prefix, device, rank, world_size)
 
-    up = _load(loader, f"{ep}.up_proj.weight")
-    down = _load(loader, f"{ep}.down_proj.weight")
-
-    # TP shard: gate/up are ColumnParallel (shard dim0), down is RowParallel (shard dim1).
-    if world_size > 1:
-        gate = gate.narrow(0, rank * (gate.shape[0] // world_size), gate.shape[0] // world_size)
-        up = up.narrow(0, rank * (up.shape[0] // world_size), up.shape[0] // world_size)
-        down = down.narrow(1, rank * (down.shape[1] // world_size), down.shape[1] // world_size)
+    del rank, world_size
+    gate = loader.dim0_shard(gate_key, unit=8)
+    up = loader.dim0_shard(f"{ep}.up_proj.weight", unit=8)
+    down = loader.dim1_shard(f"{ep}.down_proj.weight", unit=8)
 
     # Fuse gate+up into single weight (matching sglang's MergedColumnParallelLinear).
     # SiluAndMul splits at midpoint: silu(first_half) * second_half.
@@ -401,20 +402,22 @@ def _load_shared_expert(loader, prefix, device, rank=0, world_size=1):
 def _load_shared_expert_fp4(loader, prefix, device, rank=0, world_size=1):
     """Load a quantized shared expert and dequantize it once to BF16."""
     ep = f"{prefix}.mlp.shared_expert"
+    # Down-proj is column-packed in FP4. Dequantize the full tensor first, then
+    # shard the BF16 result so TP columns stay aligned with the dense path.
     gate = _dequant_fp4(
-        loader.get(f"{ep}.gate_proj.weight"),
-        loader.get(f"{ep}.gate_proj.weight_scale"),
-        loader.get(f"{ep}.gate_proj.weight_scale_2").item(),
+        loader.tensor(f"{ep}.gate_proj.weight"),
+        loader.tensor(f"{ep}.gate_proj.weight_scale"),
+        loader.scalar(f"{ep}.gate_proj.weight_scale_2"),
     )
     up = _dequant_fp4(
-        loader.get(f"{ep}.up_proj.weight"),
-        loader.get(f"{ep}.up_proj.weight_scale"),
-        loader.get(f"{ep}.up_proj.weight_scale_2").item(),
+        loader.tensor(f"{ep}.up_proj.weight"),
+        loader.tensor(f"{ep}.up_proj.weight_scale"),
+        loader.scalar(f"{ep}.up_proj.weight_scale_2"),
     )
     down = _dequant_fp4(
-        loader.get(f"{ep}.down_proj.weight"),
-        loader.get(f"{ep}.down_proj.weight_scale"),
-        loader.get(f"{ep}.down_proj.weight_scale_2").item(),
+        loader.tensor(f"{ep}.down_proj.weight"),
+        loader.tensor(f"{ep}.down_proj.weight_scale"),
+        loader.scalar(f"{ep}.down_proj.weight_scale_2"),
     )
 
     gate = tp_shard_dim0(gate, rank, world_size, unit=8)
@@ -457,11 +460,11 @@ def recipe_qwen3_5_moe(hf_model, hf_config, loader, device, tp_group):
         layers.append(layer)
 
     # Embedding and head.
-    embed_weight = loader.get("model.language_model.embed_tokens.weight").to(device)
+    embed_weight = loader.tensor("model.language_model.embed_tokens.weight").to(device)
     embed = nn.Embedding.from_pretrained(embed_weight, freeze=True)
 
-    final_norm = loader.get("model.language_model.norm.weight").to(device)
-    lm_head = loader.get("lm_head.weight").to(device)
+    final_norm = loader.tensor("model.language_model.norm.weight").to(device)
+    lm_head = loader.tensor("lm_head.weight").to(device)
 
     # RoPE (only for self-attention layers).
     cos, sin = precompute_rope_freqs(
