@@ -201,7 +201,7 @@ def test_paged_fp8_auto_chunk_heuristic_uses_coarser_extend_chunks_at_very_long_
     )
 
     assert plan.mode == "extend"
-    assert plan.kv_chunk_size == 12 * 64
+    assert plan.kv_chunk_size == 24 * 64
     assert plan.split_kv is True
 
 
@@ -377,7 +377,7 @@ def test_paged_bf16_auto_chunk_heuristic_uses_three_pages_for_extend_8192() -> N
     )
 
     assert plan.mode == "extend"
-    assert plan.kv_chunk_size == 3 * 64
+    assert plan.kv_chunk_size == 6 * 64
     assert plan.split_kv is True
 
 
@@ -401,7 +401,7 @@ def test_paged_bf16_auto_chunk_heuristic_uses_six_pages_for_extend_16384() -> No
     assert plan.split_kv is True
 
 
-def test_paged_bf16_auto_chunk_heuristic_uses_twenty_four_pages_for_extend_32768() -> None:
+def test_paged_bf16_auto_chunk_heuristic_uses_thirty_two_pages_for_extend_32768() -> None:
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[6] * 8,
         cache_seqlens=[32768] * 8,
@@ -417,7 +417,7 @@ def test_paged_bf16_auto_chunk_heuristic_uses_twenty_four_pages_for_extend_32768
     )
 
     assert plan.mode == "extend"
-    assert plan.kv_chunk_size == 24 * 64
+    assert plan.kv_chunk_size == 32 * 64
     assert plan.split_kv is True
 
 
@@ -555,9 +555,9 @@ def test_paged_extend_fp8_chunk_policy_is_explicit_out_to_128k() -> None:
             4096: 3,
             8192: 6,
             16384: 6,
-            32768: 12,
-            65536: 12,
-            131072: 12,
+            32768: 24,
+            65536: 24,
+            131072: 24,
         },
     )
 
@@ -580,10 +580,10 @@ def test_paged_extend_bf16_chunk_policy_is_explicit_out_to_128k() -> None:
             1024: 1,
             2048: 2,
             4096: 3,
-            8192: 3,
+            8192: 6,
             16384: 6,
-            32768: 24,
-            65536: 24,
-            131072: 24,
+            32768: 32,
+            65536: 32,
+            131072: 32,
         },
     )

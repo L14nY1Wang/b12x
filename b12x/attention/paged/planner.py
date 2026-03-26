@@ -29,9 +29,9 @@ _PAGED_EXTEND_FP8_CHUNK_TABLE_PAGES = (
     (64, 3),
     (128, 6),
     (256, 6),
-    (512, 12),
-    (1024, 12),
-    (2048, 12),
+    (512, 24),
+    (1024, 24),
+    (2048, 24),
 )
 _PAGED_EXTEND_FP8_GRAPH_CHUNK_TABLE_PAGES = (
     (1, 1),
@@ -41,11 +41,11 @@ _PAGED_EXTEND_FP8_GRAPH_CHUNK_TABLE_PAGES = (
     (16, 1),
     (32, 2),
     (64, 3),
-    (128, 3),
+    (128, 6),
     (256, 6),
-    (512, 12),
-    (1024, 12),
-    (2048, 12),
+    (512, 24),
+    (1024, 24),
+    (2048, 24),
 )
 _PAGED_EXTEND_BF16_CHUNK_TABLE_PAGES = (
     (1, 1),
@@ -68,11 +68,12 @@ _PAGED_EXTEND_BF16_TMA_EXACT_PLANE_CHUNK_TABLE_PAGES = (
     (8, 1),
     (16, 1),
     (32, 2),
-    (128, 3),
+    (64, 3),
+    (128, 6),
     (256, 6),
-    (512, 24),
-    (1024, 24),
-    (2048, 24),
+    (512, 32),
+    (1024, 32),
+    (2048, 32),
 )
 _PAGED_DECODE_BF16_CHUNK_TABLE_PAGES = (
     # Provisional dense-table fit from the partial decode sweep:
