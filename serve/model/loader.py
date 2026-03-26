@@ -89,6 +89,12 @@ def _resolve_local_topology(rank: int, world_size: int) -> tuple[int, int, int]:
     return local_rank, local_world_size, node_start
 
 
+def _chunked(seq: list[int], size: int) -> list[list[int]]:
+    if size <= 0:
+        raise ValueError("chunk size must be positive")
+    return [seq[i:i + size] for i in range(0, len(seq), size)]
+
+
 class TensorIndex:
     """Metadata-only view over the safetensor checkpoint."""
 
@@ -167,6 +173,7 @@ class ShardedLoader:
         self.node_ranks = list(range(self.node_start, self.node_start + self.local_world_size))
         self.node_leader_rank = self.node_start
         self.is_node_leader = self.rank == self.node_leader_rank
+        self._p2p_window = max(1, min(self.local_world_size, 4))
 
         self._device_files: dict[str, object] = {}
         self._allow_data_reads = self.backend == "local" or self.is_node_leader
@@ -407,14 +414,10 @@ class ShardedLoader:
             return
         if self.is_node_leader:
             out.copy_(self._load_full_local(key))
-            for dst in self.node_ranks:
-                if dst == self.rank:
-                    continue
-                dist.send(out, dst=dst, group=self.tp_group.process_group)
-                self.metrics.transport_bytes_sent += out.numel() * out.element_size()
+            followers = [dst for dst in self.node_ranks if dst != self.rank]
+            self._batch_send([(out, dst) for dst in followers])
         else:
-            dist.recv(out, src=self.node_leader_rank, group=self.tp_group.process_group)
-            self.metrics.transport_bytes_received += out.numel() * out.element_size()
+            self._batch_recv([out])
 
     def _dim_shard(
         self,
@@ -472,30 +475,64 @@ class ShardedLoader:
             return out
 
         if self.is_node_leader:
-            for logical_rank in self._node_logical_ranks(replica_group_size):
-                piece = self._load_local_shard_piece(
-                    key,
-                    dim=dim,
-                    start=start,
-                    total=total,
-                    logical_rank=logical_rank,
-                    logical_world=logical_world,
-                    unit=unit,
-                    pad=pad,
-                )
-                for dst in self._ranks_for_logical_rank(logical_rank, replica_group_size):
-                    if dst not in self.node_ranks:
-                        continue
-                    if dst == self.rank:
-                        out.copy_(piece)
-                    else:
-                        dist.send(piece, dst=dst, group=self.tp_group.process_group)
-                        self.metrics.transport_bytes_sent += piece.numel() * piece.element_size()
+            logical_ranks = self._node_logical_ranks(replica_group_size)
+            for logical_rank_chunk in _chunked(logical_ranks, self._p2p_window):
+                send_plan: list[tuple[torch.Tensor, int]] = []
+                keepalive: list[torch.Tensor] = []
+                for logical_rank in logical_rank_chunk:
+                    piece = self._load_local_shard_piece(
+                        key,
+                        dim=dim,
+                        start=start,
+                        total=total,
+                        logical_rank=logical_rank,
+                        logical_world=logical_world,
+                        unit=unit,
+                        pad=pad,
+                    )
+                    keepalive.append(piece)
+                    for dst in self._ranks_for_logical_rank(logical_rank, replica_group_size):
+                        if dst not in self.node_ranks:
+                            continue
+                        if dst == self.rank:
+                            out.copy_(piece)
+                        else:
+                            send_plan.append((piece, dst))
+                self._batch_send(send_plan)
         else:
-            dist.recv(out, src=self.node_leader_rank, group=self.tp_group.process_group)
-            self.metrics.transport_bytes_received += out.numel() * out.element_size()
+            self._batch_recv([out])
 
         return out
+
+    def _batch_send(self, send_plan: list[tuple[torch.Tensor, int]]) -> None:
+        if not send_plan:
+            return
+        assert self.tp_group is not None
+        ops = [
+            dist.P2POp(dist.isend, tensor, dst, group=self.tp_group.process_group)
+            for tensor, dst in send_plan
+        ]
+        reqs = dist.batch_isend_irecv(ops)
+        for req in reqs:
+            req.wait()
+        self.metrics.transport_bytes_sent += sum(
+            tensor.numel() * tensor.element_size() for tensor, _dst in send_plan
+        )
+
+    def _batch_recv(self, recv_tensors: list[torch.Tensor]) -> None:
+        if not recv_tensors:
+            return
+        assert self.tp_group is not None
+        ops = [
+            dist.P2POp(dist.irecv, tensor, self.node_leader_rank, group=self.tp_group.process_group)
+            for tensor in recv_tensors
+        ]
+        reqs = dist.batch_isend_irecv(ops)
+        for req in reqs:
+            req.wait()
+        self.metrics.transport_bytes_received += sum(
+            tensor.numel() * tensor.element_size() for tensor in recv_tensors
+        )
 
     def _shard_shape(
         self,

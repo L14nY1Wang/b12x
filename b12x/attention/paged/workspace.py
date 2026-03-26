@@ -25,6 +25,26 @@ def _canonical_device(device: torch.device | str) -> torch.device:
     return device
 
 
+def _shape_only_cuda_tensor(
+    shape: tuple[int, ...],
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return a tiny CUDA tensor view with the requested logical shape.
+
+    The paged planner only inspects shape, dtype, and device for the
+    contract-side KV tensors; it never reads their data. Represent the
+    contract with a single-element zero-stride view so graph workspaces do
+    not allocate full shadow copies of the KV cache.
+    """
+
+    if any(dim <= 0 for dim in shape):
+        raise ValueError(f"shape must be positive in every dimension, got {shape}")
+    base = torch.empty(1, dtype=dtype, device=device)
+    return base.as_strided(shape, (0,) * len(shape))
+
+
 @dataclass(kw_only=True)
 class PagedAttentionWorkspace:
     mode: Literal["decode", "extend"]
@@ -81,12 +101,12 @@ class PagedAttentionWorkspace:
         if num_cache_pages <= 0:
             raise ValueError("num_cache_pages must be positive")
         plan_q = torch.empty((max_total_q, num_q_heads, head_dim_qk), dtype=dtype, device=device)
-        plan_k_cache = torch.empty(
+        plan_k_cache = _shape_only_cuda_tensor(
             (num_cache_pages, page_size, num_kv_heads, head_dim_qk),
             dtype=kv_dtype,
             device=device,
         )
-        plan_v_cache = torch.empty(
+        plan_v_cache = _shape_only_cuda_tensor(
             (num_cache_pages, page_size, num_kv_heads, head_dim_vo),
             dtype=kv_dtype,
             device=device,
