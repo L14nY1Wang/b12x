@@ -24,7 +24,7 @@ from serve.cache.prefix_checkpoint_cache import PrefixCheckpointCache
 from serve.engine.request import Request
 from serve.engine.sampling import SamplingParams, sample_batch
 from serve.engine.scheduler import BatchScheduler
-from serve.model.loader import load_model
+from serve.model.loader import load_model, LoadedModel
 from serve.tp.group import TPGroup
 
 
@@ -63,6 +63,65 @@ def _should_enable_layer_compile(
     if not compile_layers:
         return False
     return not is_hybrid
+
+
+def _estimate_loaded_model_bytes(model: LoadedModel) -> int:
+    """Return the persistent GPU storage owned by *model*.
+
+    Walks the LoadedModel object graph and counts unique CUDA storages so
+    tied/shared tensors are only charged once. Many of the custom runtime
+    containers in `serve.model` and `b12x` hold tensors in plain attributes
+    or dataclass fields rather than registered parameters/buffers.
+    """
+
+    seen_storages: set[tuple[int, int]] = set()
+    seen_objects: set[int] = set()
+    total = 0
+
+    def visit(obj) -> None:
+        nonlocal total
+        if obj is None:
+            return
+        if isinstance(obj, (str, bytes, int, float, bool, torch.dtype, torch.device)):
+            return
+
+        if isinstance(obj, torch.Tensor):
+            if obj.device.type != "cuda":
+                return
+            storage = obj.untyped_storage()
+            key = (storage.data_ptr(), storage.nbytes())
+            if key in seen_storages:
+                return
+            seen_storages.add(key)
+            total += storage.nbytes()
+            return
+
+        obj_id = id(obj)
+        if obj_id in seen_objects:
+            return
+        seen_objects.add(obj_id)
+
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                visit(key)
+                visit(value)
+            return
+
+        if isinstance(obj, (list, tuple, set, frozenset)):
+            for item in obj:
+                visit(item)
+            return
+
+        if hasattr(obj, "__dict__"):
+            for value in vars(obj).values():
+                visit(value)
+
+    visit(model)
+    return total
+
+
+def _format_gib(num_bytes: int) -> str:
+    return f"{num_bytes / (1024 ** 3):.2f} GiB"
 
 
 class ServingEngine:
@@ -116,16 +175,35 @@ class ServingEngine:
         if layer_types:
             num_kv_layers = sum(1 for t in layer_types if t == "attention")
 
-        total_mem = torch.cuda.mem_get_info()[1]
-        used_mem = total_mem - torch.cuda.mem_get_info()[0]
+        free_mem, total_mem = torch.cuda.mem_get_info()
+        model_bytes = _estimate_loaded_model_bytes(self.model)
         # KV cache + model weights together should occupy mem_fraction of total GPU memory.
         mem_fraction = 0.75
-        kv_budget = max(0, int(total_mem * mem_fraction) - used_mem)
+        target_mem = int(total_mem * mem_fraction)
+        kv_budget = max(0, target_mem - model_bytes)
+        kv_budget_before_tp = kv_budget
+
+        model_bytes_min = model_bytes
+        model_bytes_max = model_bytes
+        free_mem_min = free_mem
+        free_mem_max = free_mem
 
         # All ranks must agree on num_pages for TP broadcast shapes.
         if self.world_size > 1:
+            model_bytes_min_t = torch.tensor([model_bytes], dtype=torch.long, device=device)
+            model_bytes_max_t = torch.tensor([model_bytes], dtype=torch.long, device=device)
+            free_mem_min_t = torch.tensor([free_mem], dtype=torch.long, device=device)
+            free_mem_max_t = torch.tensor([free_mem], dtype=torch.long, device=device)
             budget_t = torch.tensor([kv_budget], dtype=torch.long, device=device)
+            dist.all_reduce(model_bytes_min_t, op=dist.ReduceOp.MIN)
+            dist.all_reduce(model_bytes_max_t, op=dist.ReduceOp.MAX)
+            dist.all_reduce(free_mem_min_t, op=dist.ReduceOp.MIN)
+            dist.all_reduce(free_mem_max_t, op=dist.ReduceOp.MAX)
             dist.all_reduce(budget_t, op=dist.ReduceOp.MIN)
+            model_bytes_min = model_bytes_min_t.item()
+            model_bytes_max = model_bytes_max_t.item()
+            free_mem_min = free_mem_min_t.item()
+            free_mem_max = free_mem_max_t.item()
             kv_budget = budget_t.item()
 
         # Linear-attention state arena shared by live requests and cached
@@ -206,14 +284,48 @@ class ServingEngine:
                     f"{linear_state_arena.memory_bytes() / 1e6:.0f} MB"
                 )
 
+        kv_bytes_per_token_block = (
+            64
+            * self.cfg.num_kv_heads
+            * self.cfg.head_dim
+            * (torch.finfo(kv_dtype).bits // 8 if kv_dtype.is_floating_point else 1)
+            * 2
+            * num_kv_layers
+        )
+        num_pages = PagePool.estimate_num_pages(
+            kv_budget,
+            num_layers=num_kv_layers,
+            kv_heads=self.cfg.num_kv_heads,
+            head_dim=self.cfg.head_dim,
+            kv_dtype=kv_dtype,
+        )
+        kv_pool_bytes = num_pages * kv_bytes_per_token_block
+
+        if self.rank == 0:
+            print(
+                "KV sizing: "
+                f"target={_format_gib(target_mem)} "
+                f"total={_format_gib(total_mem)} "
+                f"free_after_load[min,max]=[{_format_gib(free_mem_min)}, {_format_gib(free_mem_max)}] "
+                f"model_bytes[min,max]=[{_format_gib(model_bytes_min)}, {_format_gib(model_bytes_max)}] "
+                f"kv_budget_before_tp={_format_gib(kv_budget_before_tp)} "
+                f"kv_budget={_format_gib(kv_budget)}"
+            )
+            print(
+                "KV layout: "
+                f"layers={num_kv_layers} "
+                f"kv_heads={self.cfg.num_kv_heads} "
+                f"head_dim={self.cfg.head_dim} "
+                f"dtype={kv_dtype} "
+                f"bytes_per_page={_format_gib(kv_bytes_per_token_block)} "
+                f"num_pages={num_pages} "
+                f"pool_bytes={_format_gib(kv_pool_bytes)} "
+                f"cuda_allocated={_format_gib(torch.cuda.memory_allocated())} "
+                f"cuda_reserved={_format_gib(torch.cuda.memory_reserved())}"
+            )
+
         self.pool = PagePool(
-            num_pages=PagePool.estimate_num_pages(
-                kv_budget,
-                num_layers=num_kv_layers,
-                kv_heads=self.cfg.num_kv_heads,
-                head_dim=self.cfg.head_dim,
-                kv_dtype=kv_dtype,
-            ),
+            num_pages=num_pages,
             num_layers=num_kv_layers,
             kv_heads=self.cfg.num_kv_heads,
             head_dim=self.cfg.head_dim,
