@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import pathlib
-import random
 import statistics
 import sys
 from dataclasses import dataclass
@@ -50,42 +49,46 @@ def _bench_graph(graph: torch.cuda.CUDAGraph, *, replays: int) -> list[float]:
     return [start.elapsed_time(end) for start, end in zip(starts, ends)]
 
 
-def _quantile(sorted_values: list[float], q: float) -> float:
-    if not sorted_values:
-        raise ValueError("quantile requires at least one value")
-    if q <= 0.0:
-        return sorted_values[0]
-    if q >= 1.0:
-        return sorted_values[-1]
-    pos = q * (len(sorted_values) - 1)
-    lo = int(pos)
-    hi = min(lo + 1, len(sorted_values) - 1)
-    frac = pos - lo
-    return sorted_values[lo] * (1.0 - frac) + sorted_values[hi] * frac
-
-
-def _bootstrap_ratio_ci(
-    numerator_times_ms: list[float],
-    denominator_times_ms: list[float],
+def _mean_ci(
+    times_ms: list[float],
     *,
-    samples: int,
     ci_level: float,
-    seed: int,
-) -> tuple[float, float]:
-    if len(numerator_times_ms) != len(denominator_times_ms):
-        raise ValueError("bootstrap inputs must have the same replay count")
-    if samples <= 0:
-        raise ValueError("bootstrap sample count must be positive")
-    n = len(numerator_times_ms)
-    rng = random.Random(seed)
-    ratios: list[float] = []
-    for _ in range(samples):
-        num_sample = [numerator_times_ms[rng.randrange(n)] for _ in range(n)]
-        den_sample = [denominator_times_ms[rng.randrange(n)] for _ in range(n)]
-        ratios.append(statistics.median(num_sample) / statistics.median(den_sample))
-    ratios.sort()
+) -> tuple[float, float, float]:
+    if not times_ms:
+        raise ValueError("mean CI inputs must be non-empty")
+    n = len(times_ms)
+    mean = statistics.fmean(times_ms)
+    if n == 1:
+        return mean, mean, 0.0
+    stdev = statistics.stdev(times_ms)
+    sem = stdev / (n**0.5)
     alpha = (1.0 - ci_level) / 2.0
-    return _quantile(ratios, alpha), _quantile(ratios, 1.0 - alpha)
+    z = statistics.NormalDist().inv_cdf(1.0 - alpha)
+    half_width = z * sem
+    return mean - half_width, mean + half_width, sem
+
+
+def _ratio_mean_ci(
+    numerator_mean: float,
+    numerator_sem: float,
+    denominator_mean: float,
+    denominator_sem: float,
+    *,
+    ci_level: float,
+) -> tuple[float, float]:
+    if numerator_mean <= 0.0 or denominator_mean <= 0.0:
+        return float("nan"), float("nan")
+    alpha = (1.0 - ci_level) / 2.0
+    z = statistics.NormalDist().inv_cdf(1.0 - alpha)
+    ratio = numerator_mean / denominator_mean
+    relative_var = 0.0
+    if numerator_sem > 0.0:
+        relative_var += (numerator_sem / numerator_mean) ** 2
+    if denominator_sem > 0.0:
+        relative_var += (denominator_sem / denominator_mean) ** 2
+    ratio_sem = ratio * (relative_var**0.5)
+    half_width = z * ratio_sem
+    return ratio - half_width, ratio + half_width
 
 
 def _dtype_from_name(name: str) -> torch.dtype:
@@ -140,8 +143,11 @@ class ShapeCase:
 @dataclass(frozen=True)
 class CaseMetrics:
     backend: str
-    median_us: float
+    mean_us: float
     min_us: float
+    ci_low_us: float
+    ci_high_us: float
+    sem_us: float
 
 
 @dataclass(frozen=True)
@@ -445,7 +451,6 @@ def main() -> None:
     parser.add_argument("--flashinfer-workspace-mb", type=int, default=512)
     parser.add_argument("--fixed-split-pages", type=int, default=0)
     parser.add_argument("--b12x-attn-mode", choices=["default", "turbo"], default="default")
-    parser.add_argument("--bootstrap-samples", type=int, default=5000)
     parser.add_argument("--ci-level", type=float, default=0.95)
     parser.add_argument("--compare-fa2", action="store_true", default=True)
     parser.add_argument("--no-compare-fa2", action="store_false", dest="compare_fa2")
@@ -457,8 +462,6 @@ def main() -> None:
         raise ValueError("--replays must be at least 100 for graph-replay benchmarking")
     if not 0.0 < args.ci_level < 1.0:
         raise ValueError("--ci-level must be between 0 and 1")
-    if args.bootstrap_samples <= 0:
-        raise ValueError("--bootstrap-samples must be positive")
     clear_attention_caches()
 
     dtype = _dtype_from_name(args.dtype)
@@ -531,10 +534,17 @@ def main() -> None:
             b12x_attn_mode=args.b12x_attn_mode,
         )
         backend_times_ms = _bench_graph(backend_capture.graph, replays=args.replays)
+        backend_ci_low_ms, backend_ci_high_ms, backend_sem_ms = _mean_ci(
+            backend_times_ms,
+            ci_level=args.ci_level,
+        )
         backend_metrics = CaseMetrics(
             backend="b12x",
-            median_us=statistics.median(backend_times_ms) * 1000.0,
+            mean_us=statistics.fmean(backend_times_ms) * 1000.0,
             min_us=min(backend_times_ms) * 1000.0,
+            ci_low_us=backend_ci_low_ms * 1000.0,
+            ci_high_us=backend_ci_high_ms * 1000.0,
+            sem_us=backend_sem_ms * 1000.0,
         )
 
         flashinfer_metrics: CaseMetrics | None = None
@@ -559,12 +569,19 @@ def main() -> None:
                 warmup=args.warmup,
             )
             flashinfer_times_ms = _bench_graph(flashinfer_graph, replays=args.replays)
+            flashinfer_ci_low_ms, flashinfer_ci_high_ms, flashinfer_sem_ms = _mean_ci(
+                flashinfer_times_ms,
+                ci_level=args.ci_level,
+            )
             flashinfer_metrics = CaseMetrics(
                 backend="flashinfer-fa2",
-                median_us=statistics.median(flashinfer_times_ms) * 1000.0,
+                mean_us=statistics.fmean(flashinfer_times_ms) * 1000.0,
                 min_us=min(flashinfer_times_ms) * 1000.0,
+                ci_low_us=flashinfer_ci_low_ms * 1000.0,
+                ci_high_us=flashinfer_ci_high_ms * 1000.0,
+                sem_us=flashinfer_sem_ms * 1000.0,
             )
-            speedups.append(flashinfer_metrics.median_us / backend_metrics.median_us)
+            speedups.append(flashinfer_metrics.mean_us / backend_metrics.mean_us)
 
         check_suffix = ""
         if args.check and flashinfer_output is not None:
@@ -578,26 +595,26 @@ def main() -> None:
             f"q={case.q_seqlen:2d} "
             f"k={case.cache_seqlen:5d} "
             f"{backend_capture.plan_desc:>17s} "
-            f"| {backend_metrics.backend} median={backend_metrics.median_us:8.1f} us "
-            f"min={backend_metrics.min_us:8.1f} us"
+            f"| {backend_metrics.backend} mean={backend_metrics.mean_us:8.1f} us "
+            f"min={backend_metrics.min_us:8.1f} us "
+            f"{int(args.ci_level * 100)}%CI=[{backend_metrics.ci_low_us:8.1f},{backend_metrics.ci_high_us:8.1f}] us"
         )
         if flashinfer_metrics is not None:
-            ratio = flashinfer_metrics.median_us / backend_metrics.median_us
-            ci_lo, ci_hi = _bootstrap_ratio_ci(
-                flashinfer_times_ms,
-                backend_times_ms,
-                samples=args.bootstrap_samples,
+            ratio = flashinfer_metrics.mean_us / backend_metrics.mean_us
+            ratio_ci_low, ratio_ci_high = _ratio_mean_ci(
+                flashinfer_metrics.mean_us,
+                flashinfer_metrics.sem_us,
+                backend_metrics.mean_us,
+                backend_metrics.sem_us,
                 ci_level=args.ci_level,
-                seed=case_idx,
             )
-            moe = max(ratio - ci_lo, ci_hi - ratio)
             line += (
-                f" | fa2 median={flashinfer_metrics.median_us:8.1f} us "
+                f" | fa2 mean={flashinfer_metrics.mean_us:8.1f} us "
                 f"min={flashinfer_metrics.min_us:8.1f} us "
+                f" {int(args.ci_level * 100)}%CI=[{flashinfer_metrics.ci_low_us:8.1f},{flashinfer_metrics.ci_high_us:8.1f}] us "
                 f"| fa2/{backend_metrics.backend}="
                 f"{ratio:6.3f}x"
-                f" +/- {moe:5.3f}x"
-                f" {int(args.ci_level * 100)}%CI=[{ci_lo:5.3f},{ci_hi:5.3f}]"
+                f" {int(args.ci_level * 100)}%CI=[{ratio_ci_low:5.3f},{ratio_ci_high:5.3f}]"
             )
         print(line + check_suffix)
 
