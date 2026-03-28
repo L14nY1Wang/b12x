@@ -20,6 +20,7 @@ from .forward_paged import (
     PagedForwardKernel,
     PagedFp8DecodeRawForwardKernel,
     PagedFp8ExtendRawForwardKernel,
+    PagedFp8ExtendRawLongForwardKernel,
     PagedFp8RawPlaneDumpKernel,
 )
 from .merge import PagedPersistentMergeKernel, default_paged_persistent_ctas
@@ -315,13 +316,11 @@ def _build_fp8_extend_raw_forward_kernel(
     mxfp8_turbo: bool,
     enable_mxfp8_pv: bool,
     long_context_pipeline: bool,
-) -> PagedFp8ExtendRawForwardKernel:
+) -> PagedFp8ExtendRawForwardKernel | PagedFp8ExtendRawLongForwardKernel:
     del mxfp8_turbo, enable_mxfp8_pv
-    return PagedFp8ExtendRawForwardKernel(
-        split_kv=split_kv,
-        cta_tile_q=traits.cta_tile_q,
-        long_context_pipeline=long_context_pipeline,
-    )
+    if long_context_pipeline:
+        return PagedFp8ExtendRawLongForwardKernel(split_kv=split_kv, cta_tile_q=traits.cta_tile_q)
+    return PagedFp8ExtendRawForwardKernel(split_kv=split_kv, cta_tile_q=traits.cta_tile_q)
 
 
 @lru_cache(maxsize=16)
