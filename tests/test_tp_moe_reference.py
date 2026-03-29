@@ -354,7 +354,7 @@ def _run_impl_sequence(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 2, 4, 128, 512])
+    parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 2, 4, 128, 512, 4096])
     parser.add_argument("--layer-indices", type=int, nargs="+", default=[0])
     parser.add_argument("--sequence-repeats", type=int, default=1)
     parser.add_argument("--clear-state-between-calls", action="store_true")
