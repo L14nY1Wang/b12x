@@ -57,42 +57,11 @@ _PAGED_EXTEND_BF16_CHUNK_TABLE_PAGES = (
     (64, 3),
     (128, 6),
     (256, 6),
-    (512, 24),
-    (1024, 24),
-    (2048, 24),
-)
-_PAGED_EXTEND_BF16_TMA_EXACT_PLANE_CHUNK_TABLE_PAGES = (
-    (1, 1),
-    (2, 1),
-    (4, 1),
-    (8, 1),
-    (16, 1),
-    (32, 2),
-    (64, 3),
-    (128, 6),
-    (256, 6),
     (512, 32),
     (1024, 32),
     (2048, 32),
 )
 _PAGED_DECODE_BF16_CHUNK_TABLE_PAGES = (
-    # Provisional dense-table fit from the partial decode sweep:
-    # exact at the benchmark lengths, smoothed elsewhere to the nearest
-    # stable page ladder instead of overfitting near-ties.
-    (1, 1),
-    (2, 2),
-    (16, 1),
-    (32, 2),
-    (64, 3),
-    (128, 6),
-    (256, 12),
-    (320, 16),
-    (448, 48),
-    (640, 64),
-    (960, 96),
-    (2048, 128),
-)
-_PAGED_DECODE_BF16_TMA_EXACT_PLANE_CHUNK_TABLE_PAGES = (
     (1, 1),
     (2, 2),
     (16, 1),
@@ -222,10 +191,6 @@ def _lookup_chunk_pages_from_table(
     return None
 
 
-def _use_paged_bf16_tma_exact_plane_chunk_tables() -> bool:
-    return True
-
-
 def _paged_chunk_table_pages(
     *,
     mode: Literal["decode", "extend"],
@@ -266,21 +231,11 @@ def _paged_chunk_table_pages(
             _PAGED_DECODE_FP8_CHUNK_TABLE_PAGES,
         )
     if mode == "extend" and kv_dtype == torch.bfloat16:
-        if _use_paged_bf16_tma_exact_plane_chunk_tables():
-            return _lookup_chunk_pages_from_table(
-                max_effective_kv_pages,
-                _PAGED_EXTEND_BF16_TMA_EXACT_PLANE_CHUNK_TABLE_PAGES,
-            )
         return _lookup_chunk_pages_from_table(
             max_effective_kv_pages,
             _PAGED_EXTEND_BF16_CHUNK_TABLE_PAGES,
         )
     if mode == "decode" and kv_dtype == torch.bfloat16:
-        if _use_paged_bf16_tma_exact_plane_chunk_tables():
-            return _lookup_chunk_pages_from_table(
-                max_effective_kv_pages,
-                _PAGED_DECODE_BF16_TMA_EXACT_PLANE_CHUNK_TABLE_PAGES,
-            )
         return _lookup_chunk_pages_from_table(
             max_effective_kv_pages,
             _PAGED_DECODE_BF16_CHUNK_TABLE_PAGES,
