@@ -3270,12 +3270,16 @@ class PagedForwardKernel:
                 d_frag[mma_q, row_slot] = Float32(1.0)
 
         prefetch_base = chunk_start
-        preload_count = 0
-        preload_stage_idx = Int32(0)
-        kv_producer_state = pipeline.make_pipeline_state(
+        k_producer_state = pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Producer, self.num_stages
         )
-        kv_consumer_state = pipeline.make_pipeline_state(
+        k_consumer_state = pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Consumer, self.num_stages
+        )
+        v_producer_state = pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Producer, self.num_stages
+        )
+        v_consumer_state = pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Consumer, self.num_stages
         )
         if prefetch_base < chunk_end:
@@ -3293,7 +3297,7 @@ class PagedForwardKernel:
                         load_K_tma2,
                         load_K_tma3,
                         pipeline_k,
-                        kv_producer_state,
+                        k_producer_state,
                         mPageTable,
                         request_idx,
                         prefetch_base,
@@ -3305,7 +3309,7 @@ class PagedForwardKernel:
                         load_V_tma2,
                         load_V_tma3,
                         pipeline_v,
-                        kv_producer_state,
+                        v_producer_state,
                         mPageTable,
                         request_idx,
                         prefetch_base,
@@ -3316,7 +3320,7 @@ class PagedForwardKernel:
                         load_K_tma0,
                         load_K_tma1,
                         pipeline_k,
-                        kv_producer_state,
+                        k_producer_state,
                         mPageTable,
                         request_idx,
                         prefetch_base,
@@ -3326,15 +3330,15 @@ class PagedForwardKernel:
                         load_V_tma0,
                         load_V_tma1,
                         pipeline_v,
-                        kv_producer_state,
+                        v_producer_state,
                         mPageTable,
                         request_idx,
                         prefetch_base,
                         page_size,
                     )
-            kv_producer_state.advance()
+            k_producer_state.advance()
+            v_producer_state.advance()
             prefetch_base += stage_tile_rows
-            preload_count = 1
 
         consume_stage_idx = Int32(0)
         tile_base = chunk_start
@@ -3342,8 +3346,8 @@ class PagedForwardKernel:
             tile_limit = cutlass.select_(tile_base + stage_tile_rows < chunk_end, tile_base + stage_tile_rows, chunk_end)
             tile_tokens = tile_limit - tile_base
             pipeline_k.consumer_wait(
-                kv_consumer_state,
-                pipeline_k.consumer_try_wait(kv_consumer_state),
+                k_consumer_state,
+                pipeline_k.consumer_try_wait(k_consumer_state),
             )
             cute.arch.sync_threads()
 
@@ -3565,13 +3569,41 @@ class PagedForwardKernel:
                         )
                         d_frag[mma_q, 0] = d0
                         d_frag[mma_q, 1] = d1
-                pipeline_k.consumer_release(kv_consumer_state)
-
+                pipeline_k.consumer_release(k_consumer_state)
                 next_tile_base = prefetch_base
+                # Let the next K tile start moving while this CTA is still using V.
+                if next_tile_base < chunk_end:
+                    if warp_linear_idx == Int32(0):
+                        if const_expr(self.kv_tma_plane_count > 2):
+                            self._issue_paged_kv_tma_copy_planes(
+                                load_K_tma0,
+                                load_K_tma1,
+                                load_K_tma2,
+                                load_K_tma3,
+                                pipeline_k,
+                                k_producer_state,
+                                mPageTable,
+                                request_idx,
+                                next_tile_base,
+                                page_size,
+                            )
+                        else:
+                            self._issue_paged_kv_tma_copy_2planes(
+                                load_K_tma0,
+                                load_K_tma1,
+                                pipeline_k,
+                                k_producer_state,
+                                mPageTable,
+                                request_idx,
+                                next_tile_base,
+                                page_size,
+                            )
+                    k_producer_state.advance()
+                k_consumer_state.advance()
 
                 pipeline_v.consumer_wait(
-                    kv_consumer_state,
-                    pipeline_v.consumer_try_wait(kv_consumer_state),
+                    v_consumer_state,
+                    pipeline_v.consumer_try_wait(v_consumer_state),
                 )
 
                 if const_expr(self.debug_dump_paged_kv_pvregs):
@@ -3724,30 +3756,18 @@ class PagedForwardKernel:
                         v_scale,
                     )
 
-                pipeline_v.consumer_release(kv_consumer_state)
-                kv_consumer_state.advance()
+                pipeline_v.consumer_release(v_consumer_state)
+                v_consumer_state.advance()
                 if next_tile_base < chunk_end:
                     if warp_linear_idx == Int32(0):
                         if const_expr(self.kv_tma_plane_count > 2):
-                            self._issue_paged_kv_tma_copy_planes(
-                                load_K_tma0,
-                                load_K_tma1,
-                                load_K_tma2,
-                                load_K_tma3,
-                                pipeline_k,
-                                kv_producer_state,
-                                mPageTable,
-                                request_idx,
-                                next_tile_base,
-                                page_size,
-                            )
                             self._issue_paged_kv_tma_copy_planes(
                                 load_V_tma0,
                                 load_V_tma1,
                                 load_V_tma2,
                                 load_V_tma3,
                                 pipeline_v,
-                                kv_producer_state,
+                                v_producer_state,
                                 mPageTable,
                                 request_idx,
                                 next_tile_base,
@@ -3755,26 +3775,16 @@ class PagedForwardKernel:
                             )
                         else:
                             self._issue_paged_kv_tma_copy_2planes(
-                                load_K_tma0,
-                                load_K_tma1,
-                                pipeline_k,
-                                kv_producer_state,
-                                mPageTable,
-                                request_idx,
-                                next_tile_base,
-                                page_size,
-                            )
-                            self._issue_paged_kv_tma_copy_2planes(
                                 load_V_tma0,
                                 load_V_tma1,
                                 pipeline_v,
-                                kv_producer_state,
+                                v_producer_state,
                                 mPageTable,
                                 request_idx,
                                 next_tile_base,
                                 page_size,
                             )
-                    kv_producer_state.advance()
+                    v_producer_state.advance()
                     prefetch_base += stage_tile_rows
 
             cute.arch.sync_threads()
@@ -3783,8 +3793,8 @@ class PagedForwardKernel:
             tile_base += stage_tile_rows
 
         if warp_linear_idx == Int32(0):
-            pipeline_k.producer_tail(kv_producer_state)
-            pipeline_v.producer_tail(kv_producer_state)
+            pipeline_k.producer_tail(k_producer_state)
+            pipeline_v.producer_tail(v_producer_state)
 
 
         for mma_q in cutlass.range_constexpr(num_mma_q):
