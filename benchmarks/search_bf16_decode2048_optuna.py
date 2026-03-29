@@ -75,6 +75,7 @@ class TrialConfig:
 
 @dataclass(frozen=True)
 class TrialResult:
+    score: float
     b12x_mean_us: float
     b12x_ci_low_us: float
     b12x_ci_high_us: float
@@ -83,6 +84,8 @@ class TrialResult:
     cta_tile_q: int
     kv_chunk_size: int
     split_kv: bool
+    max_abs: float
+    cos: float
 
 
 def _build_decode_table(*, exact_plane: bool, chunk_pages: tuple[int, ...]) -> tuple[tuple[int, int], ...]:
@@ -311,14 +314,14 @@ def _run_trial(
     page_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
+    fa_output: torch.Tensor,
     warmup: int,
     replays: int,
+    cos_threshold: float,
 ) -> TrialResult:
     with _scheduler_overrides(config):
         clear_attention_caches()
         b12x_graph, b12x_output, plan = _capture_b12x_graph(
-            # Keep output capture live so kernel side effects remain identical to the
-            # regular benchmark path, even though we do not compare against FA2 here.
             q=q,
             k_cache=k_cache,
             v_cache=v_cache,
@@ -327,12 +330,15 @@ def _run_trial(
             cu_seqlens_q=cu_seqlens_q,
             warmup=warmup,
         )
-        del b12x_output
         b12x_mean_us, b12x_ci_low_us, b12x_ci_high_us, b12x_sem_us = _bench_backend_mean_us(
             b12x_graph,
             replays=replays,
         )
+        max_abs = float((b12x_output - fa_output).abs().max().item())
+        cos = float(bench._cosine_similarity(b12x_output, fa_output))
+        score = 0.0 if cos < cos_threshold else (1.0 / b12x_mean_us)
         return TrialResult(
+            score=score,
             b12x_mean_us=b12x_mean_us,
             b12x_ci_low_us=b12x_ci_low_us,
             b12x_ci_high_us=b12x_ci_high_us,
@@ -341,6 +347,8 @@ def _run_trial(
             cta_tile_q=int(plan.cta_tile_q),
             kv_chunk_size=int(plan.kv_chunk_size),
             split_kv=bool(plan.split_kv),
+            max_abs=max_abs,
+            cos=cos,
         )
 
 
@@ -352,8 +360,10 @@ def _make_objective(
     page_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
+    fa_output: torch.Tensor,
     warmup: int,
     replays: int,
+    cos_threshold: float,
 ) -> Any:
     def objective(trial: optuna.Trial) -> float:
         config = _sample_config(trial)
@@ -366,16 +376,20 @@ def _make_objective(
                 page_table=page_table,
                 cache_seqlens=cache_seqlens,
                 cu_seqlens_q=cu_seqlens_q,
+                fa_output=fa_output,
                 warmup=warmup,
                 replays=replays,
+                cos_threshold=cos_threshold,
             )
         except Exception as exc:
             trial.set_user_attr("status", "crash")
             trial.set_user_attr("error", f"{type(exc).__name__}: {exc}")
             trial.set_user_attr("traceback", traceback.format_exc(limit=20))
-            raise
+            trial.set_user_attr("score", 0.0)
+            return 0.0
 
-        trial.set_user_attr("status", "ok")
+        trial.set_user_attr("status", "ok" if result.cos >= cos_threshold else "bad_cos")
+        trial.set_user_attr("score", result.score)
         trial.set_user_attr("plan_desc", result.plan_desc)
         trial.set_user_attr("cta_tile_q", result.cta_tile_q)
         trial.set_user_attr("kv_chunk_size", result.kv_chunk_size)
@@ -384,26 +398,30 @@ def _make_objective(
         trial.set_user_attr("b12x_ci_low_us", result.b12x_ci_low_us)
         trial.set_user_attr("b12x_ci_high_us", result.b12x_ci_high_us)
         trial.set_user_attr("b12x_sem_us", result.b12x_sem_us)
-        return result.b12x_mean_us
+        trial.set_user_attr("max_abs", result.max_abs)
+        trial.set_user_attr("cos", result.cos)
+        return result.score
 
     return objective
 
 
 def _print_top_trials(study: optuna.Study, *, limit: int) -> None:
     complete = [trial for trial in study.trials if trial.state == optuna.trial.TrialState.COMPLETE]
-    complete.sort(key=lambda trial: float(trial.value))
+    complete.sort(key=lambda trial: float(trial.user_attrs.get("b12x_mean_us", float("inf"))))
     print(f"top {min(limit, len(complete))} trials:")
     for trial in complete[:limit]:
         print(
             {
                 "trial": trial.number,
-                "b12x_mean_us": round(float(trial.value), 6),
+                "score": round(float(trial.value), 9),
+                "b12x_mean_us": trial.user_attrs.get("b12x_mean_us"),
                 "b12x_ci_low_us": trial.user_attrs.get("b12x_ci_low_us"),
                 "b12x_ci_high_us": trial.user_attrs.get("b12x_ci_high_us"),
                 "plan": trial.user_attrs.get("plan_desc"),
                 "cta_tile_q": trial.user_attrs.get("cta_tile_q"),
                 "kv_chunk_size": trial.user_attrs.get("kv_chunk_size"),
                 "split_kv": trial.user_attrs.get("split_kv"),
+                "cos": trial.user_attrs.get("cos"),
                 "params": trial.params,
             }
         )
@@ -415,6 +433,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--replays", type=int, default=1000)
+    parser.add_argument("--cos-threshold", type=float, default=0.999)
     parser.add_argument("--study-name", type=str, default=DEFAULT_STUDY_NAME)
     parser.add_argument(
         "--journal-path",
@@ -435,6 +454,28 @@ def main() -> None:
     journal_path.parent.mkdir(parents=True, exist_ok=True)
 
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _build_trial_inputs(args.seed)
+    clear_attention_caches()
+    fa_graph, fa_output = bench._capture_flashinfer_fa2_graph(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        q_seqlen=1,
+        page_size=64,
+        q_heads=8,
+        kv_heads=1,
+        head_dim=256,
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        k_scale=None,
+        v_scale=None,
+        workspace_bytes=512 * 1024 * 1024,
+        warmup=1,
+    )
+    # Materialize one reference replay once; trials only compare against this output.
+    fa_graph.replay()
+    torch.cuda.synchronize()
 
     sampler = optuna.samplers.TPESampler(
         seed=args.seed,
@@ -448,7 +489,7 @@ def main() -> None:
     study = optuna.create_study(
         study_name=args.study_name,
         storage=storage,
-        direction="minimize",
+        direction="maximize",
         sampler=sampler,
         load_if_exists=True,
     )
@@ -462,8 +503,10 @@ def main() -> None:
         page_table=page_table,
         cache_seqlens=cache_seqlens,
         cu_seqlens_q=cu_seqlens_q,
+        fa_output=fa_output,
         warmup=args.warmup,
         replays=args.replays,
+        cos_threshold=args.cos_threshold,
     )
     study.optimize(objective, n_trials=args.trials, timeout=None if args.timeout <= 0 else args.timeout)
 
@@ -472,13 +515,15 @@ def main() -> None:
     print(
         {
             "trial": best.number,
-            "b12x_mean_us": round(float(best.value), 6),
+            "score": round(float(best.value), 9),
+            "b12x_mean_us": best.user_attrs.get("b12x_mean_us"),
             "b12x_ci_low_us": best.user_attrs.get("b12x_ci_low_us"),
             "b12x_ci_high_us": best.user_attrs.get("b12x_ci_high_us"),
             "plan": best.user_attrs.get("plan_desc"),
             "cta_tile_q": best.user_attrs.get("cta_tile_q"),
             "kv_chunk_size": best.user_attrs.get("kv_chunk_size"),
             "split_kv": best.user_attrs.get("split_kv"),
+            "cos": best.user_attrs.get("cos"),
             "params": best.params,
         }
     )
