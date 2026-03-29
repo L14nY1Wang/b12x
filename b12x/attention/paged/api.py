@@ -322,8 +322,8 @@ def _build_bf16_extend_raw_forward_kernel(
     )
 
 
-def _use_bf16_extend_raw_long_form(cache_seqlens: torch.Tensor) -> bool:
-    return int(torch.max(cache_seqlens).item()) < 32768
+def _use_bf16_extend_raw_long_form(kv_chunk_size: int) -> bool:
+    return kv_chunk_size < 2048
 
 
 @lru_cache(maxsize=16)
@@ -436,7 +436,7 @@ def paged_attention_forward(
             plan.split_kv,
             mxfp8_turbo,
             enable_mxfp8_pv,
-            _use_bf16_extend_raw_long_form(cache_seqlens),
+            _use_bf16_extend_raw_long_form(plan.kv_chunk_size),
         )
     elif _use_fp8_extend_raw_specialization(
         traits,
