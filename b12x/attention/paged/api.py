@@ -20,10 +20,8 @@ from .forward_paged import (
     PagedForwardKernel,
     PagedFp8DecodeRawForwardKernel,
     PagedFp8ExtendRawForwardKernel,
-    PagedFp8RawPlaneDumpKernel,
 )
 from .merge import PagedPersistentMergeKernel, default_paged_persistent_ctas
-from .planner import PagedPlan
 from .traits import PagedForwardTraits, select_paged_forward_traits_from_plan
 from .workspace import PagedAttentionWorkspace
 
@@ -74,82 +72,6 @@ def _attn_turbo_enabled(attn_mode: Literal["default", "turbo"] | None) -> bool:
     if attn_mode == "default":
         return False
     return os.environ.get("B12X_ATTN", "").upper() == "TURBO"
-
-
-@lru_cache(maxsize=4)
-def _dummy_plane_tma_desc_ptrs(device_index: int) -> torch.Tensor:
-    return torch.zeros((1,), dtype=torch.int64, device=torch.device("cuda", device_index))
-
-
-def _encode_plane_tma_descriptors(
-    cache: torch.Tensor,
-    *,
-    plane_cols: int,
-    tile_rows: int | None = None,
-) -> torch.Tensor:
-    if cache.ndim != 4:
-        raise ValueError("cache must have shape [num_pages, page_size, kv_heads, head_dim]")
-    num_pages, page_size, kv_heads, head_dim = [int(dim) for dim in cache.shape]
-    if plane_cols <= 0 or head_dim % plane_cols != 0:
-        raise ValueError(f"plane_cols={plane_cols} must divide head_dim={head_dim}")
-    if tile_rows is None:
-        tile_rows = page_size
-    if tile_rows <= 0 or page_size % tile_rows != 0:
-        raise ValueError(f"tile_rows={tile_rows} must be positive and divide page_size={page_size}")
-
-    swizzle_name = os.environ.get("B12X_PAGED_KV_TMA_PLANE_SWIZZLE", "")
-    swizzle = (
-        cuda.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_NONE
-        if swizzle_name == "none"
-        else cuda.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_128B
-    )
-    if cache.dtype == torch.float8_e4m3fn:
-        data_type = cuda.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_UINT8
-        elem_bytes = 1
-    elif cache.dtype == torch.bfloat16:
-        data_type = cuda.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_BFLOAT16
-        elem_bytes = 2
-    elif cache.dtype == torch.float16:
-        data_type = cuda.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_FLOAT16
-        elem_bytes = 2
-    else:
-        raise TypeError(f"unsupported plane TMA cache dtype {cache.dtype}")
-    U64 = cuda.cuuint64_t
-    U32 = cuda.cuuint32_t
-    row_bytes = kv_heads * head_dim * elem_bytes
-    total_rows = num_pages * page_size
-    base_ptr = int(cache.view(torch.uint8).data_ptr())
-    head_stride_bytes = head_dim * elem_bytes
-
-    host_desc = torch.empty((kv_heads, 16), dtype=torch.uint64)
-    for kv_head_idx in range(kv_heads):
-        result, tensor_map = cuda.cuTensorMapEncodeTiled(
-            data_type,
-            2,
-            base_ptr + kv_head_idx * head_stride_bytes,
-            [U64(head_dim), U64(total_rows)],
-            [U64(row_bytes)],
-            [U32(plane_cols), U32(tile_rows)],
-            [U32(1), U32(1)],
-            cuda.CUtensorMapInterleave.CU_TENSOR_MAP_INTERLEAVE_NONE,
-            swizzle,
-            cuda.CUtensorMapL2promotion.CU_TENSOR_MAP_L2_PROMOTION_NONE,
-            cuda.CUtensorMapFloatOOBfill.CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
-        )
-        if result != cuda.CUresult.CUDA_SUCCESS:
-            raise RuntimeError(f"cuTensorMapEncodeTiled failed: {result}")
-        host_desc[kv_head_idx] = torch.tensor(
-            [int(word) for word in tensor_map.opaque],
-            dtype=torch.uint64,
-        )
-    return host_desc.to(device=cache.device, non_blocking=False)
-
-
-def _descriptor_row_ptrs(desc: torch.Tensor) -> torch.Tensor:
-    row_bytes = int(desc.stride(0)) * desc.element_size()
-    base_ptr = int(desc.data_ptr())
-    ptrs = [base_ptr + idx * row_bytes for idx in range(int(desc.shape[0]))]
-    return torch.tensor(ptrs, dtype=torch.int64, device=desc.device)
 
 
 def _use_fp8_decode_raw_specialization(
@@ -341,40 +263,6 @@ def _build_merge_kernel(
     )
 
 
-@lru_cache(maxsize=4)
-def _build_fp8_planewords_dump_kernel() -> PagedFp8RawPlaneDumpKernel:
-    return PagedFp8RawPlaneDumpKernel()
-
-
-def _get_cached_plane_tma_descs(
-    workspace: PagedAttentionWorkspace,
-    *,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    plane_cols: int,
-    tile_rows: int,
-) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor, torch.Tensor] | None:
-    cached = getattr(workspace, "_live_plane_tma_desc_cache", None)
-    if cached is None:
-        return None
-    key = (
-        int(k_cache.data_ptr()),
-        int(v_cache.data_ptr()),
-        tuple(k_cache.shape),
-        tuple(v_cache.shape),
-        plane_cols,
-        tile_rows,
-    )
-    if cached.get("key") != key:
-        return None
-    return (
-        cached.get("k_desc"),
-        cached.get("v_desc"),
-        cached["k_ptrs"],
-        cached["v_ptrs"],
-    )
-
-
 def paged_attention_forward(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -488,68 +376,8 @@ def paged_attention_forward(
     block_valid_mask_arg = _to_kernel_tensor(workspace.block_valid_mask, cutlass.Int32, assumed_align=4)
     k_descale_arg = _to_kernel_tensor(k_descale, cutlass.Float32)
     v_descale_arg = _to_kernel_tensor(v_descale, cutlass.Float32)
-    dummy_desc_ptrs = _dummy_plane_tma_desc_ptrs(torch.cuda.current_device())
-    k_tma_desc_ptrs = dummy_desc_ptrs
-    v_tma_desc_ptrs = dummy_desc_ptrs
-    k_tma_desc = None
-    v_tma_desc = None
-    if getattr(forward_kernel, "use_paged_kv_tma_raw_desc_issue", False) or getattr(
-        forward_kernel, "use_paged_kv_tma_fp8_raw_issue", False
-    ):
-        cached_descs = _get_cached_plane_tma_descs(
-            workspace,
-            k_cache=k_cache,
-            v_cache=v_cache,
-            plane_cols=forward_kernel.kv_tma_plane_head_dim,
-            tile_rows=forward_kernel.stage_tile_rows,
-        )
-        if cached_descs is not None:
-            k_tma_desc, v_tma_desc, k_tma_desc_ptrs, v_tma_desc_ptrs = cached_descs
-        else:
-            k_tma_desc = _encode_plane_tma_descriptors(
-                k_cache,
-                plane_cols=forward_kernel.kv_tma_plane_head_dim,
-                tile_rows=forward_kernel.stage_tile_rows,
-            )
-            k_tma_desc_ptrs = _descriptor_row_ptrs(k_tma_desc)
-            v_tma_desc = _encode_plane_tma_descriptors(
-                v_cache,
-                plane_cols=forward_kernel.kv_tma_plane_head_dim,
-                tile_rows=forward_kernel.stage_tile_rows,
-            )
-            v_tma_desc_ptrs = _descriptor_row_ptrs(v_tma_desc)
-            workspace._live_plane_tma_desc_cache = {
-                "key": (
-                    int(k_cache.data_ptr()),
-                    int(v_cache.data_ptr()),
-                    tuple(k_cache.shape),
-                    tuple(v_cache.shape),
-                    forward_kernel.kv_tma_plane_head_dim,
-                    forward_kernel.stage_tile_rows,
-                ),
-                "k_desc": k_tma_desc,
-                "v_desc": v_tma_desc,
-                "k_ptrs": k_tma_desc_ptrs,
-                "v_ptrs": v_tma_desc_ptrs,
-            }
-    workspace._live_plane_tma_descs = (k_tma_desc, v_tma_desc, k_tma_desc_ptrs, v_tma_desc_ptrs)
-    k_tma_desc_arg = _to_kernel_tensor(k_tma_desc_ptrs, cutlass.Int64, assumed_align=8)
-    v_tma_desc_arg = _to_kernel_tensor(v_tma_desc_ptrs, cutlass.Int64, assumed_align=8)
 
     stream = current_cuda_stream()
-    if getattr(forward_kernel, "use_paged_kv_tma_fp8_raw_issue", False) and os.environ.get(
-        "B12X_PAGED_KV_DEBUG_DUMP", ""
-    ) == "PLANEWORDS":
-        dump_kernel = _build_fp8_planewords_dump_kernel()
-        debug_words = torch.zeros_like(forward_output.view(torch.int32))
-        dump_kernel(
-            page_table_arg,
-            _to_kernel_tensor(debug_words, cutlass.Int32, assumed_align=4),
-            v_tma_desc_arg,
-            stream,
-        )
-        forward_output.view(torch.int32).copy_(debug_words)
-        return forward_output, forward_lse
     forward_args = (
         q_arg,
         k_cache_arg,
@@ -567,8 +395,6 @@ def paged_attention_forward(
         forward_lse_arg,
         k_descale_arg,
         v_descale_arg,
-        k_tma_desc_arg,
-        v_tma_desc_arg,
         stream,
     )
     forward_cache_key = (
@@ -633,5 +459,3 @@ def clear_paged_caches() -> None:
     _build_fp8_extend_raw_forward_kernel.cache_clear()
     _build_bf16_extend_raw_forward_kernel.cache_clear()
     _build_merge_kernel.cache_clear()
-    _build_fp8_planewords_dump_kernel.cache_clear()
-    _dummy_plane_tma_desc_ptrs.cache_clear()

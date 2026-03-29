@@ -77,6 +77,12 @@ class PagedAttentionWorkspace:
     _plan_v_cache: torch.Tensor | None = None
     _plan: PagedPlan | None = None
 
+    # Pre-compiled kernel state (set by compile_paged_kernels in api.py).
+    _compiled_forward: object | None = None
+    _compiled_merge: object | None = None
+    _compiled_forward_kernel: object | None = None
+    _compiled_key: tuple | None = None
+
     @classmethod
     def for_contract(
         cls,
