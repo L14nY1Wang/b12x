@@ -3135,19 +3135,19 @@ class PagedForwardKernel:
                             )
                         _exit_thread()
 
-                    p_frag_scalar = None
-                    _literal_update_mdo_states_fp32_pack_p(
-                        frag_S,
-                        o_frag,
-                        m_frag,
-                        d_frag,
-                        p_frag,
-                        self.softmax_scale_log2,
-                        num_mma_q,
-                        num_mma_kv,
-                        num_mma_d_vo,
-                        p_frag_scalar,
-                    )
+                p_frag_scalar = None
+                _literal_update_mdo_states_fp32_pack_p(
+                    frag_S,
+                    o_frag,
+                    m_frag,
+                    d_frag,
+                    p_frag,
+                    self.softmax_scale_log2,
+                    num_mma_q,
+                    num_mma_kv,
+                    num_mma_d_vo,
+                    p_frag_scalar,
+                )
                 if const_expr(self.debug_dump_paged_kv_pregs):
                     if (
                         work_idx == Int32(0)
@@ -4001,6 +4001,12 @@ class PagedFp8DecodeRawForwardKernel:
         m_frag = cute.make_rmem_tensor(cute.make_layout((1, 2), stride=(2, 1)), Float32)
         d_frag = cute.make_rmem_tensor(cute.make_layout((1, 2), stride=(2, 1)), Float32)
         p_frag = cute.make_rmem_tensor(frag_p_layout, Uint32)
+        for mma_d in cutlass.range_constexpr(self.num_mma_d_vo):
+            for reg_id in cutlass.range_constexpr(8):
+                o_frag[0, mma_d, reg_id] = Float32(0.0)
+        for row_slot in cutlass.range_constexpr(2):
+            m_frag[0, row_slot] = Float32(-Float32.inf)
+            d_frag[0, row_slot] = Float32(1.0)
 
         producer_state = pipeline.PipelineStateSimple(1, Int32(0))
         consumer_state = pipeline.PipelineStateSimple(1, Int32(0))
@@ -4072,12 +4078,6 @@ class PagedFp8DecodeRawForwardKernel:
                     q_head_idx_frag[0, row_slot] = Int32(0)
                     q_row_idx_frag[0, row_slot] = Int32(0)
                     causal_k_limit[0, row_slot] = Int32(-1)
-            for mma_d in cutlass.range_constexpr(self.num_mma_d_vo):
-                for reg_id in cutlass.range_constexpr(8):
-                    o_frag[0, mma_d, reg_id] = Float32(0.0)
-            for row_slot in cutlass.range_constexpr(2):
-                m_frag[0, row_slot] = Float32(-Float32.inf)
-                d_frag[0, row_slot] = Float32(1.0)
 
             frag_S = cute.make_rmem_tensor(frag_s_layout, Float32)
             frag_S.fill(0.0)

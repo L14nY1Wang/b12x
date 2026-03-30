@@ -41,9 +41,10 @@ def _make_workspace(
     )
 
 
-def _run_turbo_decode_graph_check(
+def _run_decode_graph_check(
     *,
     cache_seqlen: int,
+    b12x_attn_mode: str = "default",
 ) -> tuple[torch.Tensor, torch.Tensor, str]:
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_uniform_paged_inputs(
         batch=8,
@@ -73,7 +74,7 @@ def _run_turbo_decode_graph_check(
         k_descale=k_descale,
         v_descale=v_descale,
         warmup=1,
-        b12x_attn_mode="turbo",
+        b12x_attn_mode=b12x_attn_mode,
     )
     _fa2_graph, fa2_out = _capture_flashinfer_fa2_graph(
         q=q,
@@ -187,7 +188,7 @@ def test_paged_forward_matches_reference_without_split_fp8_decode_batch8() -> No
 @torch.inference_mode()
 def test_paged_forward_turbo_matches_reference_without_split_fp8_decode_batch8() -> None:
     require_sm120()
-    output, fa2_out, plan_desc = _run_turbo_decode_graph_check(cache_seqlen=64)
+    output, fa2_out, plan_desc = _run_decode_graph_check(cache_seqlen=64, b12x_attn_mode="turbo")
     assert plan_desc == "chunk=128,nosplit"
     assert (output - fa2_out).abs().max().item() <= 0.02
     assert _cosine_similarity(output, fa2_out) >= 0.998
@@ -277,9 +278,18 @@ def test_paged_forward_matches_reference_with_split_fp8_kv() -> None:
 
 
 @torch.inference_mode()
+def test_paged_forward_matches_reference_with_split_fp8_decode() -> None:
+    require_sm120()
+    output, fa2_out, plan_desc = _run_decode_graph_check(cache_seqlen=512)
+    assert plan_desc.endswith(",split")
+    assert (output - fa2_out).abs().max().item() <= 0.01
+    assert _cosine_similarity(output, fa2_out) >= 0.999
+
+
+@torch.inference_mode()
 def test_paged_forward_turbo_matches_reference_with_split_fp8_decode() -> None:
     require_sm120()
-    output, fa2_out, plan_desc = _run_turbo_decode_graph_check(cache_seqlen=8192)
+    output, fa2_out, plan_desc = _run_decode_graph_check(cache_seqlen=8192, b12x_attn_mode="turbo")
     assert plan_desc == "chunk=384,split"
     assert (output - fa2_out).abs().max().item() <= 0.01
     assert _cosine_similarity(output, fa2_out) >= 0.998
