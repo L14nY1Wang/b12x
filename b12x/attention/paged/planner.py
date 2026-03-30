@@ -13,84 +13,41 @@ No kernel-side split LUT or legacy scheduler assumptions live here.
 
 from __future__ import annotations
 
+from bisect import bisect_left
 from dataclasses import dataclass
 from typing import Literal
 
 import torch
 
 _FP8_KV_DTYPE = torch.float8_e4m3fn
-_PAGED_EXTEND_FP8_CHUNK_TABLE_PAGES = (
-    (1, 1),
-    (2, 1),
-    (4, 1),
-    (8, 1),
-    (16, 1),
-    (32, 2),
-    (64, 3),
-    (128, 6),
-    (256, 6),
-    (512, 24),
-    (1024, 24),
-    (2048, 24),
+_BF16_DECODE_UPPER_BOUNDS = (
+    4, 6, 7, 8, 31, 104, 120, 160, 200, 223, 238, 260, 265, 280, 286,
+    297, 315, 351, 372, 373, 382, 383, 384, 441, 442, 497, 498, 560,
+    582, 583, 584, 587, 700, 701, 702, 719, 746, 747, 748, 789, 856,
+    857, 859, 864, 865, 866, 1007, 1008, 1009, 1010, 1011, 1013, 1014,
+    1015, 1024,
 )
-_PAGED_EXTEND_FP8_GRAPH_CHUNK_TABLE_PAGES = (
-    (1, 1),
-    (2, 1),
-    (4, 1),
-    (8, 1),
-    (16, 1),
-    (32, 2),
-    (64, 3),
-    (128, 6),
-    (256, 6),
-    (512, 24),
-    (1024, 24),
-    (2048, 24),
+_BF16_DECODE_WINNERS = (
+    1, 3, 5, 8, 9, 10, 13, 14, 17, 18, 20, 22, 24, 26, 28,
+    29, 32, 35, 37, 40, 42, 43, 47, 48, 51, 56, 58, 60,
+    62, 64, 66, 69, 73, 75, 78, 81, 82, 84, 89, 94, 95,
+    97, 99, 101, 103, 106, 109, 111, 113, 115, 118, 120, 122,
+    125, 127,
 )
-_PAGED_EXTEND_BF16_CHUNK_TABLE_PAGES = (
-    (1, 1),
-    (2, 1),
-    (4, 1),
-    (8, 1),
-    (16, 1),
-    (32, 2),
-    (64, 3),
-    (128, 6),
-    (256, 6),
-    (512, 32),
-    (1024, 32),
-    (2048, 32),
+_FP8_DECODE_UPPER_BOUNDS = (
+    1, 2, 3, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 38, 55, 69, 96,
+    129, 163, 205, 249, 298, 303, 325, 342, 367, 393, 420, 430, 453,
+    463, 466, 474, 503, 531, 547, 558, 578, 580, 612, 628, 647, 665,
+    705, 719, 780, 786, 793, 820, 832, 854, 878, 887, 951, 1370, 1406,
+    1465, 1507, 1545, 1609, 1631, 1648, 1649, 1762, 1801, 1802, 1827,
+    1855, 1960, 1961, 2048,
 )
-_PAGED_DECODE_BF16_CHUNK_TABLE_PAGES = (
-    (1, 1),
-    (2, 2),
-    (16, 1),
-    (32, 2),
-    (64, 3),
-    (128, 6),
-    (256, 12),
-    (320, 16),
-    (512, 48),
-    (640, 64),
-    (960, 96),
-    (2048, 128),
-)
-_PAGED_DECODE_FP8_CHUNK_TABLE_PAGES = (
-    (1, 2),
-    (2, 2),
-    (4, 2),
-    (16, 1),
-    (32, 2),
-    (64, 3),
-    (128, 6),
-    (256, 12),
-    (320, 16),
-    (512, 24),
-    (640, 32),
-    (768, 48),
-    (1024, 64),
-    (1536, 96),
-    (2048, 128),
+_FP8_DECODE_WINNERS = (
+    1, 2, 3, 4, 6, 8, 10, 13, 14, 15, 16, 17, 18, 19, 22, 23, 24, 25,
+    26, 28, 30, 32, 34, 36, 38, 40, 41, 42, 43, 44, 47, 48, 50, 51, 52,
+    53, 54, 56, 57, 58, 59, 60, 61, 62, 63, 65, 66, 67, 68, 69, 70, 71,
+    78, 85, 93, 95, 97, 99, 101, 102, 103, 105, 111, 118, 121, 127, 134,
+    136, 144, 145, 155,
 )
 
 
@@ -154,44 +111,33 @@ def _paged_determine_cta_tile_q(
     return cta_tile_q
 
 
-def _prefill_binary_search_kv_chunk_size(
-    *,
-    enable_cuda_graph: bool,
-    max_batch_size_if_split: int,
-    packed_qo_len_arr: list[int],
-    kv_len_arr: list[int],
-    qo_chunk_size: int,
-    min_kv_chunk_size: int = 1,
-) -> tuple[bool, int]:
-    batch_size = len(packed_qo_len_arr)
-    max_kv_len = max(max(kv_len_arr, default=1), 1)
-    low = min_kv_chunk_size
-    high = max_kv_len
-    while low < high:
-        mid = (low + high) // 2
-        new_batch_size = 0
-        for i in range(batch_size):
-            new_batch_size += _ceil_div(packed_qo_len_arr[i], qo_chunk_size) * _ceil_div(
-                max(kv_len_arr[i], 1), mid
-            )
-        if new_batch_size > max_batch_size_if_split:
-            low = mid + 1
-        else:
-            high = mid
-    return (enable_cuda_graph or low < max_kv_len, low)
+def _stub_chunk_pages(page_count: int) -> int:
+    return max(1, int(round(max(1, int(page_count)) * 0.2)))
 
 
-def _lookup_chunk_pages_from_table(
-    max_effective_kv_pages: int,
-    table: tuple[tuple[int, int | None], ...],
-) -> int | None:
-    for max_pages, chunk_pages in table:
-        if max_effective_kv_pages <= max_pages:
-            return chunk_pages
-    return None
+def bf16_decode_chunk_pages(page_count: int) -> int:
+    page_count = max(1, int(page_count))
+    if page_count <= _BF16_DECODE_UPPER_BOUNDS[-1]:
+        return int(_BF16_DECODE_WINNERS[bisect_left(_BF16_DECODE_UPPER_BOUNDS, page_count)])
+    return max(127, int(round(127 + 0.11732302295918368 * (page_count - 1024))))
 
 
-def _paged_chunk_table_pages(
+def fp8_decode_chunk_pages(page_count: int) -> int:
+    page_count = max(1, int(page_count))
+    if page_count <= _FP8_DECODE_UPPER_BOUNDS[-1]:
+        return int(_FP8_DECODE_WINNERS[bisect_left(_FP8_DECODE_UPPER_BOUNDS, page_count)])
+    return max(227, int(round(227 + 0.047918528318 * (page_count - 2048))))
+
+
+def bf16_extend_chunk_pages(page_count: int) -> int:
+    return max(1, int(page_count))
+
+
+def fp8_extend_chunk_pages(page_count: int) -> int:
+    return max(1, int(page_count))
+
+
+def chunk_pages_for_family(
     *,
     mode: Literal["decode", "extend"],
     q_dtype: torch.dtype,
@@ -201,46 +147,17 @@ def _paged_chunk_table_pages(
     head_dim_vo: int,
     gqa_group_size: int,
     max_effective_kv_pages: int,
-    graph_chunk_policy: bool,
-) -> int | None:
-    """Explicit table-driven chunk override for the tuned serving matrix.
-
-    FlashInfer's planner is tuned around its own kernel/merge cost model. Our
-    current paged backend currently has materially higher per-chunk overhead on
-    the shipped serving matrix, so the same binary-search objective ends up
-    over-partitioning requests in some regimes. Keep these overrides narrow
-    and table-driven.
-    """
-    if page_size != 64 or head_dim_qk != 256 or head_dim_vo != 256 or gqa_group_size != 8:
-        return None
-    if q_dtype != torch.bfloat16:
-        return None
-    if mode == "extend" and kv_dtype == _FP8_KV_DTYPE:
-        table = (
-            _PAGED_EXTEND_FP8_GRAPH_CHUNK_TABLE_PAGES
-            if graph_chunk_policy
-            else _PAGED_EXTEND_FP8_CHUNK_TABLE_PAGES
-        )
-        return _lookup_chunk_pages_from_table(
-            max_effective_kv_pages,
-            table,
-        )
-    if mode == "decode" and kv_dtype == _FP8_KV_DTYPE:
-        return _lookup_chunk_pages_from_table(
-            max_effective_kv_pages,
-            _PAGED_DECODE_FP8_CHUNK_TABLE_PAGES,
-        )
-    if mode == "extend" and kv_dtype == torch.bfloat16:
-        return _lookup_chunk_pages_from_table(
-            max_effective_kv_pages,
-            _PAGED_EXTEND_BF16_CHUNK_TABLE_PAGES,
-        )
+) -> int:
+    del q_dtype, page_size, head_dim_qk, head_dim_vo, gqa_group_size
     if mode == "decode" and kv_dtype == torch.bfloat16:
-        return _lookup_chunk_pages_from_table(
-            max_effective_kv_pages,
-            _PAGED_DECODE_BF16_CHUNK_TABLE_PAGES,
-        )
-    return None
+        return bf16_decode_chunk_pages(max_effective_kv_pages)
+    if mode == "decode" and kv_dtype == _FP8_KV_DTYPE:
+        return fp8_decode_chunk_pages(max_effective_kv_pages)
+    if mode == "extend" and kv_dtype == torch.bfloat16:
+        return bf16_extend_chunk_pages(max_effective_kv_pages)
+    if mode == "extend" and kv_dtype == _FP8_KV_DTYPE:
+        return fp8_extend_chunk_pages(max_effective_kv_pages)
+    raise TypeError(f"unsupported chunk-policy family: mode={mode} kv_dtype={kv_dtype}")
 
 
 def decode_chunk_pages_for_graph(
@@ -256,15 +173,9 @@ def decode_chunk_pages_for_graph(
     """Return the decode split chunk size in pages for graph replay.
 
     Default decode now stays on the split-capable generic family, so replay only
-    needs the runtime chunk size, not a full host work decomposition. For the
-    tuned decode contracts we reuse the explicit table overrides. Outside the
-    tuned table range, `create_paged_plan()` falls back to the binary-search
-    path, which in graph mode immediately selects the minimum chunk size because
-    the decode graph budget is intentionally overprovisioned. Mirror that here
-    without rebuilding the full host plan.
+    needs the runtime chunk size, not a full host work decomposition.
     """
-
-    chunk_pages = _paged_chunk_table_pages(
+    return chunk_pages_for_family(
         mode="decode",
         q_dtype=q_dtype,
         kv_dtype=kv_dtype,
@@ -273,11 +184,32 @@ def decode_chunk_pages_for_graph(
         head_dim_vo=head_dim_vo,
         gqa_group_size=gqa_group_size,
         max_effective_kv_pages=max(max_effective_kv_pages, 1),
-        graph_chunk_policy=True,
     )
-    if chunk_pages is not None:
-        return int(chunk_pages)
-    return max(128 // page_size, 1)
+
+
+def build_decode_chunk_pages_lut(
+    *,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    page_size: int,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    gqa_group_size: int,
+    max_effective_kv_pages: int,
+) -> tuple[int, ...]:
+    max_effective_kv_pages = max(int(max_effective_kv_pages), 1)
+    return tuple(
+        decode_chunk_pages_for_graph(
+            q_dtype=q_dtype,
+            kv_dtype=kv_dtype,
+            page_size=page_size,
+            head_dim_qk=head_dim_qk,
+            head_dim_vo=head_dim_vo,
+            gqa_group_size=gqa_group_size,
+            max_effective_kv_pages=page_count,
+        )
+        for page_count in range(1, max_effective_kv_pages + 1)
+    )
 
 
 @dataclass(frozen=True)
@@ -442,7 +374,6 @@ def create_paged_plan(
         min(_ceil_div(window_left + cta_tile_q, page_size), kv_len) if window_left >= 0 else kv_len
         for kv_len in kv_len_arr
     ]
-    min_kv_chunk_size = max(128 // page_size, 1)
     if max_batch_size_if_split is None:
         max_batch_size_if_split = max(total_num_qo_tiles, 1) * max(max(effective_kv_len_arr), 1)
 
@@ -456,7 +387,7 @@ def create_paged_plan(
         split_kv = False
         kv_chunk_size_pages = fixed_split_size
     else:
-        heuristic_kv_chunk_size_pages = _paged_chunk_table_pages(
+        heuristic_kv_chunk_size_pages = chunk_pages_for_family(
             mode=mode,
             q_dtype=q.dtype,
             kv_dtype=k_cache.dtype,
@@ -465,20 +396,9 @@ def create_paged_plan(
             head_dim_vo=head_dim_vo,
             gqa_group_size=gqa_group_size,
             max_effective_kv_pages=max(max(effective_kv_len_arr), 1),
-            graph_chunk_policy=graph_chunk_policy,
         )
-        if heuristic_kv_chunk_size_pages is not None:
-            split_kv = False
-            kv_chunk_size_pages = heuristic_kv_chunk_size_pages
-        else:
-            split_kv, kv_chunk_size_pages = _prefill_binary_search_kv_chunk_size(
-                enable_cuda_graph=enable_cuda_graph,
-                max_batch_size_if_split=max_batch_size_if_split,
-                packed_qo_len_arr=packed_qo_len_arr,
-                kv_len_arr=effective_kv_len_arr,
-                qo_chunk_size=cta_tile_q,
-                min_kv_chunk_size=min_kv_chunk_size,
-            )
+        split_kv = False
+        kv_chunk_size_pages = heuristic_kv_chunk_size_pages
 
     request_indices: list[int] = []
     qo_tile_indices: list[int] = []

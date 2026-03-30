@@ -93,8 +93,6 @@ def _make_paged_kv_tma_source_tensor(t: cute.Tensor, stage_tile_rows: int):
 
 
 def _make_payload_ptr(payload_u8: cute.Tensor, dtype, offset_bytes: int = 0):
-    # Preserve 128-bit shared alignment when carving typed aliases out of the
-    # byte payload.
     ptr = payload_u8.iterator if offset_bytes == 0 else payload_u8.iterator + offset_bytes
     return cute.recast_ptr(ptr.align(16), dtype=dtype)
 
@@ -104,9 +102,7 @@ def _make_payload_tensor(payload_u8: cute.Tensor, dtype, offset_bytes: int, layo
 
 
 def _make_payload_memrange(payload_u8: cute.Tensor, dtype, offset_bytes: int, num_elems: int):
-    # Rebuild a MemRange alias over the payload slice so CuTe can lower swizzled
-    # shared-memory pointers the same way it does for typed struct fields.
-    return cute.struct._MemRangeData(dtype, num_elems, _make_payload_ptr(payload_u8, dtype, offset_bytes))
+            return cute.struct._MemRangeData(dtype, num_elems, _make_payload_ptr(payload_u8, dtype, offset_bytes))
 
 
 def _get_memrange_tensor(memrange, layout):
@@ -3124,7 +3120,6 @@ class PagedForwardKernel:
                         d_frag[mma_q, 1] = d1
                 pipeline_k.consumer_release(k_consumer_state)
                 next_tile_base = prefetch_base
-                # Let the next K tile start moving while this CTA is still using V.
                 if next_tile_base < chunk_end:
                     if warp_linear_idx == Int32(0):
                         if const_expr(self.kv_tma_plane_count > 2):

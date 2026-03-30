@@ -2,7 +2,15 @@ from __future__ import annotations
 
 import torch
 
-from b12x.attention.paged.planner import create_paged_plan, infer_paged_mode
+from b12x.attention.paged.planner import (
+    bf16_decode_chunk_pages,
+    bf16_extend_chunk_pages,
+    build_decode_chunk_pages_lut,
+    create_paged_plan,
+    fp8_decode_chunk_pages,
+    fp8_extend_chunk_pages,
+    infer_paged_mode,
+)
 from b12x.integration.attention import PagedAttentionWorkspace
 
 
@@ -49,6 +57,10 @@ def _assert_chunk_table(
             cu_seqlens_q,
         )
         assert plan.kv_chunk_size == expected_chunk_pages_by_cache_len[cache_len] * 64
+
+
+def _expected_chunk_size(cache_len: int, chunk_pages_fn) -> int:
+    return chunk_pages_fn((cache_len + 63) // 64) * 64
 
 
 def _make_inputs(
@@ -182,7 +194,7 @@ def test_paged_fp8_auto_chunk_heuristic_uses_larger_decode_chunks() -> None:
     )
 
     assert plan.mode == "decode"
-    assert plan.kv_chunk_size == 6 * 64
+    assert plan.kv_chunk_size == _expected_chunk_size(8192, fp8_decode_chunk_pages)
     assert plan.split_kv is True
 
 
@@ -225,8 +237,8 @@ def test_paged_fp8_auto_chunk_heuristic_uses_coarser_extend_chunks_at_very_long_
     )
 
     assert plan.mode == "extend"
-    assert plan.kv_chunk_size == 24 * 64
-    assert plan.split_kv is True
+    assert plan.kv_chunk_size == _expected_chunk_size(32768, fp8_extend_chunk_pages)
+    assert plan.split_kv is False
 
 
 def test_paged_fp8_auto_chunk_heuristic_keeps_mid_long_extend_chunks_stable() -> None:
@@ -244,8 +256,8 @@ def test_paged_fp8_auto_chunk_heuristic_keeps_mid_long_extend_chunks_stable() ->
     )
 
     assert plan.mode == "extend"
-    assert plan.kv_chunk_size == 6 * 64
-    assert plan.split_kv is True
+    assert plan.kv_chunk_size == _expected_chunk_size(8192, fp8_extend_chunk_pages)
+    assert plan.split_kv is False
 
 
 def test_paged_fp8_auto_chunk_heuristic_uses_single_page_chunks_for_small_mid_extend() -> None:
@@ -263,8 +275,8 @@ def test_paged_fp8_auto_chunk_heuristic_uses_single_page_chunks_for_small_mid_ex
     )
 
     assert plan.mode == "extend"
-    assert plan.kv_chunk_size == 1 * 64
-    assert plan.split_kv is True
+    assert plan.kv_chunk_size == _expected_chunk_size(512, fp8_extend_chunk_pages)
+    assert plan.split_kv is False
 
 
 def test_paged_fp8_auto_chunk_heuristic_uses_two_page_chunks_for_mid_extend() -> None:
@@ -282,8 +294,8 @@ def test_paged_fp8_auto_chunk_heuristic_uses_two_page_chunks_for_mid_extend() ->
     )
 
     assert plan.mode == "extend"
-    assert plan.kv_chunk_size == 2 * 64
-    assert plan.split_kv is True
+    assert plan.kv_chunk_size == _expected_chunk_size(2048, fp8_extend_chunk_pages)
+    assert plan.split_kv is False
 
 
 def test_paged_fp8_auto_chunk_heuristic_uses_three_page_chunks_for_extend_4096() -> None:
@@ -301,8 +313,8 @@ def test_paged_fp8_auto_chunk_heuristic_uses_three_page_chunks_for_extend_4096()
     )
 
     assert plan.mode == "extend"
-    assert plan.kv_chunk_size == 3 * 64
-    assert plan.split_kv is True
+    assert plan.kv_chunk_size == _expected_chunk_size(4096, fp8_extend_chunk_pages)
+    assert plan.split_kv is False
 
 
 def test_paged_fp8_auto_chunk_heuristic_uses_coarser_decode_chunks_at_very_long_context() -> None:
@@ -320,7 +332,7 @@ def test_paged_fp8_auto_chunk_heuristic_uses_coarser_decode_chunks_at_very_long_
     )
 
     assert plan.mode == "decode"
-    assert plan.kv_chunk_size == 24 * 64
+    assert plan.kv_chunk_size == _expected_chunk_size(32768, fp8_decode_chunk_pages)
     assert plan.split_kv is True
 
 
@@ -341,8 +353,8 @@ def test_paged_bf16_auto_chunk_heuristic_uses_single_page_chunks_for_small_exten
         )
 
         assert plan.mode == "extend"
-        assert plan.kv_chunk_size == 1 * 64
-        assert plan.split_kv is True
+        assert plan.kv_chunk_size == _expected_chunk_size(cache_len, bf16_extend_chunk_pages)
+        assert plan.split_kv is False
 
 
 def test_paged_bf16_auto_chunk_heuristic_uses_two_pages_for_extend_2048() -> None:
@@ -361,8 +373,8 @@ def test_paged_bf16_auto_chunk_heuristic_uses_two_pages_for_extend_2048() -> Non
     )
 
     assert plan.mode == "extend"
-    assert plan.kv_chunk_size == 2 * 64
-    assert plan.split_kv is True
+    assert plan.kv_chunk_size == _expected_chunk_size(2048, bf16_extend_chunk_pages)
+    assert plan.split_kv is False
 
 
 def test_paged_bf16_auto_chunk_heuristic_uses_three_pages_for_extend_4096() -> None:
@@ -381,8 +393,8 @@ def test_paged_bf16_auto_chunk_heuristic_uses_three_pages_for_extend_4096() -> N
     )
 
     assert plan.mode == "extend"
-    assert plan.kv_chunk_size == 3 * 64
-    assert plan.split_kv is True
+    assert plan.kv_chunk_size == _expected_chunk_size(4096, bf16_extend_chunk_pages)
+    assert plan.split_kv is False
 
 
 def test_paged_bf16_auto_chunk_heuristic_uses_three_pages_for_extend_8192() -> None:
@@ -401,8 +413,8 @@ def test_paged_bf16_auto_chunk_heuristic_uses_three_pages_for_extend_8192() -> N
     )
 
     assert plan.mode == "extend"
-    assert plan.kv_chunk_size == 6 * 64
-    assert plan.split_kv is True
+    assert plan.kv_chunk_size == _expected_chunk_size(8192, bf16_extend_chunk_pages)
+    assert plan.split_kv is False
 
 
 def test_paged_bf16_auto_chunk_heuristic_uses_six_pages_for_extend_16384() -> None:
@@ -421,8 +433,8 @@ def test_paged_bf16_auto_chunk_heuristic_uses_six_pages_for_extend_16384() -> No
     )
 
     assert plan.mode == "extend"
-    assert plan.kv_chunk_size == 6 * 64
-    assert plan.split_kv is True
+    assert plan.kv_chunk_size == _expected_chunk_size(16384, bf16_extend_chunk_pages)
+    assert plan.split_kv is False
 
 
 def test_paged_bf16_auto_chunk_heuristic_uses_thirty_two_pages_for_extend_32768() -> None:
@@ -441,8 +453,8 @@ def test_paged_bf16_auto_chunk_heuristic_uses_thirty_two_pages_for_extend_32768(
     )
 
     assert plan.mode == "extend"
-    assert plan.kv_chunk_size == 32 * 64
-    assert plan.split_kv is True
+    assert plan.kv_chunk_size == _expected_chunk_size(32768, bf16_extend_chunk_pages)
+    assert plan.split_kv is False
 
 
 def test_paged_bf16_auto_chunk_heuristic_uses_two_pages_for_decode_2048() -> None:
@@ -461,7 +473,7 @@ def test_paged_bf16_auto_chunk_heuristic_uses_two_pages_for_decode_2048() -> Non
     )
 
     assert plan.mode == "decode"
-    assert plan.kv_chunk_size == 2 * 64
+    assert plan.kv_chunk_size == _expected_chunk_size(2048, bf16_decode_chunk_pages)
     assert plan.split_kv is True
 
 
@@ -481,7 +493,7 @@ def test_paged_bf16_auto_chunk_heuristic_uses_six_pages_for_decode_8192() -> Non
     )
 
     assert plan.mode == "decode"
-    assert plan.kv_chunk_size == 6 * 64
+    assert plan.kv_chunk_size == _expected_chunk_size(8192, bf16_decode_chunk_pages)
     assert plan.split_kv is True
 
 
@@ -501,7 +513,7 @@ def test_paged_bf16_auto_chunk_heuristic_uses_forty_eight_pages_for_decode_32768
     )
 
     assert plan.mode == "decode"
-    assert plan.kv_chunk_size == 48 * 64
+    assert plan.kv_chunk_size == _expected_chunk_size(32768, bf16_decode_chunk_pages)
     assert plan.split_kv is True
 
 
@@ -510,24 +522,7 @@ def test_paged_decode_fp8_chunk_policy_is_explicit_out_to_128k() -> None:
         q_seqlens=[1] * 8,
         kv_dtype=torch.float8_e4m3fn,
         expected_chunk_pages_by_cache_len={
-            1: 2,
-            2: 2,
-            4: 2,
-            8: 2,
-            16: 2,
-            32: 2,
-            64: 2,
-            128: 2,
-            256: 2,
-            512: 1,
-            1024: 1,
-            2048: 2,
-            4096: 3,
-            8192: 6,
-            16384: 12,
-            32768: 24,
-            65536: 64,
-            131072: 128,
+            cache_len: fp8_decode_chunk_pages((cache_len + 63) // 64) for cache_len in _EXPLICIT_TOKEN_LENGTHS
         },
     )
 
@@ -537,24 +532,7 @@ def test_paged_decode_bf16_chunk_policy_is_explicit_out_to_128k() -> None:
         q_seqlens=[1] * 8,
         kv_dtype=torch.bfloat16,
         expected_chunk_pages_by_cache_len={
-            1: 1,
-            2: 1,
-            4: 1,
-            8: 1,
-            16: 1,
-            32: 1,
-            64: 1,
-            128: 2,
-            256: 1,
-            512: 1,
-            1024: 1,
-            2048: 2,
-            4096: 3,
-            8192: 6,
-            16384: 12,
-            32768: 48,
-            65536: 128,
-            131072: 128,
+            cache_len: bf16_decode_chunk_pages((cache_len + 63) // 64) for cache_len in _EXPLICIT_TOKEN_LENGTHS
         },
     )
 
@@ -564,24 +542,7 @@ def test_paged_extend_fp8_chunk_policy_is_explicit_out_to_128k() -> None:
         q_seqlens=[6] * 8,
         kv_dtype=torch.float8_e4m3fn,
         expected_chunk_pages_by_cache_len={
-            1: 1,
-            2: 1,
-            4: 1,
-            8: 1,
-            16: 1,
-            32: 1,
-            64: 1,
-            128: 1,
-            256: 1,
-            512: 1,
-            1024: 1,
-            2048: 2,
-            4096: 3,
-            8192: 6,
-            16384: 6,
-            32768: 24,
-            65536: 24,
-            131072: 24,
+            cache_len: fp8_extend_chunk_pages((cache_len + 63) // 64) for cache_len in _EXPLICIT_TOKEN_LENGTHS
         },
     )
 
@@ -591,23 +552,24 @@ def test_paged_extend_bf16_chunk_policy_is_explicit_out_to_128k() -> None:
         q_seqlens=[6] * 8,
         kv_dtype=torch.bfloat16,
         expected_chunk_pages_by_cache_len={
-            1: 1,
-            2: 1,
-            4: 1,
-            8: 1,
-            16: 1,
-            32: 1,
-            64: 1,
-            128: 1,
-            256: 1,
-            512: 1,
-            1024: 1,
-            2048: 2,
-            4096: 3,
-            8192: 6,
-            16384: 6,
-            32768: 32,
-            65536: 32,
-            131072: 32,
+            cache_len: bf16_extend_chunk_pages((cache_len + 63) // 64) for cache_len in _EXPLICIT_TOKEN_LENGTHS
         },
     )
+
+
+def test_build_decode_chunk_pages_lut_matches_bf16_decode_function() -> None:
+    lut = build_decode_chunk_pages_lut(
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        page_size=64,
+        head_dim_qk=256,
+        head_dim_vo=256,
+        gqa_group_size=8,
+        max_effective_kv_pages=2048,
+    )
+
+    assert lut[0] == bf16_decode_chunk_pages(1)
+    assert lut[127] == bf16_decode_chunk_pages(128)
+    assert lut[511] == bf16_decode_chunk_pages(512)
+    assert lut[1023] == bf16_decode_chunk_pages(1024)
+    assert lut[2047] == bf16_decode_chunk_pages(2048)
