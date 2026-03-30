@@ -243,6 +243,43 @@ def _paged_chunk_table_pages(
     return None
 
 
+def decode_chunk_pages_for_graph(
+    *,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    page_size: int,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    gqa_group_size: int,
+    max_effective_kv_pages: int,
+) -> int:
+    """Return the decode split chunk size in pages for graph replay.
+
+    Default decode now stays on the split-capable generic family, so replay only
+    needs the runtime chunk size, not a full host work decomposition. For the
+    tuned decode contracts we reuse the explicit table overrides. Outside the
+    tuned table range, `create_paged_plan()` falls back to the binary-search
+    path, which in graph mode immediately selects the minimum chunk size because
+    the decode graph budget is intentionally overprovisioned. Mirror that here
+    without rebuilding the full host plan.
+    """
+
+    chunk_pages = _paged_chunk_table_pages(
+        mode="decode",
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        page_size=page_size,
+        head_dim_qk=head_dim_qk,
+        head_dim_vo=head_dim_vo,
+        gqa_group_size=gqa_group_size,
+        max_effective_kv_pages=max(max_effective_kv_pages, 1),
+        graph_chunk_policy=True,
+    )
+    if chunk_pages is not None:
+        return int(chunk_pages)
+    return max(128 // page_size, 1)
+
+
 @dataclass(frozen=True)
 class PagedPlanKey:
     total_q: int
@@ -302,6 +339,7 @@ def create_paged_plan(
     mode: Literal["decode", "extend"] | None = None,
     fixed_split_size: int = -1,
     disable_split_kv: bool = False,
+    force_split_kv: bool | None = None,
     enable_cuda_graph: bool = False,
     graph_chunk_policy: bool = False,
     max_batch_size_if_split: int | None = None,
@@ -362,6 +400,8 @@ def create_paged_plan(
 
     inferred_mode = infer_paged_mode(cu_seqlens_q)
     mode = inferred_mode if mode is None else mode
+    if force_split_kv is None:
+        force_split_kv = mode == "decode"
 
     gqa_group_size = num_q_heads // num_kv_heads
     packed_qo_len_arr = [q_len * gqa_group_size for q_len in q_lengths]
@@ -409,7 +449,7 @@ def create_paged_plan(
     if not _merge_backend_supports_split_kv(output_dtype=q.dtype, head_dim_vo=head_dim_vo):
         disable_split_kv = True
 
-    if disable_split_kv:
+    if disable_split_kv and not force_split_kv:
         split_kv = False
         kv_chunk_size_pages = 1 << 30
     elif fixed_split_size > 0:
@@ -451,8 +491,8 @@ def create_paged_plan(
         zip(packed_qo_len_arr, q_lengths, effective_kv_len_arr)
     ):
         num_tiles_q = _ceil_div(packed_qo_len, cta_tile_q)
-        num_chunks_kv = 1 if disable_split_kv else _ceil_div(max(kv_len, 1), kv_chunk_size_pages)
-        if not disable_split_kv:
+        num_chunks_kv = 1 if disable_split_kv and not force_split_kv else _ceil_div(max(kv_len, 1), kv_chunk_size_pages)
+        if not disable_split_kv or force_split_kv:
             split_kv = split_kv or num_chunks_kv > 1
         for q_tile_idx in range(num_tiles_q):
             for kv_tile_idx in range(num_chunks_kv):
@@ -471,6 +511,9 @@ def create_paged_plan(
         raise ValueError(
             "new_batch_size exceeds padded_batch_size; fixed_split_size is incompatible with the chosen graph budget"
         )
+    if force_split_kv:
+        split_kv = True
+
     block_valid_mask = [idx < new_batch_size for idx in range(padded_batch_size)]
     kv_chunk_size = kv_chunk_size_pages * page_size
 

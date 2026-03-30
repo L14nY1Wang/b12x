@@ -18,7 +18,6 @@ from b12x.cute.utils import current_cuda_stream
 from .forward_paged import (
     PagedBf16ExtendRawForwardKernel,
     PagedForwardKernel,
-    PagedFp8DecodeRawForwardKernel,
     PagedFp8ExtendRawForwardKernel,
 )
 from .merge import PagedPersistentMergeKernel, default_paged_persistent_ctas
@@ -74,27 +73,6 @@ def _attn_turbo_enabled(attn_mode: Literal["default", "turbo"] | None) -> bool:
     return os.environ.get("B12X_ATTN", "").upper() == "TURBO"
 
 
-def _use_fp8_decode_raw_specialization(
-    traits: PagedForwardTraits,
-    *,
-    split_kv: bool,
-) -> bool:
-    return (
-        not split_kv
-        and traits.kv_dtype == torch.float8_e4m3fn
-        and traits.q_dtype == torch.bfloat16
-        and traits.o_dtype == torch.bfloat16
-        and traits.num_warps_q == 1
-        and traits.num_warps_kv == 4
-        and traits.num_threads == 128
-        and traits.cta_tile_q == 16
-        and traits.num_mma_q == 1
-        and traits.num_mma_kv == 1
-        and traits.head_dim_qk == 256
-        and traits.head_dim_vo == 256
-    )
-
-
 def _use_fp8_extend_raw_specialization(
     traits: PagedForwardTraits,
     *,
@@ -146,6 +124,44 @@ def _tensor_meta_key(
     )
 
 
+def _format_cache_key_value(value: object) -> str:
+    if value is None:
+        return "None"
+    if (
+        isinstance(value, tuple)
+        and len(value) == 4
+        and isinstance(value[0], tuple)
+        and isinstance(value[1], tuple)
+        and isinstance(value[2], str)
+        and isinstance(value[3], tuple)
+        and len(value[3]) == 2
+    ):
+        shape, stride, dtype, (device_type, device_index) = value
+        return (
+            f"shape={shape},stride={stride},dtype={dtype},device={device_type}:{device_index}"
+        )
+    return repr(value)
+
+
+def _debug_print_compile_cache_miss(
+    kernel: object,
+    cache_key: tuple[object, ...],
+    cache_key_labels: tuple[str, ...] | None,
+) -> None:
+    kernel_name = type(kernel).__name__
+    if cache_key_labels is None:
+        payload = ", ".join(
+            f"{idx}={_format_cache_key_value(value)}"
+            for idx, value in enumerate(cache_key)
+        )
+    else:
+        payload = ", ".join(
+            f"{label}={_format_cache_key_value(value)}"
+            for label, value in zip(cache_key_labels, cache_key, strict=True)
+        )
+    print(f"[paged] compile-miss {kernel_name}: {payload}", flush=True)
+
+
 def _launcher_cache_lookup(
     kernel: object,
     cache_key: tuple[object, ...],
@@ -165,12 +181,16 @@ def _run_cached_host_launcher(
     kernel: object,
     cache_key: tuple[object, ...],
     args: tuple[object, ...],
+    *,
+    cache_key_labels: tuple[str, ...] | None = None,
 ) -> None:
     if torch.cuda.is_current_stream_capturing():
         kernel(*args)
         return
     cache, compiled = _launcher_cache_lookup(kernel, cache_key)
     if compiled is None:
+        if os.environ.get("B12X_PAGED_DEBUG_COMPILE", "0") == "1":
+            _debug_print_compile_cache_miss(kernel, cache_key, cache_key_labels)
         with warnings.catch_warnings():
             warnings.filterwarnings(
                 "ignore",
@@ -202,17 +222,6 @@ def _build_forward_kernel(
         mxfp8_turbo=mxfp8_turbo,
         enable_mxfp8_pv=enable_mxfp8_pv,
     )
-
-
-@lru_cache(maxsize=16)
-def _build_fp8_decode_raw_forward_kernel(
-    traits: PagedForwardTraits,
-    split_kv: bool,
-    mxfp8_turbo: bool,
-    enable_mxfp8_pv: bool,
-) -> PagedFp8DecodeRawForwardKernel:
-    del traits, split_kv, mxfp8_turbo, enable_mxfp8_pv
-    return PagedFp8DecodeRawForwardKernel()
 
 
 @lru_cache(maxsize=16)
@@ -299,17 +308,7 @@ def paged_attention_forward(
     traits = select_paged_forward_traits_from_plan(plan)
     mxfp8_turbo = _attn_turbo_enabled(workspace.attn_mode) and plan.kv_dtype == torch.float8_e4m3fn
     enable_mxfp8_pv = mxfp8_turbo and plan.mode == "decode" and plan.kv_chunk_size <= 384
-    if _use_fp8_decode_raw_specialization(
-        traits,
-        split_kv=plan.split_kv,
-    ):
-        forward_kernel = _build_fp8_decode_raw_forward_kernel(
-            traits,
-            plan.split_kv,
-            mxfp8_turbo,
-            enable_mxfp8_pv,
-        )
-    elif _use_bf16_extend_raw_specialization(
+    if _use_bf16_extend_raw_specialization(
         traits,
         split_kv=plan.split_kv,
     ):
@@ -408,7 +407,29 @@ def paged_attention_forward(
         _tensor_meta_key(k_descale),
         _tensor_meta_key(v_descale),
     )
-    _run_cached_host_launcher(forward_kernel, forward_cache_key, forward_args)
+    _run_cached_host_launcher(
+        forward_kernel,
+        forward_cache_key,
+        forward_args,
+        cache_key_labels=(
+            "q",
+            "k_cache",
+            "v_cache",
+            "page_table",
+            "cache_seqlens",
+            "cu_seqlens_q",
+            "request_indices",
+            "qo_tile_indices",
+            "kv_tile_indices",
+            "o_indptr",
+            "kv_chunk_size_ptr",
+            "block_valid_mask",
+            "forward_output",
+            "forward_lse",
+            "k_descale",
+            "v_descale",
+        ),
+    )
 
     if plan.split_kv:
         persistent_ctas = default_paged_persistent_ctas(
@@ -440,7 +461,20 @@ def paged_attention_forward(
             _tensor_meta_key(workspace.total_num_rows_ptr),
             persistent_ctas,
         )
-        _run_cached_host_launcher(merge_kernel, merge_cache_key, (*merge_args, stream))
+        _run_cached_host_launcher(
+            merge_kernel,
+            merge_cache_key,
+            (*merge_args, stream),
+            cache_key_labels=(
+                "tmp_output",
+                "tmp_lse",
+                "merge_indptr",
+                "output",
+                "lse",
+                "total_num_rows_ptr",
+                "persistent_ctas",
+            ),
+        )
 
     return output[: plan.total_q], workspace.current_lse_view()
 
@@ -448,7 +482,6 @@ def paged_attention_forward(
 def clear_paged_caches() -> None:
     """Clear compiled-kernel caches for the primary paged backend."""
     _build_forward_kernel.cache_clear()
-    _build_fp8_decode_raw_forward_kernel.cache_clear()
     _build_fp8_extend_raw_forward_kernel.cache_clear()
     _build_bf16_extend_raw_forward_kernel.cache_clear()
     _build_merge_kernel.cache_clear()

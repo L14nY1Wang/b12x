@@ -98,7 +98,7 @@ def _run_decode_graph_check(
 
 
 @torch.inference_mode()
-def test_paged_forward_matches_reference_without_split() -> None:
+def test_paged_forward_matches_reference_decode_short_context() -> None:
     require_sm120()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[1, 1, 1],
@@ -107,12 +107,7 @@ def test_paged_forward_matches_reference_without_split() -> None:
         kv_dtype=torch.bfloat16,
     )
     workspace = _make_workspace(q, k_cache, v_cache, mode="decode")
-    workspace.prepare(
-        page_table,
-        cache_seqlens,
-        cu_seqlens_q,
-        disable_split_kv=True,
-    )
+    workspace.prepare(page_table, cache_seqlens, cu_seqlens_q)
     output, lse_base2 = workspace.run(
         q,
         k_cache,
@@ -137,7 +132,7 @@ def test_paged_forward_matches_reference_without_split() -> None:
 
 
 @torch.inference_mode()
-def test_paged_forward_matches_reference_without_split_fp8_decode_batch8() -> None:
+def test_paged_forward_matches_reference_fp8_decode_short_context_batch8() -> None:
     require_sm120()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[1, 1, 1, 1, 1, 1, 1, 1],
@@ -152,12 +147,7 @@ def test_paged_forward_matches_reference_without_split_fp8_decode_batch8() -> No
         cache_seqlens,
     )
     workspace = _make_workspace(q, k_fp8, v_fp8, mode="decode")
-    workspace.prepare(
-        page_table,
-        cache_seqlens,
-        cu_seqlens_q,
-        disable_split_kv=True,
-    )
+    workspace.prepare(page_table, cache_seqlens, cu_seqlens_q)
     output, lse_base2 = workspace.run(
         q,
         k_fp8,
@@ -186,10 +176,10 @@ def test_paged_forward_matches_reference_without_split_fp8_decode_batch8() -> No
 
 
 @torch.inference_mode()
-def test_paged_forward_turbo_matches_reference_without_split_fp8_decode_batch8() -> None:
+def test_paged_forward_turbo_matches_reference_fp8_decode_short_context_batch8() -> None:
     require_sm120()
     output, fa2_out, plan_desc = _run_decode_graph_check(cache_seqlen=64, b12x_attn_mode="turbo")
-    assert plan_desc == "chunk=128,nosplit"
+    assert plan_desc == "chunk=128,split"
     assert (output - fa2_out).abs().max().item() <= 0.02
     assert _cosine_similarity(output, fa2_out) >= 0.998
 
