@@ -205,6 +205,10 @@ class _Pointer(Pointer):
 
         return False
 
+    @property
+    def __cache_key__(self) -> tuple[object, ...]:
+        return (self._dtype, self._addr_space, self._assumed_align)
+
     def __str__(self) -> str:
         return f"Ptr<0x{int(self._pointer):016x}@{self._addr_space}>"
 

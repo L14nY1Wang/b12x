@@ -1,0 +1,350 @@
+from __future__ import annotations
+
+import hashlib
+import inspect
+import os
+from functools import lru_cache
+from functools import wraps
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+_COMPILE_ONLY_CACHE_WARNING = "Cache is disabled as user wants to compile only."
+_PATCHED = False
+_B12X_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _cute_compile_disk_cache_enabled() -> bool:
+    raw = os.environ.get("B12X_CUTE_COMPILE_DISK_CACHE", "1")
+    return raw.lower() not in {"0", "false", "no", ""}
+
+
+def _cute_compile_cache_dir() -> Path:
+    root = os.environ.get("B12X_CUTE_COMPILE_CACHE_DIR")
+    if root:
+        return Path(root)
+    cute_cache_dir = os.environ.get("CUTE_DSL_CACHE_DIR")
+    if cute_cache_dir:
+        return Path(cute_cache_dir) / "b12x_object_cache"
+    xdg_cache_home = os.environ.get("XDG_CACHE_HOME")
+    if xdg_cache_home:
+        return Path(xdg_cache_home) / "b12x" / "cute_compile"
+    return Path.home() / ".cache" / "b12x" / "cute_compile"
+
+
+def _iter_fingerprint_files(root: Path) -> list[Path]:
+    files = []
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        if "__pycache__" in path.parts:
+            continue
+        if path.suffix in {".pyc", ".pyo"}:
+            continue
+        files.append(path)
+    files.sort()
+    return files
+
+
+def _tree_state(root: Path) -> tuple[tuple[str, int, int], ...]:
+    entries = []
+    for path in _iter_fingerprint_files(root):
+        stat = path.stat()
+        entries.append((str(path.relative_to(root)), stat.st_mtime_ns, stat.st_size))
+    return tuple(entries)
+
+
+@lru_cache(maxsize=8)
+def _tree_fingerprint_cached(root_str: str, state: tuple[tuple[str, int, int], ...]) -> str:
+    root = Path(root_str)
+    digest = hashlib.sha256()
+    for rel_path, _mtime_ns, _size in state:
+        path = root / rel_path
+        digest.update(rel_path.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _tree_fingerprint(root: Path) -> str:
+    return _tree_fingerprint_cached(str(root), _tree_state(root))
+
+
+def _b12x_package_fingerprint() -> str:
+    return _tree_fingerprint(_B12X_PACKAGE_ROOT)
+
+
+def _function_fingerprint(func: Any) -> tuple[str, str, str]:
+    func = inspect.unwrap(func)
+    module = getattr(func, "__module__", "")
+    qualname = getattr(func, "__qualname__", getattr(func, "__name__", type(func).__qualname__))
+    if module == "b12x" or module.startswith("b12x."):
+        return module, qualname, f"b12x:{_b12x_package_fingerprint()}"
+    try:
+        source = inspect.getsource(func)
+        payload = source.encode("utf-8")
+    except (OSError, TypeError):
+        code = getattr(func, "__code__", None)
+        if code is None:
+            payload = repr(func).encode("utf-8")
+        else:
+            payload = repr(
+                (
+                    code.co_code,
+                    code.co_consts,
+                    code.co_names,
+                    code.co_varnames,
+                    code.co_argcount,
+                    code.co_kwonlyargcount,
+                )
+            ).encode("utf-8")
+    digest = hashlib.sha256(payload).hexdigest()
+    return module, qualname, digest
+
+
+def _normalize_compile_target(func: Any, visited: set[int]) -> Any:
+    if inspect.ismethod(func):
+        return (
+            "method",
+            _function_fingerprint(func.__func__),
+            _structural_cache_key(func.__self__, visited),
+        )
+    if inspect.isfunction(func):
+        return ("function", _function_fingerprint(func))
+    if hasattr(func, "__call__") and hasattr(func.__call__, "__func__"):
+        state = vars(func) if hasattr(func, "__dict__") else None
+        return (
+            "callable_instance",
+            type(func).__module__,
+            type(func).__qualname__,
+            _function_fingerprint(func.__call__.__func__),
+            _structural_cache_key(state, visited),
+        )
+    return ("callable", type(func).__module__, type(func).__qualname__, repr(func))
+
+
+def _structural_cache_key(value: Any, visited: set[int] | None = None) -> Any:
+    if visited is None:
+        visited = set()
+
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, bytes):
+        return ("bytes", value.hex())
+    if isinstance(value, Path):
+        return ("path", str(value))
+    if inspect.isfunction(value) or inspect.ismethod(value):
+        return _normalize_compile_target(value, visited)
+    if isinstance(value, type):
+        return ("type", value.__module__, value.__qualname__)
+    if isinstance(value, SimpleNamespace):
+        return (
+            "namespace",
+            tuple(
+                sorted(
+                    (k, _structural_cache_key(v, visited)) for k, v in vars(value).items()
+                )
+            ),
+        )
+    if isinstance(value, dict):
+        return tuple(
+            sorted(
+                (_structural_cache_key(k, visited), _structural_cache_key(v, visited))
+                for k, v in value.items()
+            )
+        )
+    if isinstance(value, (tuple, list)):
+        return tuple(_structural_cache_key(v, visited) for v in value)
+    if isinstance(value, set):
+        return tuple(sorted(_structural_cache_key(v, visited) for v in value))
+
+    type_name = type(value).__name__
+    type_module = type(value).__module__
+    if type_name == "CUstream" and type_module.startswith("cuda.bindings"):
+        return ("cuda_stream",)
+    if type_module == "cutlass.cute.runtime" and type_name == "_Tensor":
+        dtype = getattr(value, "_dtype", getattr(value, "element_type", None))
+        shape = tuple(int(dim) for dim in value.shape)
+        stride = tuple(int(dim) for dim in value.stride)
+        memspace = getattr(value, "memspace", getattr(value, "_memspace", None))
+        assumed_align = getattr(value, "_assumed_align", None)
+        is_dynamic = getattr(value, "_is_dynamic", None)
+        use_32bit_stride = getattr(value, "_use_32bit_stride", None)
+        return (
+            "runtime_tensor",
+            dtype,
+            shape,
+            stride,
+            memspace,
+            assumed_align,
+            is_dynamic,
+            use_32bit_stride,
+        )
+    if type_module == "cutlass.cute.runtime" and type_name == "_FakeCompactTensor":
+        dtype = getattr(value, "_dtype", None)
+        shape = tuple(int(dim) for dim in getattr(value, "_shape", ()))
+        stride_order = tuple(int(dim) for dim in getattr(value, "_stride_order", ()))
+        memspace = getattr(value, "_memspace", None)
+        assumed_align = getattr(value, "_assumed_align", None)
+        use_32bit_stride = getattr(value, "_use_32bit_stride", None)
+        return (
+            "fake_compact_tensor",
+            dtype,
+            shape,
+            stride_order,
+            memspace,
+            assumed_align,
+            use_32bit_stride,
+        )
+
+    cache_key_attr = getattr(value, "__cache_key__", None)
+    if cache_key_attr is not None:
+        return (
+            "cache_key",
+            type_module,
+            type_name,
+            _structural_cache_key(cache_key_attr, visited),
+        )
+
+    object_id = id(value)
+    if object_id in visited:
+        return ("cycle", type_module, type_name)
+
+    if hasattr(value, "__dict__"):
+        visited.add(object_id)
+        try:
+            return (
+                "object",
+                type_module,
+                type_name,
+                tuple(
+                    sorted(
+                        (
+                            k,
+                            _structural_cache_key(v, visited),
+                        )
+                        for k, v in vars(value).items()
+                    )
+                ),
+            )
+        finally:
+            visited.remove(object_id)
+
+    return ("repr", type_module, type_name, repr(value))
+
+
+def _compile_options_cache_key(compile_callable: Any) -> tuple[str, ...]:
+    compile_options = getattr(compile_callable, "_compile_options", None)
+    if compile_options is None:
+        return ()
+    options = getattr(compile_options, "options", {})
+    serialized = []
+    for option in options.values():
+        value = option.serialize()
+        if value:
+            serialized.append(value)
+    return tuple(serialized)
+
+
+def _build_compile_disk_cache_key(
+    compile_callable: Any,
+    func: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> str:
+    payload = (
+        "b12x_cute_compile_cache_v1",
+        _normalize_compile_target(func, set()),
+        _b12x_package_fingerprint(),
+        _structural_cache_key(args),
+        _structural_cache_key(kwargs),
+        _compile_options_cache_key(compile_callable),
+        os.environ.get("CUTE_DSL_ARCH", ""),
+        os.environ.get("CUDA_TOOLKIT_PATH", ""),
+    )
+    return hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
+
+
+def _cache_prefix(cache_key: str) -> str:
+    return f"b12x_cute_{cache_key}"
+
+
+def _cache_object_path(cache_key: str) -> Path:
+    return _cute_compile_cache_dir() / cache_key[:2] / f"{cache_key}.o"
+
+
+def _load_cute_compile_from_disk(cache_key: str):
+    from cutlass.base_dsl.export.external_binary_module import ExternalBinaryModule
+
+    object_path = _cache_object_path(cache_key)
+    if not object_path.exists():
+        return None
+    try:
+        module = ExternalBinaryModule(str(object_path))
+        return getattr(module, _cache_prefix(cache_key))
+    except Exception:
+        return None
+
+
+def _store_cute_compile_to_disk(cache_key: str, compiled: Any) -> None:
+    if not hasattr(compiled, "dump_to_object"):
+        return
+
+    object_path = _cache_object_path(cache_key)
+    object_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = object_path.with_suffix(".tmp")
+    object_bytes = compiled.dump_to_object(_cache_prefix(cache_key))
+    with open(tmp_path, "wb") as f:
+        f.write(object_bytes)
+    os.replace(tmp_path, object_path)
+
+
+def apply_cutlass_runtime_patches() -> None:
+    global _PATCHED
+    if _PATCHED:
+        return
+
+    try:
+        from cutlass.base_dsl.compiler import CompileCallable
+        from cutlass.base_dsl.dsl import BaseDSL
+    except Exception:
+        return
+
+    original_print_warning = BaseDSL.print_warning
+    original_print_warning_once = BaseDSL.print_warning_once
+    original_compile = CompileCallable._compile
+
+    @wraps(original_print_warning)
+    def patched_print_warning(self, message):
+        if message == _COMPILE_ONLY_CACHE_WARNING:
+            return None
+        return original_print_warning(self, message)
+
+    @wraps(original_print_warning_once)
+    def patched_print_warning_once(self, message):
+        if message == _COMPILE_ONLY_CACHE_WARNING:
+            return None
+        return original_print_warning_once(self, message)
+
+    @wraps(original_compile)
+    def patched_compile(self, func, *args, **kwargs):
+        if not _cute_compile_disk_cache_enabled():
+            return original_compile(self, func, *args, **kwargs)
+
+        cache_key = _build_compile_disk_cache_key(self, func, args, kwargs)
+        compiled = _load_cute_compile_from_disk(cache_key)
+        if compiled is not None:
+            return compiled
+
+        compiled = original_compile(self, func, *args, **kwargs)
+        try:
+            _store_cute_compile_to_disk(cache_key, compiled)
+        except Exception:
+            pass
+        return compiled
+
+    BaseDSL.print_warning = patched_print_warning
+    BaseDSL.print_warning_once = patched_print_warning_once
+    CompileCallable._compile = patched_compile
+    _PATCHED = True
