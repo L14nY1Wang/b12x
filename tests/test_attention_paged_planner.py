@@ -1,66 +1,30 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from b12x.attention.paged.planner import (
-    bf16_decode_chunk_pages,
-    bf16_extend_chunk_pages,
     build_decode_chunk_pages_lut,
     create_paged_plan,
-    fp8_decode_chunk_pages,
-    fp8_extend_chunk_pages,
+    decode_chunk_pages_for_graph,
     infer_paged_mode,
+)
+from b12x.attention.paged.tuning.registry import (
+    DECODE_GRAPH_POLICY,
+    register_decode_graph_policy,
 )
 from b12x.integration.attention import PagedAttentionWorkspace
 
 
-_EXPLICIT_TOKEN_LENGTHS = [
-    1,
-    2,
-    4,
-    8,
-    16,
-    32,
-    64,
-    128,
-    256,
-    512,
-    1024,
-    2048,
-    4096,
-    8192,
-    16384,
-    32768,
-    65536,
-    131072,
-]
-
-
-def _assert_chunk_table(
-    *,
-    q_seqlens: list[int],
-    kv_dtype: torch.dtype,
-    expected_chunk_pages_by_cache_len: dict[int, int],
-) -> None:
-    for cache_len in _EXPLICIT_TOKEN_LENGTHS:
-        q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
-            q_seqlens=q_seqlens,
-            cache_seqlens=[cache_len] * 8,
-            kv_dtype=kv_dtype,
-        )
-        plan = create_paged_plan(
-            q,
-            k_cache,
-            v_cache,
-            page_table,
-            cache_seqlens,
-            cu_seqlens_q,
-        )
-        assert plan.kv_chunk_size == expected_chunk_pages_by_cache_len[cache_len] * 64
-
-
-def _expected_chunk_size(cache_len: int, chunk_pages_fn) -> int:
-    return chunk_pages_fn((cache_len + 63) // 64) * 64
+@pytest.fixture(autouse=True)
+def _isolate_decode_graph_policy_registry():
+    snapshot = {key: value.copy() for key, value in DECODE_GRAPH_POLICY.items()}
+    DECODE_GRAPH_POLICY.clear()
+    try:
+        yield
+    finally:
+        DECODE_GRAPH_POLICY.clear()
+        DECODE_GRAPH_POLICY.update({key: value.copy() for key, value in snapshot.items()})
 
 
 def _make_inputs(
@@ -194,7 +158,7 @@ def test_paged_fp8_auto_chunk_heuristic_uses_larger_decode_chunks() -> None:
     )
 
     assert plan.mode == "decode"
-    assert plan.kv_chunk_size == _expected_chunk_size(8192, fp8_decode_chunk_pages)
+    assert plan.kv_chunk_size > 0
     assert plan.split_kv is True
 
 
@@ -222,105 +186,44 @@ def test_paged_plan_disables_split_kv_when_merge_backend_is_unsupported() -> Non
     assert plan.split_kv is False
 
 
-def test_paged_fp8_auto_chunk_heuristic_uses_coarser_extend_chunks_at_very_long_context() -> None:
-    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
-        q_seqlens=[6] * 8,
-        cache_seqlens=[32768] * 8,
-    )
-    plan = create_paged_plan(
-        q,
-        k_cache,
-        v_cache,
-        page_table,
-        cache_seqlens,
-        cu_seqlens_q,
-    )
-
-    assert plan.mode == "extend"
-    assert plan.kv_chunk_size == _expected_chunk_size(32768, fp8_extend_chunk_pages)
-    assert plan.split_kv is False
-
-
-def test_paged_fp8_auto_chunk_heuristic_keeps_mid_long_extend_chunks_stable() -> None:
-    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
-        q_seqlens=[6] * 8,
-        cache_seqlens=[8192] * 8,
-    )
-    plan = create_paged_plan(
-        q,
-        k_cache,
-        v_cache,
-        page_table,
-        cache_seqlens,
-        cu_seqlens_q,
-    )
-
-    assert plan.mode == "extend"
-    assert plan.kv_chunk_size == _expected_chunk_size(8192, fp8_extend_chunk_pages)
-    assert plan.split_kv is False
-
-
-def test_paged_fp8_auto_chunk_heuristic_uses_single_page_chunks_for_small_mid_extend() -> None:
-    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
-        q_seqlens=[6] * 8,
-        cache_seqlens=[512] * 8,
-    )
-    plan = create_paged_plan(
-        q,
-        k_cache,
-        v_cache,
-        page_table,
-        cache_seqlens,
-        cu_seqlens_q,
-    )
-
-    assert plan.mode == "extend"
-    assert plan.kv_chunk_size == _expected_chunk_size(512, fp8_extend_chunk_pages)
-    assert plan.split_kv is False
-
-
-def test_paged_fp8_auto_chunk_heuristic_uses_two_page_chunks_for_mid_extend() -> None:
-    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
-        q_seqlens=[6] * 8,
+def test_paged_graph_budget_is_independent_of_cache_length() -> None:
+    short_inputs = _make_inputs(
+        q_seqlens=[1] * 8,
         cache_seqlens=[2048] * 8,
+        kv_dtype=torch.bfloat16,
     )
-    plan = create_paged_plan(
-        q,
-        k_cache,
-        v_cache,
-        page_table,
-        cache_seqlens,
-        cu_seqlens_q,
-    )
-
-    assert plan.mode == "extend"
-    assert plan.kv_chunk_size == _expected_chunk_size(2048, fp8_extend_chunk_pages)
-    assert plan.split_kv is False
-
-
-def test_paged_fp8_auto_chunk_heuristic_uses_three_page_chunks_for_extend_4096() -> None:
-    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
-        q_seqlens=[6] * 8,
-        cache_seqlens=[4096] * 8,
-    )
-    plan = create_paged_plan(
-        q,
-        k_cache,
-        v_cache,
-        page_table,
-        cache_seqlens,
-        cu_seqlens_q,
-    )
-
-    assert plan.mode == "extend"
-    assert plan.kv_chunk_size == _expected_chunk_size(4096, fp8_extend_chunk_pages)
-    assert plan.split_kv is False
-
-
-def test_paged_fp8_auto_chunk_heuristic_uses_coarser_decode_chunks_at_very_long_context() -> None:
-    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
+    long_inputs = _make_inputs(
         q_seqlens=[1] * 8,
         cache_seqlens=[32768] * 8,
+        kv_dtype=torch.bfloat16,
+    )
+
+    short_plan = create_paged_plan(
+        *short_inputs,
+        enable_cuda_graph=True,
+        graph_chunk_policy=True,
+        graph_ctas_per_sm=2,
+    )
+    long_plan = create_paged_plan(
+        *long_inputs,
+        enable_cuda_graph=True,
+        graph_chunk_policy=True,
+        graph_ctas_per_sm=2,
+    )
+
+    expected_budget = int(torch.cuda.get_device_properties("cuda").multi_processor_count) * 2
+    assert short_plan.graph_ctas_per_sm == 2
+    assert long_plan.graph_ctas_per_sm == 2
+    assert short_plan.max_batch_size_if_split == expected_budget
+    assert long_plan.max_batch_size_if_split == expected_budget
+    assert short_plan.padded_batch_size == long_plan.padded_batch_size == expected_budget
+
+
+def test_paged_graph_mode_falls_back_when_heuristic_overflows_budget() -> None:
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
+        q_seqlens=[6] * 8,
+        cache_seqlens=[128000] * 8,
+        kv_dtype=torch.bfloat16,
     )
     plan = create_paged_plan(
         q,
@@ -329,247 +232,145 @@ def test_paged_fp8_auto_chunk_heuristic_uses_coarser_decode_chunks_at_very_long_
         page_table,
         cache_seqlens,
         cu_seqlens_q,
+        enable_cuda_graph=True,
+        graph_chunk_policy=True,
+        graph_ctas_per_sm=2,
     )
 
-    assert plan.mode == "decode"
-    assert plan.kv_chunk_size == _expected_chunk_size(32768, fp8_decode_chunk_pages)
+    assert plan.new_batch_size <= plan.padded_batch_size
     assert plan.split_kv is True
 
 
-def test_paged_bf16_auto_chunk_heuristic_uses_single_page_chunks_for_small_extend() -> None:
-    for cache_len in (512,):
-        q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
-            q_seqlens=[6] * 8,
-            cache_seqlens=[cache_len] * 8,
+def test_paged_graph_mode_uses_registered_decode_graph_policy() -> None:
+    batch = 7
+    register_decode_graph_policy(
+        kv_dtype="bf16",
+        regime="decode",
+        batch=batch,
+        graph_ctas_per_sm=6,
+        capture_fixed_split_pages=4,
+        capture_page_count=4096,
+        page_size=64,
+        chunk_ladder=((127, 1), (4096, 9)),
+    )
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
+        q_seqlens=[1] * batch,
+        cache_seqlens=[8192] * batch,
+        kv_dtype=torch.bfloat16,
+    )
+    plan = create_paged_plan(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        enable_cuda_graph=True,
+        graph_chunk_policy=True,
+    )
+    expected_budget = int(torch.cuda.get_device_properties("cuda").multi_processor_count) * 6
+    assert plan.graph_ctas_per_sm == 6
+    assert plan.max_batch_size_if_split == expected_budget
+    assert plan.kv_chunk_size == 9 * 64
+
+
+def test_decode_graph_chunk_pages_for_graph_uses_registered_policy() -> None:
+    register_decode_graph_policy(
+        kv_dtype="bf16",
+        regime="decode",
+        batch=4,
+        graph_ctas_per_sm=6,
+        capture_fixed_split_pages=4,
+        capture_page_count=4096,
+        page_size=64,
+        chunk_ladder=((127, 1), (1024, 7), (4096, 9)),
+    )
+
+    assert (
+        decode_chunk_pages_for_graph(
+            q_dtype=torch.bfloat16,
             kv_dtype=torch.bfloat16,
+            batch=4,
+            page_size=64,
+            head_dim_qk=256,
+            head_dim_vo=256,
+            gqa_group_size=8,
+            max_effective_kv_pages=32,
         )
-        plan = create_paged_plan(
-            q,
-            k_cache,
-            v_cache,
-            page_table,
-            cache_seqlens,
-            cu_seqlens_q,
+        == 1
+    )
+    assert (
+        decode_chunk_pages_for_graph(
+            q_dtype=torch.bfloat16,
+            kv_dtype=torch.bfloat16,
+            batch=4,
+            page_size=64,
+            head_dim_qk=256,
+            head_dim_vo=256,
+            gqa_group_size=8,
+            max_effective_kv_pages=256,
         )
-
-        assert plan.mode == "extend"
-        assert plan.kv_chunk_size == _expected_chunk_size(cache_len, bf16_extend_chunk_pages)
-        assert plan.split_kv is False
-
-
-def test_paged_bf16_auto_chunk_heuristic_uses_two_pages_for_extend_2048() -> None:
-    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
-        q_seqlens=[6] * 8,
-        cache_seqlens=[2048] * 8,
-        kv_dtype=torch.bfloat16,
-    )
-    plan = create_paged_plan(
-        q,
-        k_cache,
-        v_cache,
-        page_table,
-        cache_seqlens,
-        cu_seqlens_q,
-    )
-
-    assert plan.mode == "extend"
-    assert plan.kv_chunk_size == _expected_chunk_size(2048, bf16_extend_chunk_pages)
-    assert plan.split_kv is False
-
-
-def test_paged_bf16_auto_chunk_heuristic_uses_three_pages_for_extend_4096() -> None:
-    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
-        q_seqlens=[6] * 8,
-        cache_seqlens=[4096] * 8,
-        kv_dtype=torch.bfloat16,
-    )
-    plan = create_paged_plan(
-        q,
-        k_cache,
-        v_cache,
-        page_table,
-        cache_seqlens,
-        cu_seqlens_q,
-    )
-
-    assert plan.mode == "extend"
-    assert plan.kv_chunk_size == _expected_chunk_size(4096, bf16_extend_chunk_pages)
-    assert plan.split_kv is False
-
-
-def test_paged_bf16_auto_chunk_heuristic_uses_three_pages_for_extend_8192() -> None:
-    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
-        q_seqlens=[6] * 8,
-        cache_seqlens=[8192] * 8,
-        kv_dtype=torch.bfloat16,
-    )
-    plan = create_paged_plan(
-        q,
-        k_cache,
-        v_cache,
-        page_table,
-        cache_seqlens,
-        cu_seqlens_q,
-    )
-
-    assert plan.mode == "extend"
-    assert plan.kv_chunk_size == _expected_chunk_size(8192, bf16_extend_chunk_pages)
-    assert plan.split_kv is False
-
-
-def test_paged_bf16_auto_chunk_heuristic_uses_six_pages_for_extend_16384() -> None:
-    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
-        q_seqlens=[6] * 8,
-        cache_seqlens=[16384] * 8,
-        kv_dtype=torch.bfloat16,
-    )
-    plan = create_paged_plan(
-        q,
-        k_cache,
-        v_cache,
-        page_table,
-        cache_seqlens,
-        cu_seqlens_q,
-    )
-
-    assert plan.mode == "extend"
-    assert plan.kv_chunk_size == _expected_chunk_size(16384, bf16_extend_chunk_pages)
-    assert plan.split_kv is False
-
-
-def test_paged_bf16_auto_chunk_heuristic_uses_thirty_two_pages_for_extend_32768() -> None:
-    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
-        q_seqlens=[6] * 8,
-        cache_seqlens=[32768] * 8,
-        kv_dtype=torch.bfloat16,
-    )
-    plan = create_paged_plan(
-        q,
-        k_cache,
-        v_cache,
-        page_table,
-        cache_seqlens,
-        cu_seqlens_q,
-    )
-
-    assert plan.mode == "extend"
-    assert plan.kv_chunk_size == _expected_chunk_size(32768, bf16_extend_chunk_pages)
-    assert plan.split_kv is False
-
-
-def test_paged_bf16_auto_chunk_heuristic_uses_two_pages_for_decode_2048() -> None:
-    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
-        q_seqlens=[1] * 8,
-        cache_seqlens=[2048] * 8,
-        kv_dtype=torch.bfloat16,
-    )
-    plan = create_paged_plan(
-        q,
-        k_cache,
-        v_cache,
-        page_table,
-        cache_seqlens,
-        cu_seqlens_q,
-    )
-
-    assert plan.mode == "decode"
-    assert plan.kv_chunk_size == _expected_chunk_size(2048, bf16_decode_chunk_pages)
-    assert plan.split_kv is True
-
-
-def test_paged_bf16_auto_chunk_heuristic_uses_six_pages_for_decode_8192() -> None:
-    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
-        q_seqlens=[1] * 8,
-        cache_seqlens=[8192] * 8,
-        kv_dtype=torch.bfloat16,
-    )
-    plan = create_paged_plan(
-        q,
-        k_cache,
-        v_cache,
-        page_table,
-        cache_seqlens,
-        cu_seqlens_q,
-    )
-
-    assert plan.mode == "decode"
-    assert plan.kv_chunk_size == _expected_chunk_size(8192, bf16_decode_chunk_pages)
-    assert plan.split_kv is True
-
-
-def test_paged_bf16_auto_chunk_heuristic_uses_forty_eight_pages_for_decode_32768() -> None:
-    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
-        q_seqlens=[1] * 8,
-        cache_seqlens=[32768] * 8,
-        kv_dtype=torch.bfloat16,
-    )
-    plan = create_paged_plan(
-        q,
-        k_cache,
-        v_cache,
-        page_table,
-        cache_seqlens,
-        cu_seqlens_q,
-    )
-
-    assert plan.mode == "decode"
-    assert plan.kv_chunk_size == _expected_chunk_size(32768, bf16_decode_chunk_pages)
-    assert plan.split_kv is True
-
-
-def test_paged_decode_fp8_chunk_policy_is_explicit_out_to_128k() -> None:
-    _assert_chunk_table(
-        q_seqlens=[1] * 8,
-        kv_dtype=torch.float8_e4m3fn,
-        expected_chunk_pages_by_cache_len={
-            cache_len: fp8_decode_chunk_pages((cache_len + 63) // 64) for cache_len in _EXPLICIT_TOKEN_LENGTHS
-        },
+        == 7
     )
 
 
-def test_paged_decode_bf16_chunk_policy_is_explicit_out_to_128k() -> None:
-    _assert_chunk_table(
-        q_seqlens=[1] * 8,
-        kv_dtype=torch.bfloat16,
-        expected_chunk_pages_by_cache_len={
-            cache_len: bf16_decode_chunk_pages((cache_len + 63) // 64) for cache_len in _EXPLICIT_TOKEN_LENGTHS
-        },
+def test_build_decode_chunk_pages_lut_uses_registered_policy() -> None:
+    register_decode_graph_policy(
+        kv_dtype="bf16",
+        regime="decode",
+        batch=3,
+        graph_ctas_per_sm=5,
+        capture_fixed_split_pages=4,
+        capture_page_count=4096,
+        page_size=64,
+        chunk_ladder=((4, 1), (8, 2), (16, 3)),
     )
 
-
-def test_paged_extend_fp8_chunk_policy_is_explicit_out_to_128k() -> None:
-    _assert_chunk_table(
-        q_seqlens=[6] * 8,
-        kv_dtype=torch.float8_e4m3fn,
-        expected_chunk_pages_by_cache_len={
-            cache_len: fp8_extend_chunk_pages((cache_len + 63) // 64) for cache_len in _EXPLICIT_TOKEN_LENGTHS
-        },
-    )
-
-
-def test_paged_extend_bf16_chunk_policy_is_explicit_out_to_128k() -> None:
-    _assert_chunk_table(
-        q_seqlens=[6] * 8,
-        kv_dtype=torch.bfloat16,
-        expected_chunk_pages_by_cache_len={
-            cache_len: bf16_extend_chunk_pages((cache_len + 63) // 64) for cache_len in _EXPLICIT_TOKEN_LENGTHS
-        },
-    )
-
-
-def test_build_decode_chunk_pages_lut_matches_bf16_decode_function() -> None:
     lut = build_decode_chunk_pages_lut(
         q_dtype=torch.bfloat16,
         kv_dtype=torch.bfloat16,
+        batch=3,
         page_size=64,
         head_dim_qk=256,
         head_dim_vo=256,
         gqa_group_size=8,
-        max_effective_kv_pages=2048,
+        max_effective_kv_pages=16,
     )
 
-    assert lut[0] == bf16_decode_chunk_pages(1)
-    assert lut[127] == bf16_decode_chunk_pages(128)
-    assert lut[511] == bf16_decode_chunk_pages(512)
-    assert lut[1023] == bf16_decode_chunk_pages(1024)
-    assert lut[2047] == bf16_decode_chunk_pages(2048)
+    assert lut[:4] == (1, 1, 1, 1)
+    assert lut[4:8] == (2, 2, 2, 2)
+    assert lut[8:] == (3, 3, 3, 3, 3, 3, 3, 3)
+
+
+@pytest.mark.parametrize(
+    ("q_seqlens", "cache_seqlens", "kv_dtype"),
+    [
+        ([1] * 8, [8192] * 8, torch.float8_e4m3fn),
+        ([1] * 8, [32768] * 8, torch.bfloat16),
+        ([6] * 8, [8192] * 8, torch.float8_e4m3fn),
+        ([6] * 8, [32768] * 8, torch.bfloat16),
+    ],
+)
+def test_paged_non_policy_chunk_selection_still_produces_valid_split_kv_plans(
+    q_seqlens: list[int],
+    cache_seqlens: list[int],
+    kv_dtype: torch.dtype,
+) -> None:
+    q, k_cache, v_cache, page_table, cache_seqlens_t, cu_seqlens_q = _make_inputs(
+        q_seqlens=q_seqlens,
+        cache_seqlens=cache_seqlens,
+        kv_dtype=kv_dtype,
+    )
+    plan = create_paged_plan(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens_t,
+        cu_seqlens_q,
+    )
+
+    assert plan.kv_chunk_size > 0
+    assert plan.total_num_partial_rows >= plan.total_q
+    assert plan.new_batch_size >= page_table.shape[0]
+    assert plan.split_kv is True

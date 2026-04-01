@@ -288,6 +288,49 @@ def test_paged_workspace_matches_reference_for_fp8_kv_cache() -> None:
     assert _cosine_similarity(out, ref_out) >= 0.9999
 
 
+def test_paged_workspace_matches_reference_for_bf16_splitkv_extend_shape() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
+        q_seqlens=[128],
+        cache_seqlens=[128],
+        page_size=64,
+        q_heads=8,
+        kv_heads=1,
+        head_dim=256,
+        seed=29,
+    )
+    workspace = _make_workspace(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        cu_seqlens_q=cu_seqlens_q,
+    )
+    workspace.prepare(page_table, cache_seqlens, cu_seqlens_q)
+
+    assert workspace.plan.mode == "extend"
+    assert workspace.plan.split_kv is True
+    assert workspace.plan.kv_chunk_size == 64
+
+    output = torch.empty_like(q)
+    out, lse = workspace.run(q, k_cache, v_cache, output=output)
+    ref_out, ref_lse = paged_attention_reference(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        causal=True,
+    )
+    torch.cuda.synchronize()
+
+    assert (out - ref_out).abs().max().item() <= 0.02
+    assert (_lse_base2_to_natural(lse) - ref_lse).abs().max().item() <= 0.02
+    assert _cosine_similarity(out, ref_out) >= 0.9999
+
+
 def test_paged_mode_inference_distinguishes_decode_from_extend() -> None:
     require_sm120()
     clear_attention_caches()

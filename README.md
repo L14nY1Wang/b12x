@@ -1,4 +1,3 @@
-# b12x
 
 `b12x` is an SM120-only CuTe DSL kernel library for Blackwell NVFP4 dense GEMM,
 routed Mixture-of-Experts, and paged attention inference.
@@ -8,15 +7,12 @@ full model-serving stack. It does not intend to target any other GPU architectur
 including SM100. It is a focused package for a small number of hand-tuned, high-performance
 SM120 kernels plus the runtime glue needed to launch them cleanly from PyTorch and `sglang`.
 
-## Installation
 
-### Runtime install
 
 ```bash
 python -m pip install b12x
 ```
 
-### Development install from source
 
 ```bash
 git clone <repo-url>
@@ -24,7 +20,6 @@ cd b12x
 python -m pip install -e '.[dev]'
 ```
 
-## Requirements
 
 - Blackwell SM120 GPU
 - CUDA 13 toolchain
@@ -34,7 +29,6 @@ python -m pip install -e '.[dev]'
 - FlashInfer available if you want reference and benchmark comparisons, but it's not a runtime dependency
 - Qwen3.5-397B A17B NVFP4 checkpoint available through `B12X_MODEL_PATH` for the end-to-end MoE benchmark
 
-## Package layout
 
 - `b12x.attention`
   - Primary SM120 paged attention backend (split-KV, BF16/FP8 KV, exact host planning)
@@ -51,7 +45,6 @@ python -m pip install -e '.[dev]'
 - `b12x.sglang`
   - Thin `sglang` integration shims
 
-## Attention runtime contract
 
 Paged attention now routes through the primary `b12x.attention.paged` backend.
 It is narrow by design and tuned for the Blackwell serving matrix this repo
@@ -68,13 +61,11 @@ cares about.
 - GQA with arbitrary ratios is supported.
 - During CUDA graph capture, `output=` must be caller-owned and stable across replays.
 
-## Acknowledgement
 
 The paged attention planner, split/merge structure, and benchmark methodology
 were developed by studying FlashInfer's paged attention kernels. `b12x` ships
 its own SM120-first implementation and does not depend on FlashInfer at runtime.
 
-## MoE runtime contract
 
 - `b12x.integration.tp_moe.b12x_moe_fp4` requires a caller-owned workspace.
 - `b12x` selects its fused MoE backend from shape alone:
@@ -85,7 +76,6 @@ its own SM120-first implementation and does not depend on FlashInfer at runtime.
 - Keep one workspace pool per process/device, and let the pool partition scratch by CUDA stream internally.
 - During CUDA graph capture, `output=` must also be caller-owned and stable across replays.
 
-## Environment variables
 
 | Variable | Default | Description |
 |---|---|---|
@@ -99,9 +89,7 @@ its own SM120-first implementation and does not depend on FlashInfer at runtime.
 | `B12X_{STATIC,MICRO,DYNAMIC}_MAX_ACTIVE_CLUSTERS` | auto | Override max active clusters per backend. |
 | `B12X_{STATIC,MICRO,DYNAMIC}_REUSE_COMPILED` | `1` | Reuse compiled kernels across shapes within a backend. |
 
-## Benchmarks and tests
 
-### Benchmarks
 
 - `benchmarks/benchmark_moe.py`
   - End-to-end Qwen3.5-397B TP=4 MoE benchmark
@@ -115,7 +103,6 @@ its own SM120-first implementation and does not depend on FlashInfer at runtime.
 - `benchmarks/benchmark_mxfp8_pv.py`
   - MXFP8 PV microbenchmark (turbo mode throughput)
 
-### Tests
 
 - `tests/test_paged_attention_workspace_api.py`
   - Public paged attention plan, workspace, and wrapper correctness
@@ -136,39 +123,27 @@ its own SM120-first implementation and does not depend on FlashInfer at runtime.
 - `tests/test_gemm_stack.py`
   - Dense GEMM exactness vs FlashInfer/cuDNN
 
-## Common commands
 
 ```bash
-# Graph-first benchmark defaults with auto-dispatch
 B12X_MODEL_PATH=/path/to/Qwen3.5-397B-A17B-NVFP4 python benchmarks/benchmark_moe.py
 
-# Measure eager launches instead of CUDA graph replay
 B12X_MODEL_PATH=/path/to/Qwen3.5-397B-A17B-NVFP4 python benchmarks/benchmark_moe.py --no-cuda-graph
 
-# Include routing in the timed region
 B12X_MODEL_PATH=/path/to/Qwen3.5-397B-A17B-NVFP4 python benchmarks/benchmark_moe.py --include-routing
 
-# Use the recorded single-request sglang profile
 B12X_MODEL_PATH=/path/to/Qwen3.5-397B-A17B-NVFP4 python benchmarks/benchmark_moe.py --batch-size-profile sglang-single-request
 
-# Graph-first prefill-scale sweep aligned with chunked-prefill serving
 B12X_MODEL_PATH=/path/to/Qwen3.5-397B-A17B-NVFP4 python benchmarks/benchmark_moe.py --batch-size-profile chunked-prefill
 
-# Multi-layer CUDA-graph replay validation with real consecutive MoE layers
 B12X_MODEL_PATH=/path/to/Qwen3.5-397B-A17B-NVFP4 python benchmarks/benchmark_moe.py --graph-mode multi-layer --reference none --validate none
 
-# Paged attention benchmark vs FlashInfer
 python benchmarks/benchmark_paged_attention.py
 
-# Dense GEMM microbenchmark
 python benchmarks/benchmark_dense_gemm.py
 
-# Attention correctness
 pytest tests/test_attention_cuda_graphs.py tests/test_paged_attention_workspace_api.py
 
-# Oracle-backed MoE correctness
 python tests/test_tp_moe_reference.py --impls b12x --scale-contract per-expert
 
-# Real-weight CUDA-graph smoke
 pytest tests/test_moe_equivalence.py
 ```

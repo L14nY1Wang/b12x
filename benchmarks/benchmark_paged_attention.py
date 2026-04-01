@@ -18,6 +18,7 @@ from b12x.integration.attention import (
     PagedAttentionWorkspace,
     clear_attention_caches,
 )
+from b12x.attention.paged.planner import create_paged_plan
 
 
 def require_sm120() -> None:
@@ -178,37 +179,90 @@ def _build_shape_cases(
     return cases
 
 
+def _make_uniform_page_metadata(
+    *,
+    batch: int,
+    cache_seqlen: int,
+    page_size: int,
+    num_pages: int,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    device = "cuda"
+    pages_per_request = (cache_seqlen + page_size - 1) // page_size
+    total_pages_needed = batch * pages_per_request
+    if num_pages < total_pages_needed:
+        raise ValueError(
+            f"num_pages={num_pages} is too small for batch={batch}, cache_seqlen={cache_seqlen}, "
+            f"page_size={page_size}; need at least {total_pages_needed}"
+        )
+    page_table = torch.zeros(batch, pages_per_request, dtype=torch.int32, device=device)
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+    page_order = torch.randperm(num_pages, generator=generator, device=device)
+    for request_idx in range(batch):
+        start = request_idx * pages_per_request
+        page_ids = page_order[start : start + pages_per_request].to(torch.int32)
+        page_table[request_idx] = page_ids
+    cache_seqlens = torch.full((batch,), cache_seqlen, dtype=torch.int32, device=device)
+    return page_table, cache_seqlens
+
+
 def _make_uniform_paged_inputs(
     *,
     batch: int,
     q_seqlen: int,
     cache_seqlen: int,
+    capture_cache_seqlen: int | None,
     page_size: int,
     q_heads: int,
     kv_heads: int,
     head_dim: int,
     dtype: torch.dtype,
     seed: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
     torch.manual_seed(seed)
     device = "cuda"
     total_q = batch * q_seqlen
     q = torch.randn(total_q, q_heads, head_dim, device=device, dtype=dtype) / 4
-    pages_per_request = (cache_seqlen + page_size - 1) // page_size
-    max_pages = pages_per_request
-    total_pages_needed = batch * pages_per_request
-    num_pages = max(1, total_pages_needed * 2)
+    capture_cache_seqlen = max(cache_seqlen, capture_cache_seqlen or cache_seqlen)
+    capture_pages_per_request = (capture_cache_seqlen + page_size - 1) // page_size
+    num_pages = batch * capture_pages_per_request
     k_cache = torch.randn(num_pages, page_size, kv_heads, head_dim, device=device, dtype=dtype) / 4
     v_cache = torch.randn(num_pages, page_size, kv_heads, head_dim, device=device, dtype=dtype) / 4
-    page_table = torch.zeros(batch, max_pages, dtype=torch.int32, device=device)
-    page_order = torch.randperm(num_pages, device=device)
-    for request_idx in range(batch):
-        start = request_idx * pages_per_request
-        page_ids = page_order[start : start + pages_per_request].to(torch.int32)
-        page_table[request_idx] = page_ids
-    cache_seqlens = torch.full((batch,), cache_seqlen, dtype=torch.int32, device=device)
+    page_table, cache_seqlens = _make_uniform_page_metadata(
+        batch=batch,
+        cache_seqlen=cache_seqlen,
+        page_size=page_size,
+        num_pages=num_pages,
+        seed=seed,
+    )
+    capture_page_table, capture_cache_seqlens = _make_uniform_page_metadata(
+        batch=batch,
+        cache_seqlen=capture_cache_seqlen,
+        page_size=page_size,
+        num_pages=num_pages,
+        seed=seed + 10_000,
+    )
     cu_seqlens_q = torch.arange(0, total_q + 1, q_seqlen, dtype=torch.int32, device=device)
-    return q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q
+    return (
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        capture_page_table,
+        capture_cache_seqlens,
+        cu_seqlens_q,
+    )
 
 
 def _quantize_paged_kv_cache_global_e4m3(
@@ -288,12 +342,15 @@ def _capture_backend_graph(
     v_cache: torch.Tensor,
     page_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
+    capture_page_table: torch.Tensor,
+    capture_cache_seqlens: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     fixed_split_pages: int | None,
     k_descale: torch.Tensor | None,
     v_descale: torch.Tensor | None,
     warmup: int,
     b12x_attn_mode: str,
+    graph_ctas_per_sm: int | None,
 ) -> BackendCapture:
     output = torch.empty_like(q)
     mode = "decode" if int(q.shape[0]) == int(page_table.shape[0]) else "extend"
@@ -302,15 +359,41 @@ def _capture_backend_graph(
         q=q,
         k_cache=k_cache,
         v_cache=v_cache,
-        use_cuda_graph=True,
+        use_cuda_graph=False,
         attn_mode=b12x_attn_mode,
     )
-    workspace.prepare(
-        page_table,
-        cache_seqlens,
-        cu_seqlens_q,
-        fixed_split_size=fixed_split_pages,
-    )
+    assert workspace._plan_q is not None
+    assert workspace._plan_k_cache is not None
+    assert workspace._plan_v_cache is not None
+    active_total_q = int(cu_seqlens_q[-1].item())
+
+    def graph_plan_for(
+        runtime_page_table: torch.Tensor,
+        runtime_cache_seqlens: torch.Tensor,
+    ):
+        return create_paged_plan(
+            workspace._plan_q[:active_total_q],
+            workspace._plan_k_cache,
+            workspace._plan_v_cache,
+            runtime_page_table,
+            runtime_cache_seqlens,
+            cu_seqlens_q,
+            mode=mode,
+            fixed_split_size=-1 if fixed_split_pages is None else int(fixed_split_pages),
+            disable_split_kv=False,
+            enable_cuda_graph=True,
+            graph_chunk_policy=True,
+            graph_ctas_per_sm=graph_ctas_per_sm,
+        )
+
+    replay_plan = graph_plan_for(page_table, cache_seqlens)
+    capture_plan = graph_plan_for(capture_page_table, capture_cache_seqlens)
+    workspace._ensure_capacity(replay_plan)
+    workspace._ensure_capacity(capture_plan)
+    workspace.use_cuda_graph = True
+    workspace._copy_runtime_metadata(capture_page_table, capture_cache_seqlens, cu_seqlens_q)
+    workspace._copy_plan_metadata(capture_plan)
+    workspace._plan = capture_plan
 
     def run() -> None:
         workspace.run(
@@ -323,6 +406,9 @@ def _capture_backend_graph(
         )
 
     graph = _capture_graph(run, warmup=warmup)
+    workspace._copy_runtime_metadata(page_table, cache_seqlens, cu_seqlens_q)
+    workspace._copy_plan_metadata(replay_plan)
+    workspace._plan = replay_plan
     chunk_desc = f"chunk={workspace.plan.kv_chunk_size}"
     if workspace.plan.split_kv:
         chunk_desc += ",split"
@@ -338,6 +424,8 @@ def _capture_flashinfer_fa2_graph(
     v_cache: torch.Tensor,
     page_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
+    capture_page_table: torch.Tensor,
+    capture_cache_seqlens: torch.Tensor,
     q_seqlen: int,
     page_size: int,
     q_heads: int,
@@ -361,6 +449,18 @@ def _capture_flashinfer_fa2_graph(
             page_size=page_size,
         )
     )
+    (
+        capture_qo_indptr,
+        capture_paged_kv_indptr,
+        capture_paged_kv_indices,
+        capture_paged_kv_last_page_len,
+    ) = _make_flashinfer_page_metadata(
+        batch=batch,
+        q_seqlen=q_seqlen,
+        cache_seqlens=capture_cache_seqlens,
+        page_table=capture_page_table,
+        page_size=page_size,
+    )
     float_workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=q.device)
     sm_scale = head_dim ** -0.5
 
@@ -370,15 +470,15 @@ def _capture_flashinfer_fa2_graph(
             kv_layout="NHD",
             use_cuda_graph=True,
             use_tensor_cores=True,
-            paged_kv_indptr_buffer=paged_kv_indptr.clone(),
-            paged_kv_indices_buffer=paged_kv_indices.clone(),
-            paged_kv_last_page_len_buffer=paged_kv_last_page_len.clone(),
+            paged_kv_indptr_buffer=capture_paged_kv_indptr.clone(),
+            paged_kv_indices_buffer=capture_paged_kv_indices.clone(),
+            paged_kv_last_page_len_buffer=capture_paged_kv_last_page_len.clone(),
             backend="fa2",
         )
         wrapper.plan(
-            indptr=paged_kv_indptr,
-            indices=paged_kv_indices,
-            last_page_len=paged_kv_last_page_len,
+            indptr=capture_paged_kv_indptr,
+            indices=capture_paged_kv_indices,
+            last_page_len=capture_paged_kv_last_page_len,
             num_qo_heads=q_heads,
             num_kv_heads=kv_heads,
             head_dim=head_dim,
@@ -400,23 +500,35 @@ def _capture_flashinfer_fa2_graph(
             )
 
         graph = _capture_graph(run, warmup=warmup)
+        wrapper.plan(
+            indptr=paged_kv_indptr,
+            indices=paged_kv_indices,
+            last_page_len=paged_kv_last_page_len,
+            num_qo_heads=q_heads,
+            num_kv_heads=kv_heads,
+            head_dim=head_dim,
+            page_size=page_size,
+            q_data_type=q_dtype,
+            kv_data_type=kv_dtype,
+            sm_scale=sm_scale,
+        )
         return graph, output.view(-1, q_heads, head_dim)
 
     wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
         float_workspace,
         kv_layout="NHD",
         use_cuda_graph=True,
-        qo_indptr_buf=qo_indptr.clone(),
-        paged_kv_indptr_buf=paged_kv_indptr.clone(),
-        paged_kv_indices_buf=paged_kv_indices.clone(),
-        paged_kv_last_page_len_buf=paged_kv_last_page_len.clone(),
+        qo_indptr_buf=capture_qo_indptr.clone(),
+        paged_kv_indptr_buf=capture_paged_kv_indptr.clone(),
+        paged_kv_indices_buf=capture_paged_kv_indices.clone(),
+        paged_kv_last_page_len_buf=capture_paged_kv_last_page_len.clone(),
         backend="fa2",
     )
     wrapper.plan(
-        qo_indptr=qo_indptr,
-        paged_kv_indptr=paged_kv_indptr,
-        paged_kv_indices=paged_kv_indices,
-        paged_kv_last_page_len=paged_kv_last_page_len,
+        qo_indptr=capture_qo_indptr,
+        paged_kv_indptr=capture_paged_kv_indptr,
+        paged_kv_indices=capture_paged_kv_indices,
+        paged_kv_last_page_len=capture_paged_kv_last_page_len,
         num_qo_heads=q_heads,
         num_kv_heads=kv_heads,
         head_dim_qk=head_dim,
@@ -432,6 +544,20 @@ def _capture_flashinfer_fa2_graph(
         wrapper.run(q, (k_cache, v_cache), out=output, k_scale=k_scale, v_scale=v_scale)
 
     graph = _capture_graph(run, warmup=warmup)
+    wrapper.plan(
+        qo_indptr=qo_indptr,
+        paged_kv_indptr=paged_kv_indptr,
+        paged_kv_indices=paged_kv_indices,
+        paged_kv_last_page_len=paged_kv_last_page_len,
+        num_qo_heads=q_heads,
+        num_kv_heads=kv_heads,
+        head_dim_qk=head_dim,
+        page_size=page_size,
+        causal=True,
+        q_data_type=q_dtype,
+        kv_data_type=kv_dtype,
+        sm_scale=sm_scale,
+    )
     return graph, output
 
 
@@ -450,6 +576,8 @@ def main() -> None:
     parser.add_argument("--replays", type=int, default=1000)
     parser.add_argument("--flashinfer-workspace-mb", type=int, default=512)
     parser.add_argument("--fixed-split-pages", type=int, default=0)
+    parser.add_argument("--capture-cache-seqlen", type=int, default=0)
+    parser.add_argument("--graph-ctas-per-sm", type=int, default=0)
     parser.add_argument("--b12x-attn-mode", choices=["default", "turbo"], default="default")
     parser.add_argument("--ci-level", type=float, default=0.95)
     parser.add_argument("--compare-fa2", action="store_true", default=True)
@@ -488,6 +616,8 @@ def main() -> None:
             "q_dtype": str(dtype),
             "kv_dtype": str(kv_dtype),
             "fixed_split_pages": args.fixed_split_pages,
+            "capture_cache_seqlen": args.capture_cache_seqlen,
+            "graph_ctas_per_sm": args.graph_ctas_per_sm,
             "b12x_attn_mode": args.b12x_attn_mode,
             "replays": args.replays,
             "flashinfer_fa2": args.compare_fa2,
@@ -496,11 +626,21 @@ def main() -> None:
 
     speedups: list[float] = []
     for case_idx, case in enumerate(cases):
-        q, k_cache, v_cache, page_table, cache_seqlens_tensor, cu_seqlens_q = (
+        (
+            q,
+            k_cache,
+            v_cache,
+            page_table,
+            cache_seqlens_tensor,
+            capture_page_table,
+            capture_cache_seqlens,
+            cu_seqlens_q,
+        ) = (
             _make_uniform_paged_inputs(
                 batch=case.batch,
                 q_seqlen=case.q_seqlen,
                 cache_seqlen=case.cache_seqlen,
+                capture_cache_seqlen=args.capture_cache_seqlen if args.capture_cache_seqlen > 0 else None,
                 page_size=args.page_size,
                 q_heads=args.q_heads,
                 kv_heads=args.kv_heads,
@@ -526,12 +666,15 @@ def main() -> None:
             v_cache=v_cache,
             page_table=page_table,
             cache_seqlens=cache_seqlens_tensor,
+            capture_page_table=capture_page_table,
+            capture_cache_seqlens=capture_cache_seqlens,
             cu_seqlens_q=cu_seqlens_q,
             fixed_split_pages=args.fixed_split_pages if args.fixed_split_pages > 0 else None,
             k_descale=k_descale,
             v_descale=v_descale,
             warmup=args.warmup,
             b12x_attn_mode=args.b12x_attn_mode,
+            graph_ctas_per_sm=args.graph_ctas_per_sm if args.graph_ctas_per_sm > 0 else None,
         )
         backend_times_ms = _bench_graph(backend_capture.graph, replays=args.replays)
         backend_ci_low_ms, backend_ci_high_ms, backend_sem_ms = _mean_ci(
@@ -556,6 +699,8 @@ def main() -> None:
                 v_cache=v_cache,
                 page_table=page_table,
                 cache_seqlens=cache_seqlens_tensor,
+                capture_page_table=capture_page_table,
+                capture_cache_seqlens=capture_cache_seqlens,
                 q_seqlen=case.q_seqlen,
                 page_size=args.page_size,
                 q_heads=args.q_heads,

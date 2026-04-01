@@ -587,9 +587,9 @@ def st_shared_u8(smem_addr: Int32, value: Uint8, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def get_ptr_as_int64(tensor: cute.Tensor, offset: Int32, *, loc=None, ip=None) -> Int64:
+def get_ptr_as_int64(tensor: cute.Tensor, offset, *, loc=None, ip=None) -> Int64:
     """Get the memory address of tensor[offset] as Int64."""
-    elem_ptr = tensor.iterator + Int32(offset)
+    elem_ptr = tensor.iterator + offset
     ptr_int = llvm.ptrtoint(T.i64(), elem_ptr.llvm_ptr, loc=loc, ip=ip)
     return Int64(ptr_int)
 

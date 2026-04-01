@@ -1,6 +1,6 @@
 [project]
 name = "b12x"
-version = "0.5.1"
+version = "0.6.0"
 description = "Unapologetically SM120-only CuTe DSL kernels for NVFP4 GEMM and MoE."
 readme = "README.md"
 requires-python = ">=3.10,<4.0"
@@ -9,7 +9,7 @@ license = "Apache-2.0"
 dependencies = [
   "torch>=2.10.0",
   "cuda-python",
-  "nvidia-cutlass-dsl[cu13]==4.4.1",
+  "nvidia-cutlass-dsl[cu13]>=4.4.1",
   "apache-tvm-ffi>=0.1.6,!=0.1.8,!=0.1.8.post0,<0.2",
   "rich>=13",
 ]

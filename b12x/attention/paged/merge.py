@@ -123,12 +123,25 @@ def _state_merge(
 ) -> tuple[Float32, Float32]:
     prev_m = state_m
     prev_d = state_d
-    state_m = attention_utils.fmax(prev_m, other_m)
-    prev_scale = _exp2_approx_ftz_f32(prev_m - state_m)
-    other_scale = _exp2_approx_ftz_f32(other_m - state_m)
-    state_d = Float32(prev_d * prev_scale + other_d * other_scale)
-    for vec_idx in cutlass.range_constexpr(cute.size(state_o.shape)):
-        state_o[vec_idx] = state_o[vec_idx] * prev_scale + other_o[vec_idx] * other_scale
+    if prev_m == -Float32.inf:
+        if other_m == -Float32.inf:
+            state_m = Float32(prev_m)
+            state_d = Float32(prev_d)
+        else:
+            for vec_idx in cutlass.range_constexpr(cute.size(state_o.shape)):
+                state_o[vec_idx] = other_o[vec_idx]
+            state_m = Float32(other_m)
+            state_d = Float32(other_d)
+    elif other_m == -Float32.inf:
+        state_m = Float32(prev_m)
+        state_d = Float32(prev_d)
+    else:
+        state_m = attention_utils.fmax(prev_m, other_m)
+        prev_scale = _exp2_approx_ftz_f32(prev_m - state_m)
+        other_scale = _exp2_approx_ftz_f32(other_m - state_m)
+        state_d = Float32(prev_d * prev_scale + other_d * other_scale)
+        for vec_idx in cutlass.range_constexpr(cute.size(state_o.shape)):
+            state_o[vec_idx] = state_o[vec_idx] * prev_scale + other_o[vec_idx] * other_scale
     return Float32(state_m), state_d
 
 
@@ -260,7 +273,7 @@ def _merge_async_slot(
             partial_idx = start_idx + next_linear_idx
             gmem_addr = get_ptr_as_int64(
                 mV_partial,
-                Int32((partial_idx * num_heads + head_idx) * head_dim + base_k),
+                (Int64(partial_idx) * Int64(num_heads) + Int64(head_idx)) * Int64(head_dim) + Int64(base_k),
             )
             _cp_async_load_128b(smem_addr, gmem_addr)
         cute.arch.cp_async_commit_group()
@@ -486,7 +499,8 @@ class PagedPersistentMergeKernel:
                             partial_idx = start_idx + staged_linear_idx
                             gmem_addr = get_ptr_as_int64(
                                 mV_partial,
-                                Int32((partial_idx * num_heads + head_idx) * head_dim + base_k),
+                                (Int64(partial_idx) * Int64(num_heads) + Int64(head_idx)) * Int64(head_dim)
+                                + Int64(base_k),
                             )
                             _cp_async_load_128b(smem_addr, gmem_addr)
                         cute.arch.cp_async_commit_group()

@@ -617,6 +617,12 @@ def _workspace_pool_key(
     device: torch.device,
     dtype: torch.dtype,
 ) -> tuple:
+    # Dynamic kernels accept runtime row/task extents, so one pool entry can
+    # safely serve any request up to the workspace's current capacity. Avoid
+    # exact-shape keys here or long-tail prompt lengths will accumulate one
+    # retained dynamic workspace per distinct routed-row count.
+    if implementation == "dynamic":
+        max_rows = -1
     return (
         implementation,
         stream_key,
@@ -689,6 +695,24 @@ def _resolve_workspace(
     )
     resolved = workspace.workspaces.get(key)
     if resolved is None:
+        resolved = _alloc_workspace(
+            implementation,
+            state_E,
+            weight_E,
+            k,
+            n,
+            num_topk,
+            device,
+            dtype,
+            a1_gscale,
+            a2_gscale,
+            max_rows=max_rows,
+            input_scales_static=input_scales_static,
+        )
+        workspace.workspaces[key] = resolved
+        return resolved
+
+    if implementation == "dynamic" and resolved.max_rows < max_rows:
         resolved = _alloc_workspace(
             implementation,
             state_E,
