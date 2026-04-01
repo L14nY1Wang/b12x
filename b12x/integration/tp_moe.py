@@ -26,7 +26,7 @@ _DYNAMIC_SLICE_CHUNK = 2
 
 @dataclass(kw_only=True)
 class TPMoEWorkspace:
-    """Reusable scratch buffers for one exact `b12x_moe_fp4` launch shape."""
+    """Reusable scratch buffers for one `b12x_moe_fp4` shape family."""
     implementation: str
     state_E: int
     weight_E: int
@@ -53,6 +53,7 @@ class TPMoEWorkspace:
 
 @dataclass(kw_only=True)
 class TPCompactStaticWorkspace(TPMoEWorkspace):
+    routed_rows_capacity: int
     active_expert_count: torch.Tensor
     weight_expert_ids: torch.Tensor
     global_to_local_expert: torch.Tensor
@@ -61,6 +62,9 @@ class TPCompactStaticWorkspace(TPMoEWorkspace):
 
 @dataclass(kw_only=True)
 class TPDynamicWorkspace(TPMoEWorkspace):
+    routed_rows_capacity: int
+    physical_tiles_capacity: int
+    task_capacity: int
     expert_write_rows: torch.Tensor
     expert_tile_base: torch.Tensor
     input_gs: torch.Tensor
@@ -83,7 +87,7 @@ class TPDynamicWorkspace(TPMoEWorkspace):
 
 @dataclass
 class TPMoEWorkspacePool:
-    """Caller-owned exact-shape workspace cache partitioned by CUDA stream.
+    """Caller-owned capacity-based workspace cache partitioned by CUDA stream.
 
     A single explicit pool may be shared across multiple layers, but overlapping
     launches on different CUDA streams must still use distinct scratch buffers.
@@ -129,6 +133,31 @@ class _TPRouteWorkspace:
     topk_logits: torch.Tensor
     topk_ids: torch.Tensor
     topk_weights: torch.Tensor
+
+
+@dataclass(frozen=True, kw_only=True)
+class TPMoEPlan:
+    """Logical launch plan shared by the static and dynamic backends."""
+
+    implementation: str
+    state_E: int
+    weight_E: int
+    routed_rows: int
+    max_rows: int
+    k: int
+    n: int
+    num_topk: int
+    device: torch.device
+    dtype: torch.dtype
+    max_tokens_per_launch: int
+    dynamic_physical_tiles: int | None = None
+    dynamic_task_capacity: int | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class _TPMoEWorkspacePolicy:
+    can_chunk: bool
+    eager_exact_dynamic: bool
 
 
 @dataclass
@@ -188,14 +217,22 @@ def _env_flag(name: str, *, default: bool) -> bool:
 _FAST_MATH_DEFAULT = _env_flag("B12X_FAST_MATH", default=True)
 
 
+def _first_env(*names: str) -> str | None:
+    for name in names:
+        value = os.environ.get(name)
+        if value is not None:
+            return value
+    return None
+
+
 def _get_static_compact_cutover_pairs() -> int:
     global _STATIC_COMPACT_CUTOVER_PAIRS_CACHE
     if _STATIC_COMPACT_CUTOVER_PAIRS_CACHE is None:
-        cutover = os.environ.get("B12X_STATIC_COMPACT_CUTOVER_PAIRS")
-        if cutover is None:
-            cutover = os.environ.get("B12X_DYNAMIC_STATIC_CUTOVER_PAIRS")
-        if cutover is None:
-            cutover = os.environ.get("B12X_LEVEL10_STATIC_CUTOVER_PAIRS")
+        cutover = _first_env(
+            "B12X_STATIC_COMPACT_CUTOVER_PAIRS",
+            "B12X_DYNAMIC_STATIC_CUTOVER_PAIRS",
+            "B12X_LEVEL10_STATIC_CUTOVER_PAIRS",
+        )
         if cutover is None:
             _STATIC_COMPACT_CUTOVER_PAIRS_CACHE = _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT
         else:
@@ -217,9 +254,12 @@ def _get_micro_cutover_tokens() -> int:
 def _dynamic_multicta_enabled() -> bool:
     global _DYNAMIC_MULTICTA_CACHE
     if _DYNAMIC_MULTICTA_CACHE is None:
-        multicta_env = os.environ.get("B12X_DYNAMIC_ENABLE_MULTICTA")
+        multicta_env = _first_env(
+            "B12X_DYNAMIC_ENABLE_MULTICTA",
+            "B12X_LEVEL10_ENABLE_MULTICTA",
+        )
         if multicta_env is None:
-            multicta_env = os.environ.get("B12X_LEVEL10_ENABLE_MULTICTA", "1")
+            multicta_env = "1"
         _DYNAMIC_MULTICTA_CACHE = multicta_env == "1"
     return _DYNAMIC_MULTICTA_CACHE
 
@@ -302,24 +342,29 @@ def _safe_token_chunk(E: int, k: int, n: int, num_topk: int) -> int:
 
 
 def _safe_dynamic_max_rows_per_launch(E: int, k: int, _n: int) -> int:
-    """Largest routed-row budget for the compact dynamic workspace.
+    """Largest graph-safe routed-row budget for the compact dynamic workspace.
 
     Dynamic now stores routed activations in a compact physical-tile pool, so
     the dominant CuTe memref extents scale with `rows_padded` rather than
-    `E * max_rows`. The compact pool still needs `E - 1` extra 128-row tiles
-    to account for the per-expert prefix upper bound.
+    `E * max_rows`. Graph-safe chunking still has to budget for the worst-case
+    active-expert envelope, so it reserves `E - 1` extra 128-row tiles in that
+    large-row regime.
     """
-    cols_pad_k = align_up(k // _NVFP4_BLOCK_SIZE, 4)
+    rows_padded_limit = _dynamic_rows_padded_limit(k)
     extra_rows = max(0, E - 1) * _LEVEL_TILE_M
-    rows_padded_limit = min(
-        _RUNTIME_MEMREF_LIMIT // max(1, k // 2),
-        _RUNTIME_MEMREF_LIMIT // max(1, cols_pad_k),
-    )
-    rows_padded_limit -= rows_padded_limit % _LEVEL_TILE_M
     safe_rows = rows_padded_limit - extra_rows
     if safe_rows <= 0:
         return _LEVEL_TILE_M
     return max(_LEVEL_TILE_M, safe_rows - (safe_rows % _LEVEL_TILE_M))
+
+
+def _dynamic_rows_padded_limit(k: int) -> int:
+    cols_pad_k = align_up(k // _NVFP4_BLOCK_SIZE, 4)
+    rows_padded_limit = min(
+        _RUNTIME_MEMREF_LIMIT // max(1, k // 2),
+        _RUNTIME_MEMREF_LIMIT // max(1, cols_pad_k),
+    )
+    return rows_padded_limit - (rows_padded_limit % _LEVEL_TILE_M)
 
 
 def _safe_dynamic_token_chunk(E: int, k: int, n: int, num_topk: int) -> int:
@@ -341,6 +386,54 @@ def _dynamic_token_chunk_limit(E: int, k: int, n: int, num_topk: int) -> int:
     return min(compact_limit, legacy_limit)
 
 
+def _eager_dynamic_token_chunk_limit(
+    topk_ids: torch.Tensor,
+    *,
+    weight_E: int,
+    k: int,
+    n: int,
+    num_topk: int,
+) -> int:
+    """Largest eager token chunk whose exact routed tile pool fits in one launch."""
+    rows_padded_limit = _dynamic_rows_padded_limit(k)
+    total_tokens = topk_ids.shape[0]
+    exact_tiles, _, _ = _dynamic_task_geometry_from_routing(topk_ids, weight_E=weight_E, n=n)
+    if exact_tiles * _LEVEL_TILE_M <= rows_padded_limit:
+        exact_limit = total_tokens
+    else:
+        lo = 1
+        hi = total_tokens
+        exact_limit = 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            prefix_tiles, _, _ = _dynamic_task_geometry_from_routing(
+                topk_ids[:mid],
+                weight_E=weight_E,
+                n=n,
+            )
+            if prefix_tiles * _LEVEL_TILE_M <= rows_padded_limit:
+                exact_limit = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+
+    legacy_env = os.environ.get("B12X_DYNAMIC_CHUNK_MULTIPLIER")
+    if legacy_env is None:
+        return exact_limit
+    legacy_limit = _safe_token_chunk(weight_E, k, n, num_topk) * _get_dynamic_chunk_multiplier()
+    return min(exact_limit, legacy_limit)
+
+
+def _workspace_policy(
+    workspace: TPMoEWorkspace | TPMoEWorkspacePool,
+) -> _TPMoEWorkspacePolicy:
+    is_pool = isinstance(workspace, TPMoEWorkspacePool)
+    return _TPMoEWorkspacePolicy(
+        can_chunk=is_pool,
+        eager_exact_dynamic=is_pool and not torch.cuda.is_current_stream_capturing(),
+    )
+
+
 def select_tp_moe_backend(
     *,
     num_tokens: int,
@@ -353,12 +446,35 @@ def select_tp_moe_backend(
     return "dynamic"
 
 
-def _dynamic_task_geometry(E: int, n: int, max_rows: int) -> tuple[int, int, int]:
-    max_m_tiles = max(1, align_up(max_rows, _LEVEL_TILE_M) // _LEVEL_TILE_M + E - 1)
+def _dynamic_task_geometry(E: int, n: int, routed_rows: int) -> tuple[int, int, int]:
+    routed_rows = max(1, routed_rows)
+    base_m_tiles = align_up(routed_rows, _LEVEL_TILE_M) // _LEVEL_TILE_M
+    # At most one new physical tile is introduced per active expert beyond the
+    # first, and the routed workload cannot touch more experts than routed rows.
+    active_expert_upper_bound = min(E, routed_rows)
+    max_m_tiles = max(1, base_m_tiles + active_expert_upper_bound - 1)
     gate_tile_cnt = max(1, (n + _LEVEL_TILE_N - 1) // _LEVEL_TILE_N)
     slice_groups = max(1, (gate_tile_cnt + _DYNAMIC_SLICE_CHUNK - 1) // _DYNAMIC_SLICE_CHUNK)
     max_tasks = max_m_tiles * slice_groups
     return max_m_tiles, gate_tile_cnt, max_tasks
+
+
+def _dynamic_task_geometry_from_routing(
+    topk_ids: torch.Tensor,
+    *,
+    weight_E: int,
+    n: int,
+) -> tuple[int, int, int]:
+    flat_ids = topk_ids.reshape(-1)
+    if flat_ids.dtype != torch.int64:
+        flat_ids = flat_ids.to(torch.int64)
+    counts = torch.bincount(flat_ids, minlength=weight_E)
+    tiles_per_expert = (counts + (_LEVEL_TILE_M - 1)) // _LEVEL_TILE_M
+    exact_tiles = max(1, int(tiles_per_expert.sum().item()))
+    gate_tile_cnt = max(1, (n + _LEVEL_TILE_N - 1) // _LEVEL_TILE_N)
+    slice_groups = max(1, (gate_tile_cnt + _DYNAMIC_SLICE_CHUNK - 1) // _DYNAMIC_SLICE_CHUNK)
+    max_tasks = exact_tiles * slice_groups
+    return exact_tiles, gate_tile_cnt, max_tasks
 
 
 def _refresh_dynamic_workspace_scales(
@@ -412,8 +528,11 @@ def _alloc_workspace(
     a1_gscale: torch.Tensor,
     a2_gscale: torch.Tensor,
     *,
+    routed_rows: int,
     max_rows: int,
     input_scales_static: bool,
+    dynamic_physical_tiles: int | None = None,
+    dynamic_task_capacity: int | None = None,
 ) -> TPMoEWorkspace:
     cols_pad_k = align_up(k // _NVFP4_BLOCK_SIZE, 4)
     common_kwargs = dict(
@@ -435,6 +554,7 @@ def _alloc_workspace(
         static_rows_pad_k = align_up(max_rows, 128)
         workspace = TPCompactStaticWorkspace(
             **common_kwargs,
+            routed_rows_capacity=routed_rows,
             token_map=torch.zeros(state_E, max_rows, dtype=torch.int32, device=device),
             token_weights=torch.zeros(state_E, max_rows, dtype=torch.float32, device=device),
             packed_input=torch.empty(state_E, max_rows, k // 2, dtype=torch.uint8, device=device),
@@ -447,10 +567,17 @@ def _alloc_workspace(
         _finalize_workspace_views(workspace)
         return workspace
 
-    dynamic_tiles, _, dynamic_max_tasks = _dynamic_task_geometry(state_E, n, max_rows)
+    if dynamic_physical_tiles is None or dynamic_task_capacity is None:
+        dynamic_tiles, _, dynamic_max_tasks = _dynamic_task_geometry(state_E, n, routed_rows)
+    else:
+        dynamic_tiles = dynamic_physical_tiles
+        dynamic_max_tasks = dynamic_task_capacity
     dynamic_rows_padded = dynamic_tiles * _LEVEL_TILE_M
     workspace = TPDynamicWorkspace(
         **common_kwargs,
+        routed_rows_capacity=routed_rows,
+        physical_tiles_capacity=dynamic_tiles,
+        task_capacity=dynamic_max_tasks,
         token_map=torch.zeros(dynamic_rows_padded, dtype=torch.int32, device=device),
         token_weights=torch.zeros(dynamic_rows_padded, dtype=torch.float32, device=device),
         packed_input=torch.empty(1, dynamic_rows_padded, k // 2, dtype=torch.uint8, device=device),
@@ -557,35 +684,84 @@ def _resolve_workspace_layout(
     return implementation, weight_E, ((routed_rows + 127) // 128) * 128
 
 
-def _validate_workspace(
-    workspace: TPMoEWorkspace,
+def _make_workspace_plan(
     *,
-    implementation: str,
-    state_E: int,
+    num_tokens: int,
     weight_E: int,
-    max_rows: int,
     k: int,
     n: int,
     num_topk: int,
     device: torch.device,
     dtype: torch.dtype,
+    topk_ids: torch.Tensor | None = None,
+    eager_exact_dynamic: bool = False,
+) -> TPMoEPlan:
+    routed_rows = num_tokens * num_topk
+    implementation, state_E, max_rows = _resolve_workspace_layout(
+        num_tokens=num_tokens,
+        weight_E=weight_E,
+        num_topk=num_topk,
+    )
+    dynamic_physical_tiles = None
+    dynamic_task_capacity = None
+    max_tokens_per_launch = num_tokens
+    if implementation == "dynamic":
+        if eager_exact_dynamic:
+            if topk_ids is None:
+                raise ValueError("routing-aware dynamic planning requires topk_ids")
+            dynamic_physical_tiles, _, dynamic_task_capacity = _dynamic_task_geometry_from_routing(
+                topk_ids,
+                weight_E=weight_E,
+                n=n,
+            )
+            max_tokens_per_launch = _eager_dynamic_token_chunk_limit(
+                topk_ids,
+                weight_E=weight_E,
+                k=k,
+                n=n,
+                num_topk=num_topk,
+            )
+        else:
+            dynamic_physical_tiles, _, dynamic_task_capacity = _dynamic_task_geometry(
+                state_E,
+                n,
+                routed_rows,
+            )
+            max_tokens_per_launch = _dynamic_token_chunk_limit(weight_E, k, n, num_topk)
+    return TPMoEPlan(
+        implementation=implementation,
+        state_E=state_E,
+        weight_E=weight_E,
+        routed_rows=routed_rows,
+        max_rows=max_rows,
+        k=k,
+        n=n,
+        num_topk=num_topk,
+        device=device,
+        dtype=dtype,
+        max_tokens_per_launch=max_tokens_per_launch,
+        dynamic_physical_tiles=dynamic_physical_tiles,
+        dynamic_task_capacity=dynamic_task_capacity,
+    )
+
+
+def _validate_workspace(
+    workspace: TPMoEWorkspace,
+    *,
+    plan: TPMoEPlan,
 ) -> None:
     expected = (
-        implementation,
-        state_E,
-        weight_E,
-        max_rows,
-        k,
-        n,
-        num_topk,
-        device,
-        dtype,
+        plan.implementation,
+        plan.weight_E,
+        plan.k,
+        plan.n,
+        plan.num_topk,
+        plan.device,
+        plan.dtype,
     )
     actual = (
         workspace.implementation,
-        workspace.state_E,
         workspace.weight_E,
-        workspace.max_rows,
         workspace.k,
         workspace.n,
         workspace.num_topk,
@@ -594,14 +770,52 @@ def _validate_workspace(
     )
     if actual != expected:
         raise ValueError(
-            "workspace shape mismatch: "
-            f"expected {(implementation, state_E, weight_E, max_rows, k, n, num_topk, device, dtype)}, "
+            "workspace metadata mismatch: "
+            f"expected {(plan.implementation, plan.weight_E, plan.k, plan.n, plan.num_topk, plan.device, plan.dtype)}, "
             f"got {actual}"
         )
-    if implementation == "static" and not isinstance(workspace, TPCompactStaticWorkspace):
+    if workspace.state_E < plan.state_E:
+        raise ValueError(
+            "workspace expert capacity mismatch: "
+            f"expected at least {plan.state_E}, got {workspace.state_E}"
+        )
+    if workspace.max_rows < plan.max_rows:
+        raise ValueError(
+            "workspace row capacity mismatch: "
+            f"expected at least {plan.max_rows}, got {workspace.max_rows}"
+        )
+    if plan.implementation == "static" and not isinstance(workspace, TPCompactStaticWorkspace):
         raise TypeError("expected a TPCompactStaticWorkspace for the compact static backend")
-    if implementation == "dynamic" and not isinstance(workspace, TPDynamicWorkspace):
+    if plan.implementation == "dynamic" and not isinstance(workspace, TPDynamicWorkspace):
         raise TypeError("expected a TPDynamicWorkspace for the dynamic backend")
+    if isinstance(workspace, TPCompactStaticWorkspace) and workspace.routed_rows_capacity < plan.routed_rows:
+        raise ValueError(
+            "workspace routed-row capacity mismatch: "
+            f"expected at least {plan.routed_rows}, got {workspace.routed_rows_capacity}"
+        )
+    if isinstance(workspace, TPDynamicWorkspace) and workspace.routed_rows_capacity < plan.routed_rows:
+        raise ValueError(
+            "workspace routed-row capacity mismatch: "
+            f"expected at least {plan.routed_rows}, got {workspace.routed_rows_capacity}"
+        )
+    if (
+        isinstance(workspace, TPDynamicWorkspace)
+        and plan.dynamic_physical_tiles is not None
+        and workspace.physical_tiles_capacity < plan.dynamic_physical_tiles
+    ):
+        raise ValueError(
+            "workspace physical-tile capacity mismatch: "
+            f"expected at least {plan.dynamic_physical_tiles}, got {workspace.physical_tiles_capacity}"
+        )
+    if (
+        isinstance(workspace, TPDynamicWorkspace)
+        and plan.dynamic_task_capacity is not None
+        and workspace.task_capacity < plan.dynamic_task_capacity
+    ):
+        raise ValueError(
+            "workspace task capacity mismatch: "
+            f"expected at least {plan.dynamic_task_capacity}, got {workspace.task_capacity}"
+        )
 
 
 def _workspace_pool_key(
@@ -617,11 +831,11 @@ def _workspace_pool_key(
     device: torch.device,
     dtype: torch.dtype,
 ) -> tuple:
-    # Dynamic kernels accept runtime row/task extents, so one pool entry can
-    # safely serve any request up to the workspace's current capacity. Avoid
+    # Pool-backed static and dynamic workspaces are capacity-based. Avoid
     # exact-shape keys here or long-tail prompt lengths will accumulate one
-    # retained dynamic workspace per distinct routed-row count.
-    if implementation == "dynamic":
+    # retained workspace per distinct routed-row count.
+    if implementation in ("static", "dynamic"):
+        state_E = -1
         max_rows = -1
     return (
         implementation,
@@ -640,32 +854,13 @@ def _workspace_pool_key(
 def _resolve_workspace(
     workspace: TPMoEWorkspace | TPMoEWorkspacePool,
     *,
-    implementation: str,
-    state_E: int,
-    weight_E: int,
-    max_rows: int,
-    k: int,
-    n: int,
-    num_topk: int,
-    device: torch.device,
-    dtype: torch.dtype,
+    plan: TPMoEPlan,
     a1_gscale: torch.Tensor,
     a2_gscale: torch.Tensor,
     input_scales_static: bool,
 ) -> TPMoEWorkspace:
     if isinstance(workspace, TPMoEWorkspace):
-        _validate_workspace(
-            workspace,
-            implementation=implementation,
-            state_E=state_E,
-            weight_E=weight_E,
-            max_rows=max_rows,
-            k=k,
-            n=n,
-            num_topk=num_topk,
-            device=device,
-            dtype=dtype,
-        )
+        _validate_workspace(workspace, plan=plan)
         if isinstance(workspace, TPDynamicWorkspace):
             _refresh_dynamic_workspace_scales(
                 workspace,
@@ -680,52 +875,81 @@ def _resolve_workspace(
             "workspace must be a TPMoEWorkspace or TPMoEWorkspacePool"
         )
 
-    stream_key = int(torch.cuda.current_stream(device).stream_id)
+    stream_key = int(torch.cuda.current_stream(plan.device).stream_id)
     key = _workspace_pool_key(
-        implementation,
+        plan.implementation,
         stream_key=stream_key,
-        state_E=state_E,
-        weight_E=weight_E,
-        max_rows=max_rows,
-        k=k,
-        n=n,
-        num_topk=num_topk,
-        device=device,
-        dtype=dtype,
+        state_E=plan.state_E,
+        weight_E=plan.weight_E,
+        max_rows=plan.max_rows,
+        k=plan.k,
+        n=plan.n,
+        num_topk=plan.num_topk,
+        device=plan.device,
+        dtype=plan.dtype,
     )
     resolved = workspace.workspaces.get(key)
     if resolved is None:
         resolved = _alloc_workspace(
-            implementation,
-            state_E,
-            weight_E,
-            k,
-            n,
-            num_topk,
-            device,
-            dtype,
+            plan.implementation,
+            plan.state_E,
+            plan.weight_E,
+            plan.k,
+            plan.n,
+            plan.num_topk,
+            plan.device,
+            plan.dtype,
             a1_gscale,
             a2_gscale,
-            max_rows=max_rows,
+            routed_rows=plan.routed_rows,
+            max_rows=plan.max_rows,
             input_scales_static=input_scales_static,
+            dynamic_physical_tiles=plan.dynamic_physical_tiles,
+            dynamic_task_capacity=plan.dynamic_task_capacity,
         )
         workspace.workspaces[key] = resolved
         return resolved
 
-    if implementation == "dynamic" and resolved.max_rows < max_rows:
+    needs_growth = (
+        resolved.state_E < plan.state_E
+        or resolved.max_rows < plan.max_rows
+        or (
+            isinstance(resolved, (TPDynamicWorkspace, TPCompactStaticWorkspace))
+            and resolved.routed_rows_capacity < plan.routed_rows
+        )
+        or (
+            isinstance(resolved, TPDynamicWorkspace)
+            and plan.dynamic_physical_tiles is not None
+            and resolved.physical_tiles_capacity < plan.dynamic_physical_tiles
+        )
+        or (
+            isinstance(resolved, TPDynamicWorkspace)
+            and plan.dynamic_task_capacity is not None
+            and resolved.task_capacity < plan.dynamic_task_capacity
+        )
+    )
+    if needs_growth:
+        dynamic_tiles = plan.dynamic_physical_tiles
+        dynamic_tasks = plan.dynamic_task_capacity
+        if isinstance(resolved, TPDynamicWorkspace):
+            dynamic_tiles = max(dynamic_tiles or 0, resolved.physical_tiles_capacity)
+            dynamic_tasks = max(dynamic_tasks or 0, resolved.task_capacity)
         resolved = _alloc_workspace(
-            implementation,
-            state_E,
-            weight_E,
-            k,
-            n,
-            num_topk,
-            device,
-            dtype,
+            plan.implementation,
+            max(plan.state_E, resolved.state_E),
+            plan.weight_E,
+            plan.k,
+            plan.n,
+            plan.num_topk,
+            plan.device,
+            plan.dtype,
             a1_gscale,
             a2_gscale,
-            max_rows=max_rows,
+            routed_rows=max(plan.routed_rows, getattr(resolved, "routed_rows_capacity", 0)),
+            max_rows=max(plan.max_rows, resolved.max_rows),
             input_scales_static=input_scales_static,
+            dynamic_physical_tiles=dynamic_tiles,
+            dynamic_task_capacity=dynamic_tasks,
         )
         workspace.workspaces[key] = resolved
         return resolved
@@ -750,7 +974,7 @@ def allocate_tp_moe_workspace(
     *,
     input_scales_static: bool = False,
 ) -> TPMoEWorkspace:
-    """Allocate reusable scratch for one exact unchunked `b12x_moe_fp4` call shape."""
+    """Allocate reusable scratch covering one unchunked `b12x_moe_fp4` call."""
     if a.ndim != 2:
         raise ValueError(f"expected input activations with rank 2, got shape {tuple(a.shape)}")
     if topk_ids.ndim != 2:
@@ -761,28 +985,35 @@ def allocate_tp_moe_workspace(
     weight_E = w1_fp4.shape[0]
     n = w2_fp4.shape[2] * 2
     num_topk = topk_ids.shape[1]
-    impl, state_E, state_max_rows = _resolve_workspace_layout(
+    plan = _make_workspace_plan(
         num_tokens=m,
         weight_E=weight_E,
+        k=k,
+        n=n,
         num_topk=num_topk,
+        device=a.device,
+        dtype=a.dtype,
     )
     effective_input_scales_static = (
         input_scales_static
         or (a1_gscale.numel() == 1 and a2_gscale.numel() == 1)
     )
     return _alloc_workspace(
-        impl,
-        state_E,
-        weight_E,
-        k,
-        n,
-        num_topk,
-        a.device,
-        a.dtype,
+        plan.implementation,
+        plan.state_E,
+        plan.weight_E,
+        plan.k,
+        plan.n,
+        plan.num_topk,
+        plan.device,
+        plan.dtype,
         a1_gscale,
         a2_gscale,
-        max_rows=state_max_rows,
+        routed_rows=plan.routed_rows,
+        max_rows=plan.max_rows,
         input_scales_static=effective_input_scales_static,
+        dynamic_physical_tiles=plan.dynamic_physical_tiles,
+        dynamic_task_capacity=plan.dynamic_task_capacity,
     )
 
 
@@ -811,9 +1042,10 @@ def _get_impl_mac(impl: str) -> int:
     sm_count = get_num_sm(torch.device("cuda"))
     mac_limit = min(get_max_active_clusters(1), sm_count)
     override_name = f"B12X_{impl.upper()}_MAX_ACTIVE_CLUSTERS"
-    mac_override = os.environ.get(override_name)
-    if mac_override is None and impl == "dynamic":
-        mac_override = os.environ.get("B12X_LEVEL10_MAX_ACTIVE_CLUSTERS")
+    if impl == "dynamic":
+        mac_override = _first_env(override_name, "B12X_LEVEL10_MAX_ACTIVE_CLUSTERS")
+    else:
+        mac_override = _first_env(override_name)
     if mac_override is not None:
         mac = max(1, min(int(mac_override), mac_limit))
     else:
@@ -1228,9 +1460,9 @@ def _get_dynamic_kernel(
     last_kkey, last_kval = _LAST_KERNEL
     if last_kkey == cache_key:
         return last_kval
-    reuse_compiled = os.environ.get("B12X_DYNAMIC_REUSE_COMPILED")
+    reuse_compiled = _first_env("B12X_DYNAMIC_REUSE_COMPILED", "B12X_LEVEL10_REUSE_COMPILED")
     if reuse_compiled is None:
-        reuse_compiled = os.environ.get("B12X_LEVEL10_REUSE_COMPILED", "1")
+        reuse_compiled = "1"
     reuse_compiled = reuse_compiled != "0"
     if reuse_compiled:
         cached = _DYNAMIC_KERNEL_CACHE.get(cache_key)
@@ -1365,6 +1597,7 @@ def _launch_dynamic(
     k: int,
     n: int,
     num_topk: int,
+    routed_rows: int,
     max_rows: int,
     topk_ids_dtype: torch.dtype,
     input_scales_are_reciprocal: bool,
@@ -1410,9 +1643,9 @@ def _launch_dynamic(
         _gptr(cutlass.Int32, workspace.token_map, 4),
         _gptr(cutlass.Float32, workspace.token_weights, 4),
         m, max_rows,
-        _dynamic_task_geometry(E, n, max_rows)[0] * _LEVEL_TILE_M,
-        _dynamic_task_geometry(E, n, max_rows)[2],
-        _dynamic_task_geometry(E, n, max_rows)[0],
+        workspace.physical_tiles_capacity * _LEVEL_TILE_M,
+        workspace.task_capacity,
+        workspace.physical_tiles_capacity,
         mac, stream,
     )
 
@@ -1432,7 +1665,6 @@ def _launch_compact_static(
     k: int,
     n: int,
     num_topk: int,
-    state_max_rows: int,
     routed_rows: int,
     topk_ids_dtype: torch.dtype,
     input_scales_are_reciprocal: bool,
@@ -1460,7 +1692,7 @@ def _launch_compact_static(
             workspace.active_expert_count,
         )
         compiled, mac = _get_micro_kernel(
-            workspace.state_E, weight_E, m, k, n, num_topk, state_max_rows,
+            workspace.state_E, weight_E, m, k, n, num_topk, workspace.max_rows,
             topk_ids_dtype=torch.int32,
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
@@ -1469,7 +1701,7 @@ def _launch_compact_static(
         launch_ids = compact_ids
     else:
         compiled, mac = _get_static_kernel(
-            workspace.state_E, weight_E, m, k, n, num_topk, state_max_rows,
+            workspace.state_E, weight_E, m, k, n, num_topk, workspace.max_rows,
             topk_ids_dtype=topk_ids_dtype,
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
@@ -1524,6 +1756,18 @@ def b12x_moe_fp4(
     num_topk = topk_ids.shape[1]
     routed_rows = m * num_topk
     device = a.device
+    workspace_policy = _workspace_policy(workspace)
+    plan = _make_workspace_plan(
+        num_tokens=m,
+        weight_E=weight_E,
+        k=k,
+        n=n,
+        num_topk=num_topk,
+        device=device,
+        dtype=a.dtype,
+        topk_ids=topk_ids,
+        eager_exact_dynamic=workspace_policy.eager_exact_dynamic,
+    )
 
     if apply_router_weight_on_input:
         raise NotImplementedError("apply_router_weight_on_input is not implemented in b12x_moe_fp4")
@@ -1536,19 +1780,10 @@ def b12x_moe_fp4(
         or (a1_gscale.numel() == 1 and a2_gscale.numel() == 1)
     )
 
-    impl, state_E, state_max_rows = _resolve_workspace_layout(
-        num_tokens=m,
-        weight_E=weight_E,
-        num_topk=num_topk,
-    )
-    if impl == "dynamic":
-        max_rows = ((routed_rows + 127) // 128) * 128
-        max_tokens_per_launch = _dynamic_token_chunk_limit(E, k, n, num_topk)
-    else:
-        max_rows = state_max_rows
-        max_tokens_per_launch = m
-    if impl == "dynamic" and m > max_tokens_per_launch:
-        if isinstance(workspace, TPMoEWorkspace):
+    impl = plan.implementation
+    max_rows = plan.max_rows
+    if impl == "dynamic" and m > plan.max_tokens_per_launch:
+        if not workspace_policy.can_chunk:
             raise ValueError(
                 "chunked requests require a TPMoEWorkspacePool; "
                 "an exact TPMoEWorkspace only supports one launch shape"
@@ -1556,8 +1791,8 @@ def b12x_moe_fp4(
         chunk_output = output
         if chunk_output is None:
             chunk_output = torch.empty(m, k, dtype=a.dtype, device=device)
-        for start in range(0, m, max_tokens_per_launch):
-            end = min(start + max_tokens_per_launch, m)
+        for start in range(0, m, plan.max_tokens_per_launch):
+            end = min(start + plan.max_tokens_per_launch, m)
             b12x_moe_fp4(
                 a[start:end],
                 a1_gscale,
@@ -1581,15 +1816,7 @@ def b12x_moe_fp4(
 
     s = _resolve_workspace(
         workspace,
-        implementation=impl,
-        state_E=state_E,
-        weight_E=weight_E,
-        max_rows=state_max_rows,
-        k=k,
-        n=n,
-        num_topk=num_topk,
-        device=device,
-        dtype=a.dtype,
+        plan=plan,
         a1_gscale=a1_gscale,
         a2_gscale=a2_gscale,
         input_scales_static=effective_input_scales_static,
@@ -1661,6 +1888,7 @@ def b12x_moe_fp4(
             k=k,
             n=n,
             num_topk=num_topk,
+            routed_rows=routed_rows,
             max_rows=max_rows,
             topk_ids_dtype=flat_ids.dtype,
             input_scales_are_reciprocal=input_scales_are_reciprocal,
@@ -1682,7 +1910,6 @@ def b12x_moe_fp4(
             k=k,
             n=n,
             num_topk=num_topk,
-            state_max_rows=state_max_rows,
             routed_rows=routed_rows,
             topk_ids_dtype=flat_ids.dtype,
             input_scales_are_reciprocal=input_scales_are_reciprocal,

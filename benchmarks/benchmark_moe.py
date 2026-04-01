@@ -41,11 +41,14 @@ LEGACY_BATCH_SIZES = [1, 2, 4, 8]
 # - larger prefill chunk m=80 during the same request path
 # - decode remains effectively m=1 for a single running request
 RECORDED_SGLANG_SINGLE_REQUEST_BATCH_SIZES = [1, 23, 80]
+# Representative eager-prefill forwards without CUDA graph replay.
+EAGER_PREFILL_BATCH_SIZES = [16384, 32768]
 # Representative total-token sizes for packed chunked-prefill forwards.
 # The first point is one full server-side prefill chunk, then we scale to
 # larger packed forwards up to four chunks' worth of tokens.
 CHUNKED_PREFILL_BATCH_SIZES = [8192, 16384, 24576, 32768]
 BATCH_SIZE_PROFILES = {
+    "eager-prefill": EAGER_PREFILL_BATCH_SIZES,
     "micro": LEGACY_BATCH_SIZES,
     "sglang-single-request": RECORDED_SGLANG_SINGLE_REQUEST_BATCH_SIZES,
     "chunked-prefill": CHUNKED_PREFILL_BATCH_SIZES,
@@ -1017,15 +1020,7 @@ def bench_e2e() -> None:
     routing_warm = torch.randn(1, spec.num_experts, dtype=torch.float32, device=device)
     topk_logits_w, topk_ids_w = torch.topk(routing_warm, spec.top_k, dim=-1)
     topk_weights_w = torch.softmax(topk_logits_w, dim=-1)
-    warmup_workspace = allocate_tp_moe_workspace(
-        x_warm,
-        params.a1_gscale,
-        weights.w13_weight,
-        params.a2_gscale,
-        weights.w2_weight,
-        topk_ids_w,
-        input_scales_static=True,
-    )
+    warmup_workspace = allocate_tp_moe_workspace_pool()
     b12x_moe_fp4(
         x_warm,
         params.a1_gscale,

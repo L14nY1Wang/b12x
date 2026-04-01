@@ -71,8 +71,8 @@ its own SM120-first implementation and does not depend on FlashInfer at runtime.
 - `b12x` selects its fused MoE backend from shape alone:
   - compact routed workloads use the static or micro backend
   - all larger routed workloads use dynamic
-- Use `allocate_tp_moe_workspace(...)` for one exact unchunked launch shape.
-- Use `allocate_tp_moe_workspace_pool()` for variable-size or chunked workloads.
+- Use `allocate_tp_moe_workspace(...)` for one caller-owned launch workspace.
+- Use `allocate_tp_moe_workspace_pool()` for variable-size, chunked, or eager routing-aware dynamic workloads.
 - Keep one workspace pool per process/device, and let the pool partition scratch by CUDA stream internally.
 - During CUDA graph capture, `output=` must also be caller-owned and stable across replays.
 
@@ -94,6 +94,7 @@ its own SM120-first implementation and does not depend on FlashInfer at runtime.
 - `benchmarks/benchmark_moe.py`
   - End-to-end Qwen3.5-397B TP=4 MoE benchmark
   - `micro` batch profile: `[1, 2, 4, 8]`
+  - `eager-prefill` batch profile: `[16384, 32768]`
   - `sglang-single-request` batch profile: `[1, 23, 80]`
   - `chunked-prefill` batch profile: `[8192, 16384, 24576, 32768]`
 - `benchmarks/benchmark_paged_attention.py`
@@ -132,6 +133,8 @@ B12X_MODEL_PATH=/path/to/Qwen3.5-397B-A17B-NVFP4 python benchmarks/benchmark_moe
 B12X_MODEL_PATH=/path/to/Qwen3.5-397B-A17B-NVFP4 python benchmarks/benchmark_moe.py --include-routing
 
 B12X_MODEL_PATH=/path/to/Qwen3.5-397B-A17B-NVFP4 python benchmarks/benchmark_moe.py --batch-size-profile sglang-single-request
+
+B12X_MODEL_PATH=/path/to/Qwen3.5-397B-A17B-NVFP4 python benchmarks/benchmark_moe.py --batch-size-profile eager-prefill --no-cuda-graph
 
 B12X_MODEL_PATH=/path/to/Qwen3.5-397B-A17B-NVFP4 python benchmarks/benchmark_moe.py --batch-size-profile chunked-prefill
 
