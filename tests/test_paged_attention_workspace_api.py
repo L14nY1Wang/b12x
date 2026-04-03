@@ -6,7 +6,7 @@ import cutlass.base_dsl.dsl as cutlass_dsl
 import pytest
 import torch
 
-from b12x.attention.paged.api import _build_extend_forward_kernel
+from b12x.attention.paged.api import _build_extend_forward_kernel, _resolve_mxfp8_turbo_flags
 from b12x.attention.paged.traits import select_paged_forward_traits_from_plan
 from b12x.attention.reference import paged_attention_reference
 from b12x.integration.attention import (
@@ -251,6 +251,54 @@ def test_paged_workspace_preserves_opt_in_attention_mode() -> None:
 
     assert workspace.attn_mode == "turbo"
     assert workspace.use_cuda_graph is True
+
+
+@pytest.mark.parametrize(
+    ("batch", "cache_len", "expect_turbo"),
+    [
+        (2, 16384, True),
+        (4, 16384, False),
+        (4, 32768, True),
+    ],
+)
+def test_decode_turbo_dispatch_tracks_batch_and_chunk_regime(
+    batch: int,
+    cache_len: int,
+    expect_turbo: bool,
+) -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    q, k_cache, v_cache, page_table, cache_seqlens_t, cu_seqlens_q = _make_paged_inputs(
+        q_seqlens=[1] * batch,
+        cache_seqlens=[cache_len] * batch,
+        page_size=64,
+        seed=37 + batch + cache_len // 64,
+        num_pages=(batch * cache_len) // 64,
+    )
+    k_fp8, v_fp8, _k_descale, _v_descale = _quantize_paged_kv_cache_e4m3(
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens_t,
+    )
+    workspace = _make_workspace(
+        q=q,
+        k_cache=k_fp8,
+        v_cache=v_fp8,
+        cu_seqlens_q=cu_seqlens_q,
+        use_cuda_graph=True,
+        attn_mode="turbo",
+    )
+    workspace.prepare(page_table, cache_seqlens_t, cu_seqlens_q)
+
+    mxfp8_turbo, enable_mxfp8_pv = _resolve_mxfp8_turbo_flags(attn_mode=workspace.attn_mode, plan=workspace.plan)
+
+    assert workspace.plan.mode == "decode"
+    assert workspace.plan.kv_dtype == torch.float8_e4m3fn
+    assert (workspace.plan.kv_chunk_size < 11 * workspace.plan.page_size) == (cache_len == 16384)
+    assert mxfp8_turbo is expect_turbo
+    assert enable_mxfp8_pv is (expect_turbo and workspace.plan.kv_chunk_size <= 384)
 
 
 def test_paged_workspace_matches_reference_for_fp8_kv_cache() -> None:

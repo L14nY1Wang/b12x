@@ -24,6 +24,8 @@ from .traits import PagedForwardTraits, select_paged_forward_traits_from_plan
 from .workspace import PagedAttentionWorkspace
 
 _EAGER_HOST_LAUNCHER_CACHE_SIZE = 32
+_DECODE_MXFP8_TURBO_MAX_SMALL_BATCH = 2
+_DECODE_MXFP8_TURBO_MIN_LONG_CHUNK_PAGES = 11
 
 
 def _torch_to_cutlass_dtype(dtype: torch.dtype) -> type[cutlass.Numeric]:
@@ -70,6 +72,24 @@ def _attn_turbo_enabled(attn_mode: Literal["default", "turbo"] | None) -> bool:
     if attn_mode == "default":
         return False
     return os.environ.get("B12X_ATTN", "").upper() == "TURBO"
+
+
+def _resolve_mxfp8_turbo_flags(
+    *,
+    attn_mode: Literal["default", "turbo"] | None,
+    plan,
+) -> tuple[bool, bool]:
+    mxfp8_turbo = _attn_turbo_enabled(attn_mode) and plan.kv_dtype == torch.float8_e4m3fn
+    if (
+        mxfp8_turbo
+        and plan.mode in ("decode", "verify")
+        and plan.total_q > _DECODE_MXFP8_TURBO_MAX_SMALL_BATCH
+        and plan.kv_chunk_size < _DECODE_MXFP8_TURBO_MIN_LONG_CHUNK_PAGES * plan.page_size
+    ):
+        # Mid-batch short-chunk decode picks up most of turbo's numeric loss for negligible replay gain.
+        mxfp8_turbo = False
+    enable_mxfp8_pv = mxfp8_turbo and plan.mode in ("decode", "verify") and plan.kv_chunk_size <= 384
+    return mxfp8_turbo, enable_mxfp8_pv
 
 
 @lru_cache(maxsize=16)
@@ -361,8 +381,7 @@ def paged_attention_forward(
         raise ValueError("fp8 paged caches require k_descale and v_descale")
 
     traits = select_paged_forward_traits_from_plan(plan)
-    mxfp8_turbo = _attn_turbo_enabled(workspace.attn_mode) and plan.kv_dtype == torch.float8_e4m3fn
-    enable_mxfp8_pv = mxfp8_turbo and plan.mode in ("decode", "verify") and plan.kv_chunk_size <= 384
+    mxfp8_turbo, enable_mxfp8_pv = _resolve_mxfp8_turbo_flags(attn_mode=workspace.attn_mode, plan=plan)
     if plan.mode == "extend":
         if plan.split_kv:
             raise ValueError("extend plans no longer support split-kv")
