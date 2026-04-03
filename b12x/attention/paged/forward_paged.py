@@ -2831,13 +2831,19 @@ class PagedForwardKernel:
                 valid_row = packed_row_local < packed_tile_rows
                 row_valid[mma_q, row_slot] = Int32(valid_row)
                 if valid_row:
-                    packed_q_idx = packed_tile_start + packed_row_local
-                    token_local = packed_q_idx // group_size
-                    q_group_lane = packed_q_idx - token_local * group_size
-                    q_token_local[mma_q, row_slot] = Int32(token_local)
-                    q_head_idx_frag[mma_q, row_slot] = Int32(kv_head_idx * group_size + q_group_lane)
-                    q_row_idx_frag[mma_q, row_slot] = Int32(q_start + token_local)
-                    causal_k_limit[mma_q, row_slot] = Int32(token_local + cache_len - qo_len)
+                    if const_expr(self.single_request_decode_graph or self.single_qtile_decode_graph):
+                        q_token_local[mma_q, row_slot] = Int32(0)
+                        q_head_idx_frag[mma_q, row_slot] = Int32(kv_head_idx * group_size + packed_row_local)
+                        q_row_idx_frag[mma_q, row_slot] = Int32(q_start)
+                        causal_k_limit[mma_q, row_slot] = Int32(cache_len - qo_len)
+                    else:
+                        packed_q_idx = packed_tile_start + packed_row_local
+                        token_local = packed_q_idx // group_size
+                        q_group_lane = packed_q_idx - token_local * group_size
+                        q_token_local[mma_q, row_slot] = Int32(token_local)
+                        q_head_idx_frag[mma_q, row_slot] = Int32(kv_head_idx * group_size + q_group_lane)
+                        q_row_idx_frag[mma_q, row_slot] = Int32(q_start + token_local)
+                        causal_k_limit[mma_q, row_slot] = Int32(token_local + cache_len - qo_len)
                 else:
                     q_token_local[mma_q, row_slot] = Int32(0)
                     q_head_idx_frag[mma_q, row_slot] = Int32(0)
