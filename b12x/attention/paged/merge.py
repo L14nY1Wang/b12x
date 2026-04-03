@@ -306,6 +306,8 @@ class PagedPersistentMergeKernel:
         bdy: int = 4,
         num_smem_stages: int = 4,
         persistent_ctas: int | None = None,
+        direct_grid: bool = False,
+        regular_decode_graph: bool = False,
     ):
         self.dtype = dtype
         self.dtype_partial = dtype_partial
@@ -317,6 +319,8 @@ class PagedPersistentMergeKernel:
         self.persistent_ctas = (
             int(persistent_ctas) if persistent_ctas is not None else 0
         )
+        self.direct_grid = bool(direct_grid)
+        self.regular_decode_graph = bool(regular_decode_graph)
 
     @staticmethod
     def can_implement(
@@ -329,6 +333,7 @@ class PagedPersistentMergeKernel:
         bdy: int,
         num_smem_stages: int,
         persistent_ctas: int,
+        direct_grid: bool,
     ) -> bool:
         if dtype not in (cutlass.Float16, cutlass.BFloat16, cutlass.Float32):
             return False
@@ -340,7 +345,7 @@ class PagedPersistentMergeKernel:
             return False
         if bdx % 32 != 0:
             return False
-        if persistent_ctas <= 0:
+        if not direct_grid and persistent_ctas <= 0:
             return False
         return True
 
@@ -370,6 +375,8 @@ class PagedPersistentMergeKernel:
         mV_partial: cute.Tensor,
         mLSE_partial: cute.Tensor,
         mMergeIndptr: cute.Tensor,
+        mCacheSeqlens: cute.Tensor,
+        mKvChunkSizePtr: cute.Tensor,
         mO: cute.Tensor,
         mLSE: cute.Tensor,
         mTotalRowsPtr: cute.Tensor | None,
@@ -381,6 +388,10 @@ class PagedPersistentMergeKernel:
             raise ValueError("mLSE_partial must have shape (nnz_partial_rows, num_heads)")
         if const_expr(len(mMergeIndptr.shape) != 1):
             raise ValueError("mMergeIndptr must have shape (max_total_rows + 1,)")
+        if const_expr(len(mCacheSeqlens.shape) != 1):
+            raise ValueError("mCacheSeqlens must have shape (total_rows,)")
+        if const_expr(len(mKvChunkSizePtr.shape) != 1):
+            raise ValueError("mKvChunkSizePtr must have shape (1,)")
         if const_expr(len(mO.shape) != 3):
             raise ValueError("mO must have shape (max_total_rows, num_heads, head_dim)")
         if const_expr(len(mLSE.shape) != 2):
@@ -403,6 +414,7 @@ class PagedPersistentMergeKernel:
                 bdy=self.bdy,
                 num_smem_stages=self.num_smem_stages,
                 persistent_ctas=self.persistent_ctas,
+                direct_grid=self.direct_grid,
             )
         ):
             raise TypeError("paged merge kernel configuration is not supported")
@@ -412,11 +424,13 @@ class PagedPersistentMergeKernel:
             mV_partial,
             mLSE_partial,
             mMergeIndptr,
+            mCacheSeqlens,
+            mKvChunkSizePtr,
             mO,
             mLSE,
             mTotalRowsPtr,
         ).launch(
-            grid=(self.persistent_ctas, 1, 1),
+            grid=((mO.shape[1], mO.shape[0], 1) if self.direct_grid else (self.persistent_ctas, 1, 1)),
             block=[self.bdx, self.bdy, 1],
             smem=SharedStorage.size_in_bytes(),
             stream=stream,
@@ -428,13 +442,16 @@ class PagedPersistentMergeKernel:
         mV_partial: cute.Tensor,
         mLSE_partial: cute.Tensor,
         mMergeIndptr: cute.Tensor,
+        mCacheSeqlens: cute.Tensor,
+        mKvChunkSizePtr: cute.Tensor,
         mO: cute.Tensor,
         mLSE: cute.Tensor,
         mTotalRowsPtr: cute.Tensor | None,
     ):
         tx, ty, _ = cute.arch.thread_idx()
-        cta_id, _, _ = cute.arch.block_idx()
-        num_ctas, _, _ = cute.arch.grid_dim()
+        block_x, block_y, _ = cute.arch.block_idx()
+        if const_expr(not self.direct_grid):
+            num_ctas, _, _ = cute.arch.grid_dim()
         max_total_rows = mO.shape[0]
         num_heads = mO.shape[1]
         head_dim = self.head_dim
@@ -457,19 +474,38 @@ class PagedPersistentMergeKernel:
         )
         s_lse = storage.sLSE.get_tensor(cute.make_layout((self.bdy,), stride=(1,)))
 
-        cute.arch.griddepcontrol_wait()
+        if const_expr(not self.direct_grid):
+            cute.arch.griddepcontrol_wait()
 
         total_work = total_rows * num_heads
         base_k = tx * self.vec_size
-        work_linear_idx = cta_id
+        work_linear_idx = (
+            Int32(block_y * num_heads + block_x)
+            if const_expr(self.direct_grid)
+            else Int32(block_x)
+        )
+        max_chunks_per_req = Int32(0)
+        if const_expr(self.regular_decode_graph):
+            max_chunks_per_req = Int32(mV_partial.shape[0] // mO.shape[0])
         while work_linear_idx < total_work:
             cute.arch.sync_threads()
 
-            row_idx = work_linear_idx // num_heads
-            head_idx = work_linear_idx % num_heads
-            start_idx = mMergeIndptr[row_idx]
-            end_idx = mMergeIndptr[row_idx + 1]
-            num_index_sets = end_idx - start_idx
+            if const_expr(self.direct_grid):
+                row_idx = Int32(block_y)
+                head_idx = Int32(block_x)
+            else:
+                row_idx = work_linear_idx // num_heads
+                head_idx = work_linear_idx % num_heads
+            if const_expr(self.regular_decode_graph):
+                start_idx = row_idx * max_chunks_per_req
+                kv_chunk_size = mKvChunkSizePtr[0]
+                cache_len = mCacheSeqlens[row_idx]
+                num_index_sets = (cache_len + kv_chunk_size - 1) // kv_chunk_size
+                end_idx = start_idx + num_index_sets
+            else:
+                start_idx = mMergeIndptr[row_idx]
+                end_idx = mMergeIndptr[row_idx + 1]
+                num_index_sets = end_idx - start_idx
 
             if num_index_sets == 0:
                 for vec_idx in cutlass.range_constexpr(self.vec_size):
@@ -637,6 +673,9 @@ class PagedPersistentMergeKernel:
                     mO[row_idx, head_idx, base_k + vec_idx] = state_o[vec_idx].to(self.dtype)
                 if tx == 0 and ty == 0:
                     mLSE[head_idx, row_idx] = _state_get_lse_base2(state_m, state_d)
-            work_linear_idx += num_ctas
+            if const_expr(self.direct_grid):
+                work_linear_idx = total_work
+            else:
+                work_linear_idx += num_ctas
 
         cute.arch.griddepcontrol_launch_dependents()

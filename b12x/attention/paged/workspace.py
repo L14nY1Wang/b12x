@@ -93,6 +93,7 @@ class PagedAttentionWorkspace:
     _compiled_key: tuple | None = None
     _decode_graph_chunk_pages_lut: torch.Tensor | None = None
     _decode_graph_max_chunks_per_req: int | None = None
+    _use_regular_decode_graph_replay: bool = False
     _live_plane_tma_desc_cache: dict[tuple[int, int, tuple[int, ...], tuple[int, ...], int, int], tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor, torch.Tensor]] = field(
         default_factory=dict
     )
@@ -330,6 +331,29 @@ class PagedAttentionWorkspace:
     def planner_budget(self) -> PagedPlanBudget | None:
         return self._planner_budget
 
+    @staticmethod
+    def _plan_has_regular_decode_graph_grid(plan: PagedPlan) -> bool:
+        batch = int(plan.page_table_shape[0])
+        if batch <= 0 or plan.mode != "decode" or not plan.enable_cuda_graph or not plan.split_kv:
+            return False
+        if int(plan.total_q) != batch:
+            return False
+        work_items = len(plan.request_indices)
+        if work_items <= 0 or work_items % batch != 0:
+            return False
+        max_chunks_per_req = work_items // batch
+        for req_idx in range(batch):
+            base = req_idx * max_chunks_per_req
+            for chunk_idx in range(max_chunks_per_req):
+                work_idx = base + chunk_idx
+                if plan.request_indices[work_idx] != req_idx:
+                    return False
+                if plan.qo_tile_indices[work_idx] != 0:
+                    return False
+                if plan.kv_tile_indices[work_idx] != chunk_idx:
+                    return False
+        return True
+
     def prepare(
         self,
         page_table: torch.Tensor,
@@ -462,6 +486,7 @@ class PagedAttentionWorkspace:
             device=self.device,
         )
         self._decode_graph_max_chunks_per_req = int(max_chunks_per_req)
+        self._use_regular_decode_graph_replay = self.kv_dtype == torch.bfloat16 and batch >= 4
         self.prepare_for_capacity(
             batch=batch,
             total_q_capacity=total_q_capacity,
@@ -569,36 +594,38 @@ class PagedAttentionWorkspace:
         if self.kv_chunk_size_ptr is None:
             raise RuntimeError("decode graph workspace is missing kv_chunk_size_ptr")
 
-        regularized_decode_graph = bool(
-            self._plan is not None
-            and self._plan.mode == "decode"
-            and self._plan.enable_cuda_graph
-            and self._plan.split_kv
-            and self._plan.num_qo_tiles == self._plan.page_table_shape[0]
-            and self._plan.page_table_shape[0] == 16
-        )
+        self._validate_decode_graph_replay_capacity(batch=int(self.cache_seqlens.shape[0]))
 
-        self._validate_decode_graph_replay_capacity(
-            batch=int(self.cache_seqlens.shape[0]),
-            regularized_decode_graph=regularized_decode_graph,
-        )
+        if self._use_regular_decode_graph_replay:
+            from .graph_replay import update_regular_decode_graph_replay_metadata
 
-        from .graph_replay import update_decode_graph_replay_metadata
+            update_regular_decode_graph_replay_metadata(
+                req_to_token=req_to_token,
+                req_pool_indices=req_pool_indices,
+                page_table=self.page_table,
+                cache_seqlens=self.cache_seqlens,
+                merge_indptr=self.merge_indptr,
+                o_indptr=self.o_indptr,
+                kv_chunk_size_ptr=self.kv_chunk_size_ptr,
+                decode_chunk_pages_lut=self._decode_graph_chunk_pages_lut,
+                page_size=self.page_size,
+            )
+        else:
+            from .graph_replay import update_decode_graph_replay_metadata
 
-        update_decode_graph_replay_metadata(
-            req_to_token=req_to_token,
-            req_pool_indices=req_pool_indices,
-            page_table=self.page_table,
-            cache_seqlens=self.cache_seqlens,
-            request_indices=self.request_indices,
-            merge_indptr=self.merge_indptr,
-            o_indptr=self.o_indptr,
-            block_valid_mask=self.block_valid_mask,
-            kv_chunk_size_ptr=self.kv_chunk_size_ptr,
-            decode_chunk_pages_lut=self._decode_graph_chunk_pages_lut,
-            page_size=self.page_size,
-            regularized_decode_graph=regularized_decode_graph,
-        )
+            update_decode_graph_replay_metadata(
+                req_to_token=req_to_token,
+                req_pool_indices=req_pool_indices,
+                page_table=self.page_table,
+                cache_seqlens=self.cache_seqlens,
+                request_indices=self.request_indices,
+                merge_indptr=self.merge_indptr,
+                o_indptr=self.o_indptr,
+                block_valid_mask=self.block_valid_mask,
+                kv_chunk_size_ptr=self.kv_chunk_size_ptr,
+                decode_chunk_pages_lut=self._decode_graph_chunk_pages_lut,
+                page_size=self.page_size,
+            )
         return self
 
     @torch._dynamo.disable
@@ -753,22 +780,17 @@ class PagedAttentionWorkspace:
         self,
         *,
         batch: int,
-        regularized_decode_graph: bool = False,
     ) -> None:
         if self._decode_graph_max_chunks_per_req is None:
             raise RuntimeError("decode graph replay policy has not been prepared")
         if self.request_indices is None:
             raise RuntimeError("decode graph workspace is missing request indices")
-        if self.block_valid_mask is None:
-            raise RuntimeError("decode graph workspace is missing block_valid_mask")
         if batch <= 0:
             raise ValueError("decode graph replay requires bs > 0")
-        work_items_capacity = (
-            int(self.block_valid_mask.shape[0]) if regularized_decode_graph else int(self.request_indices.shape[0])
-        )
+        work_items_capacity = int(self.request_indices.shape[0])
         if work_items_capacity % batch != 0:
             raise RuntimeError(
-                "decode graph workspace work-item capacity is incompatible with the batch bucket"
+                "decode graph workspace request_indices shape is incompatible with the batch bucket"
             )
         max_chunks_per_req = work_items_capacity // batch
         if max_chunks_per_req <= 0:
@@ -800,6 +822,42 @@ class PagedAttentionWorkspace:
         self.cache_seqlens[: cache_seqlens_i32.shape[0]].copy_(cache_seqlens_i32)
         self.cu_seqlens_q[: cu_seqlens_q_i32.shape[0]].copy_(cu_seqlens_q_i32)
 
+    def _copy_regular_decode_graph_plan_metadata(self, plan: PagedPlan) -> None:
+        assert self.request_indices is not None
+        assert self.merge_indptr is not None
+        assert self.o_indptr is not None
+        assert self.kv_chunk_size_ptr is not None
+        assert self.total_num_rows_ptr is not None
+        assert self.cache_seqlens is not None
+
+        batch = int(plan.page_table_shape[0])
+        if batch <= 0:
+            raise RuntimeError("regular decode graph replay requires bs > 0")
+        work_items_capacity = int(self.request_indices.shape[0])
+        if work_items_capacity % batch != 0:
+            raise RuntimeError(
+                "decode graph workspace request_indices shape is incompatible with the batch bucket"
+            )
+        capture_max_chunks_per_req = work_items_capacity // batch
+        current_work_items = len(plan.request_indices)
+        if current_work_items % batch != 0:
+            raise RuntimeError("decode graph replay plan work-items are incompatible with the batch bucket")
+        current_max_chunks_per_req = current_work_items // batch
+        if current_max_chunks_per_req > capture_max_chunks_per_req:
+            raise RuntimeError("decode graph replay plan exceeds the captured fixed-grid capacity")
+
+        from .graph_replay import update_regular_decode_graph_chunk_metadata
+
+        update_regular_decode_graph_chunk_metadata(
+            cache_seqlens=self.cache_seqlens,
+            merge_indptr=self.merge_indptr,
+            o_indptr=self.o_indptr,
+            kv_chunk_size_ptr=self.kv_chunk_size_ptr,
+            kv_chunk_size=int(plan.kv_chunk_size),
+            max_chunks_per_req=capture_max_chunks_per_req,
+        )
+        self.total_num_rows_ptr[0] = int(plan.total_q)
+
     def _copy_plan_metadata(self, plan: PagedPlan) -> None:
         assert self.request_indices is not None
         assert self.qo_tile_indices is not None
@@ -809,6 +867,31 @@ class PagedAttentionWorkspace:
         assert self.kv_chunk_size_ptr is not None
         assert self.total_num_rows_ptr is not None
         assert self.block_valid_mask is not None
+
+        self._use_regular_decode_graph_replay = False
+        if (
+            self.kv_dtype == torch.bfloat16
+            and int(plan.page_table_shape[0]) >= 4
+            and self.use_cuda_graph
+            and self._plan_has_regular_decode_graph_grid(plan)
+        ):
+            batch = int(plan.page_table_shape[0])
+            work_items_capacity = int(self.request_indices.shape[0])
+            if work_items_capacity % batch != 0:
+                raise RuntimeError(
+                    "decode graph workspace request_indices shape is incompatible with the batch bucket"
+                )
+            capture_max_chunks_per_req = work_items_capacity // batch
+            current_max_chunks_per_req = len(plan.request_indices) // batch
+            if self._decode_graph_max_chunks_per_req is None:
+                self._decode_graph_max_chunks_per_req = int(capture_max_chunks_per_req)
+            elif current_max_chunks_per_req > self._decode_graph_max_chunks_per_req:
+                raise RuntimeError("decode graph replay plan exceeds the captured fixed-grid capacity")
+            if current_max_chunks_per_req < capture_max_chunks_per_req:
+                self._use_regular_decode_graph_replay = True
+                self._copy_regular_decode_graph_plan_metadata(plan)
+                return
+            self._use_regular_decode_graph_replay = True
 
         request_indices = _copy_int_metadata(plan.request_indices, device=self.device)
         qo_tile_indices = _copy_int_metadata(plan.qo_tile_indices, device=self.device)

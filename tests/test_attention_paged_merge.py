@@ -47,7 +47,7 @@ def _make_merge_problem(
     *,
     dtype: torch.dtype = torch.bfloat16,
     counts: list[int] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     device = "cuda"
     counts = [0, 1, 3, 1, 4] if counts is None else counts
     num_heads = 3
@@ -62,13 +62,47 @@ def _make_merge_problem(
     output = torch.full((len(counts), num_heads, head_dim), -77.0, dtype=dtype, device=device)
     lse = torch.full((num_heads, len(counts)), -99.0, dtype=torch.float32, device=device)
     total_rows_ptr = torch.tensor([len(counts)], dtype=torch.int32, device=device)
-    return partial_o, partial_lse, merge_indptr, output, lse, total_rows_ptr
+    cache_seqlens = torch.tensor([max(count, 1) * 64 for count in counts], dtype=torch.int32, device=device)
+    kv_chunk_size_ptr = torch.tensor([64], dtype=torch.int32, device=device)
+    return partial_o, partial_lse, merge_indptr, output, lse, total_rows_ptr, cache_seqlens, kv_chunk_size_ptr
+
+
+def _make_regular_decode_graph_merge_problem(
+    *,
+    dtype: torch.dtype = torch.bfloat16,
+    counts: list[int],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    partial_o, partial_lse, merge_indptr, output, lse, total_rows_ptr, cache_seqlens, kv_chunk_size_ptr = (
+        _make_merge_problem(dtype=dtype, counts=counts)
+    )
+    max_chunks_per_req = max(counts)
+    fixed_partial_o = torch.zeros(
+        (len(counts) * max_chunks_per_req, partial_o.shape[1], partial_o.shape[2]),
+        dtype=partial_o.dtype,
+        device=partial_o.device,
+    )
+    fixed_partial_lse = torch.zeros(
+        (len(counts) * max_chunks_per_req, partial_lse.shape[1]),
+        dtype=partial_lse.dtype,
+        device=partial_lse.device,
+    )
+    for row_idx, count in enumerate(counts):
+        if count <= 0:
+            continue
+        src_start = int(merge_indptr[row_idx].item())
+        src_end = int(merge_indptr[row_idx + 1].item())
+        dst_start = row_idx * max_chunks_per_req
+        fixed_partial_o[dst_start : dst_start + count].copy_(partial_o[src_start:src_end])
+        fixed_partial_lse[dst_start : dst_start + count].copy_(partial_lse[src_start:src_end])
+    return fixed_partial_o, fixed_partial_lse, merge_indptr, output, lse, total_rows_ptr, cache_seqlens, kv_chunk_size_ptr
 
 
 @torch.inference_mode()
 def test_paged_persistent_merge_matches_reference() -> None:
     require_sm120()
-    partial_o, partial_lse, merge_indptr, output, lse, total_rows_ptr = _make_merge_problem()
+    partial_o, partial_lse, merge_indptr, output, lse, total_rows_ptr, cache_seqlens, kv_chunk_size_ptr = (
+        _make_merge_problem()
+    )
     kernel = PagedPersistentMergeKernel(
         cutlass.BFloat16,
         cutlass.BFloat16,
@@ -80,6 +114,8 @@ def test_paged_persistent_merge_matches_reference() -> None:
         partial_o,
         partial_lse,
         merge_indptr,
+        cache_seqlens,
+        kv_chunk_size_ptr,
         output,
         lse,
         total_rows_ptr,
@@ -95,7 +131,9 @@ def test_paged_persistent_merge_matches_reference() -> None:
 @torch.inference_mode()
 def test_paged_persistent_merge_respects_dynamic_total_rows() -> None:
     require_sm120()
-    partial_o, partial_lse, merge_indptr, output, lse, total_rows_ptr = _make_merge_problem()
+    partial_o, partial_lse, merge_indptr, output, lse, total_rows_ptr, cache_seqlens, kv_chunk_size_ptr = (
+        _make_merge_problem()
+    )
     total_rows_ptr[0] = 3
     kernel = PagedPersistentMergeKernel(
         cutlass.BFloat16,
@@ -110,6 +148,8 @@ def test_paged_persistent_merge_respects_dynamic_total_rows() -> None:
         partial_o,
         partial_lse,
         merge_indptr,
+        cache_seqlens,
+        kv_chunk_size_ptr,
         output,
         lse,
         total_rows_ptr,
@@ -127,8 +167,8 @@ def test_paged_persistent_merge_respects_dynamic_total_rows() -> None:
 @torch.inference_mode()
 def test_paged_persistent_merge_handles_more_than_one_partial_per_ty() -> None:
     require_sm120()
-    partial_o, partial_lse, merge_indptr, output, lse, total_rows_ptr = _make_merge_problem(
-        counts=[8, 7, 5]
+    partial_o, partial_lse, merge_indptr, output, lse, total_rows_ptr, cache_seqlens, kv_chunk_size_ptr = (
+        _make_merge_problem(counts=[8, 7, 5])
     )
     kernel = PagedPersistentMergeKernel(
         cutlass.BFloat16,
@@ -141,6 +181,8 @@ def test_paged_persistent_merge_handles_more_than_one_partial_per_ty() -> None:
         partial_o,
         partial_lse,
         merge_indptr,
+        cache_seqlens,
+        kv_chunk_size_ptr,
         output,
         lse,
         total_rows_ptr,
@@ -149,5 +191,47 @@ def test_paged_persistent_merge_handles_more_than_one_partial_per_ty() -> None:
     torch.cuda.synchronize()
 
     ref_out, ref_lse = _merge_reference_base2(partial_o, partial_lse, merge_indptr)
+    assert torch.allclose(output.to(torch.float32), ref_out, atol=2e-2, rtol=2e-2)
+    assert torch.allclose(lse, ref_lse, atol=2e-3, rtol=2e-3)
+
+
+@torch.inference_mode()
+def test_paged_persistent_merge_regular_decode_graph_matches_reference() -> None:
+    require_sm120()
+    counts = [1, 3, 2, 4]
+    partial_o, partial_lse, merge_indptr, output, lse, total_rows_ptr, cache_seqlens, kv_chunk_size_ptr = (
+        _make_regular_decode_graph_merge_problem(counts=counts)
+    )
+    kernel = PagedPersistentMergeKernel(
+        cutlass.BFloat16,
+        cutlass.BFloat16,
+        head_dim=256,
+        persistent_ctas=2,
+        direct_grid=True,
+        regular_decode_graph=True,
+    )
+
+    kernel(
+        partial_o,
+        partial_lse,
+        merge_indptr,
+        cache_seqlens,
+        kv_chunk_size_ptr,
+        output,
+        lse,
+        total_rows_ptr,
+        stream=current_cuda_stream(),
+    )
+    torch.cuda.synchronize()
+
+    compact_o = []
+    compact_lse = []
+    max_chunks_per_req = max(counts)
+    for row_idx, count in enumerate(counts):
+        row_start = row_idx * max_chunks_per_req
+        row_end = row_start + count
+        compact_o.append(partial_o[row_start:row_end])
+        compact_lse.append(partial_lse[row_start:row_end])
+    ref_out, ref_lse = _merge_reference_base2(torch.cat(compact_o, dim=0), torch.cat(compact_lse, dim=0), merge_indptr)
     assert torch.allclose(output.to(torch.float32), ref_out, atol=2e-2, rtol=2e-2)
     assert torch.allclose(lse, ref_lse, atol=2e-3, rtol=2e-3)

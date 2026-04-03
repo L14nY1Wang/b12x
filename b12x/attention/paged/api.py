@@ -303,16 +303,19 @@ def _build_merge_kernel(
     dtype: torch.dtype,
     head_dim: int,
     persistent_ctas: int,
-    total_rows: int,
+    direct_grid: bool,
+    regular_decode_graph: bool,
 ) -> PagedPersistentMergeKernel:
     cutlass_dtype = _torch_to_cutlass_dtype(dtype)
-    merge_bdy = 8 if int(total_rows) <= 2 else 4
+    merge_bdy = 4
     return PagedPersistentMergeKernel(
         cutlass_dtype,
         cutlass_dtype,
         head_dim=head_dim,
         bdy=merge_bdy,
         persistent_ctas=persistent_ctas,
+        direct_grid=direct_grid,
+        regular_decode_graph=regular_decode_graph,
     )
 
 
@@ -381,13 +384,7 @@ def paged_attention_forward(
             and plan.page_table_shape[0] > 1
             and max(plan.qo_tile_indices, default=0) == 0
         )
-        regularized_decode_graph = (
-            plan.mode == "decode"
-            and plan.enable_cuda_graph
-            and plan.split_kv
-            and plan.num_qo_tiles == plan.page_table_shape[0]
-            and plan.page_table_shape[0] == 16
-        )
+        regularized_decode_graph = bool(single_qtile_decode_graph and workspace._use_regular_decode_graph_replay)
         forward_kernel = _build_forward_kernel(
             traits,
             plan.split_kv,
@@ -571,17 +568,38 @@ def paged_attention_forward(
             num_heads=plan.num_q_heads,
             device=output.device,
         )
-        merge_kernel = _build_merge_kernel(output.dtype, plan.head_dim_vo, persistent_ctas, plan.total_q)
+        merge_regular_decode_graph = (
+            plan.mode == "decode"
+            and plan.enable_cuda_graph
+            and workspace._use_regular_decode_graph_replay
+        )
+        merge_direct_grid = merge_regular_decode_graph
+        merge_kernel = _build_merge_kernel(
+            output.dtype,
+            plan.head_dim_vo,
+            persistent_ctas,
+            merge_direct_grid,
+            merge_regular_decode_graph,
+        )
         tmp_output_arg = _to_kernel_tensor(workspace.tmp_output, _torch_to_cutlass_dtype(workspace.tmp_output.dtype))
         tmp_lse_arg = _to_kernel_tensor(workspace.tmp_lse, cutlass.Float32)
         merge_indptr_arg = _to_kernel_tensor(workspace.merge_indptr, cutlass.Int32, assumed_align=4)
+        merge_cache_seqlens_arg = _to_kernel_tensor(
+            _as_int32_tensor(cache_seqlens), cutlass.Int32, assumed_align=4
+        )
         output_arg = _to_kernel_tensor(output, _torch_to_cutlass_dtype(output.dtype))
         lse_arg = _to_kernel_tensor(workspace.lse, cutlass.Float32)
-        total_num_rows_arg = _to_kernel_tensor(workspace.total_num_rows_ptr, cutlass.Int32, assumed_align=4)
+        total_num_rows_arg = (
+            None
+            if merge_regular_decode_graph
+            else _to_kernel_tensor(workspace.total_num_rows_ptr, cutlass.Int32, assumed_align=4)
+        )
         merge_args = (
             tmp_output_arg,
             tmp_lse_arg,
             merge_indptr_arg,
+            merge_cache_seqlens_arg,
+            kv_chunk_size_arg,
             output_arg,
             lse_arg,
             total_num_rows_arg,
@@ -590,10 +608,14 @@ def paged_attention_forward(
             _tensor_meta_key(workspace.tmp_output),
             _tensor_meta_key(workspace.tmp_lse),
             _tensor_meta_key(workspace.merge_indptr),
+            _tensor_meta_key(cache_seqlens),
+            _tensor_meta_key(workspace.kv_chunk_size_ptr),
             _tensor_meta_key(output),
             _tensor_meta_key(workspace.lse),
-            _tensor_meta_key(workspace.total_num_rows_ptr),
+            None if merge_regular_decode_graph else _tensor_meta_key(workspace.total_num_rows_ptr),
             persistent_ctas,
+            merge_direct_grid,
+            merge_regular_decode_graph,
         )
         _run_cached_host_launcher(
             merge_kernel,
@@ -603,10 +625,14 @@ def paged_attention_forward(
                 "tmp_output",
                 "tmp_lse",
                 "merge_indptr",
+                "cache_seqlens",
+                "kv_chunk_size_ptr",
                 "output",
                 "lse",
                 "total_num_rows_ptr",
                 "persistent_ctas",
+                "direct_grid",
+                "regular_decode_graph",
             ),
         )
 

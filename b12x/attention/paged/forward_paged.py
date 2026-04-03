@@ -2208,6 +2208,15 @@ class PagedForwardKernel:
         )
 
         SharedStorage = self._get_shared_storage_cls()
+        grid = (
+            (
+                mO.shape[0] // mPageTable.shape[0],
+                mKCache.shape[2],
+                mPageTable.shape[0],
+            )
+            if self.regularized_decode_graph
+            else (mBlockValidMask.shape[0], mKCache.shape[2], 1)
+        )
         self.kernel(
             mQ,
             mKCache,
@@ -2229,7 +2238,7 @@ class PagedForwardKernel:
             tma_atom_K,
             tma_atom_V,
         ).launch(
-            grid=(mBlockValidMask.shape[0], mKCache.shape[2], 1),
+            grid=grid,
             block=[32, self.traits.num_warps_q, self.traits.num_warps_kv],
             smem=SharedStorage.size_in_bytes(),
             stream=stream,
@@ -2259,42 +2268,56 @@ class PagedForwardKernel:
         tma_atom_V: cute.CopyAtom | None,
     ):
         lane, warp_q_idx, warp_kv_idx = cute.arch.thread_idx()
-        work_idx, kv_head_idx, _ = cute.arch.block_idx()
-        block_valid = mBlockValidMask[work_idx]
-        if block_valid == Int32(0):
-            _exit_thread()
-        if const_expr(self.single_request_decode_graph):
-            request_idx = Int32(0)
-            q_start = Int32(0)
-            q_end = Int32(1)
+        block_x, kv_head_idx, block_z = cute.arch.block_idx()
+        if const_expr(self.regularized_decode_graph):
+            max_chunks_per_req = Int32(mO.shape[0] // mPageTable.shape[0])
+            request_idx = Int32(block_z)
+            kv_tile_idx = Int32(block_x)
+            work_idx = request_idx * max_chunks_per_req + kv_tile_idx
+            q_start = request_idx
             qo_len = Int32(1)
-            kv_tile_idx = work_idx
-            request_partial_start = Int32(0)
-            request_partial_end = mOIndptr[1]
-        elif const_expr(self.single_qtile_decode_graph):
-            if const_expr(self.regularized_decode_graph):
-                batch = mPageTable.shape[0]
-                max_chunks_per_req = mBlockValidMask.shape[0] // batch
-                request_idx = work_idx // max_chunks_per_req
-                kv_tile_idx = work_idx - request_idx * max_chunks_per_req
-            else:
+            cache_len = mCacheSeqlens[request_idx]
+            kv_chunk_size = mKvChunkSizePtr[0]
+            num_chunks_kv = (
+                mOIndptr[request_idx + 1] - mOIndptr[request_idx]
+                if const_expr(self.split_kv)
+                else 1
+            )
+            if kv_tile_idx >= num_chunks_kv:
+                _exit_thread()
+            request_partial_start = request_idx * max_chunks_per_req
+            request_partial_end = request_partial_start + num_chunks_kv
+        else:
+            work_idx = Int32(block_x)
+            block_valid = mBlockValidMask[work_idx]
+            if block_valid == Int32(0):
+                _exit_thread()
+            if const_expr(self.single_request_decode_graph):
+                request_idx = Int32(0)
+                q_start = Int32(0)
+                q_end = Int32(1)
+                qo_len = Int32(1)
+                kv_tile_idx = work_idx
+                request_partial_start = Int32(0)
+                request_partial_end = mOIndptr[1]
+            elif const_expr(self.single_qtile_decode_graph):
                 request_idx = mRequestIndices[work_idx]
                 kv_tile_idx = work_idx - mOIndptr[mRequestIndices[work_idx]]
-            q_start = request_idx
-            q_end = request_idx + 1
-            qo_len = Int32(1)
-            request_partial_start = mOIndptr[request_idx]
-            request_partial_end = mOIndptr[request_idx + 1]
-        else:
-            request_idx = mRequestIndices[work_idx]
-            qo_tile_idx = mQoTileIndices[work_idx]
-            kv_tile_idx = mKvTileIndices[work_idx]
-            q_start = mCuSeqlensQ[request_idx]
-            q_end = mCuSeqlensQ[request_idx + 1]
-            qo_len = q_end - q_start
-            request_partial_start = mOIndptr[request_idx]
-            request_partial_end = mOIndptr[request_idx + 1]
-        cache_len = mCacheSeqlens[request_idx]
+                q_start = request_idx
+                q_end = request_idx + 1
+                qo_len = Int32(1)
+                request_partial_start = mOIndptr[request_idx]
+                request_partial_end = mOIndptr[request_idx + 1]
+            else:
+                request_idx = mRequestIndices[work_idx]
+                qo_tile_idx = mQoTileIndices[work_idx]
+                kv_tile_idx = mKvTileIndices[work_idx]
+                q_start = mCuSeqlensQ[request_idx]
+                q_end = mCuSeqlensQ[request_idx + 1]
+                qo_len = q_end - q_start
+                request_partial_start = mOIndptr[request_idx]
+                request_partial_end = mOIndptr[request_idx + 1]
+            cache_len = mCacheSeqlens[request_idx]
         group_size = mQ.shape[1] // mKCache.shape[2]
         packed_qo_len = qo_len * group_size
         if const_expr(self.single_request_decode_graph or self.single_qtile_decode_graph):
@@ -2320,9 +2343,13 @@ class PagedForwardKernel:
         )
         if const_expr(self.split_kv):
             num_chunks_kv = (
-                request_partial_end - request_partial_start
-                if const_expr(self.single_request_decode_graph or self.single_qtile_decode_graph)
-                else (request_partial_end - request_partial_start) // qo_len
+                num_chunks_kv
+                if const_expr(self.regularized_decode_graph)
+                else (
+                    request_partial_end - request_partial_start
+                    if const_expr(self.single_request_decode_graph or self.single_qtile_decode_graph)
+                    else (request_partial_end - request_partial_start) // qo_len
+                )
             )
         else:
             num_chunks_kv = 1
