@@ -25,6 +25,14 @@ from serve.tp.group import TPGroup
 _ACTIVE_TP_MONITOR = None
 
 
+def _cleanup_followers(followers: list[mp.Process]) -> None:
+    for p in followers:
+        if p.is_alive():
+            p.kill()
+    for p in followers:
+        p.join(timeout=5)
+
+
 @dataclass
 class TPFollowerMonitor:
     world_size: int
@@ -125,15 +133,25 @@ def launch_tp(
         followers.append(p)
     _set_active_tp_monitor(TPFollowerMonitor(world_size=world_size, gpu_ids=gpu_ids, followers=followers))
 
+    previous_handlers: dict[int, object] = {}
+
+    def _handle_parent_signal(signum, _frame):
+        _cleanup_followers(followers)
+        _clear_active_tp_monitor()
+        raise KeyboardInterrupt(f"launch_tp interrupted by signal {signum}")
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous_handlers[signum] = signal.getsignal(signum)
+        signal.signal(signum, _handle_parent_signal)
+
     # Run rank 0 in the current process (preserves stdin for interactive mode).
     try:
         _worker(0, world_size, gpu_ids, port, fn, args)
     finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
         _clear_active_tp_monitor()
-        for p in followers:
-            if p.is_alive():
-                p.kill()
-                p.join(timeout=5)
+        _cleanup_followers(followers)
 
 
 def _worker(rank, world_size, gpu_ids, port, fn, args):

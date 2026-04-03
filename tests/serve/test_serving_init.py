@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import torch
 
 from serve.engine.serving import ServingEngine
+from serve.model.attention import B12xPagedAttention
 
 
 class _FakeTokenizer:
@@ -77,3 +78,142 @@ def test_serving_engine_passes_runtime_limits_to_model_runner(monkeypatch):
     assert runner_kwargs["max_batch_size"] == 256
     assert runner_kwargs["max_total_tokens"] == 16384
     assert engine.runtime_policy()["max_running"] == 256
+
+
+def test_serving_engine_enables_hybrid_layer_compile_without_legacy_warmup(monkeypatch):
+    cfg = SimpleNamespace(
+        num_layers=2,
+        num_kv_heads=1,
+        head_dim=8,
+        vocab_size=16,
+        layer_types=["attention", "linear_attention"],
+        linear_num_v_heads=1,
+        linear_head_v_dim=8,
+        linear_head_k_dim=8,
+        linear_num_k_heads=1,
+        linear_conv_kernel=4,
+    )
+    fake_model = SimpleNamespace(config=cfg)
+    calls = {"warmup": 0, "compile_model": 0}
+
+    class _FakeRunner:
+        def __init__(self, model, kv_mgr, **kwargs):
+            del model, kv_mgr, kwargs
+
+        def warmup(self, *args, **kwargs):
+            del args, kwargs
+            calls["warmup"] += 1
+
+        def capture_decode_graphs(self, *args, **kwargs):
+            return None
+
+        def compile_model(self, *args, **kwargs):
+            del args, kwargs
+            calls["compile_model"] += 1
+
+    class _FakeLinearStateArena:
+        def __init__(self, **kwargs):
+            del kwargs
+            self.num_snapshot_slots = 0
+
+        def zero_all(self):
+            return None
+
+        def memory_bytes(self):
+            return 0
+
+    monkeypatch.setattr("serve.engine.serving.load_model", lambda *args, **kwargs: fake_model)
+    monkeypatch.setattr("serve.engine.serving.AutoTokenizer.from_pretrained", lambda *args, **kwargs: _FakeTokenizer())
+    monkeypatch.setattr("serve.engine.serving._estimate_loaded_model_bytes", lambda model: 0)
+    monkeypatch.setattr("serve.engine.serving.PagePool", _FakePagePool)
+    monkeypatch.setattr("serve.engine.serving.PrefixCheckpointCache", lambda pool, state_arena=None: SimpleNamespace(pool=pool))
+    monkeypatch.setattr("serve.engine.serving.start_startup_session", lambda: None)
+    monkeypatch.setattr("torch.cuda.mem_get_info", lambda: (8 * 1024**3, 16 * 1024**3))
+    monkeypatch.setattr("serve.engine.runner.ModelRunner", _FakeRunner)
+    monkeypatch.setattr("serve.cache.linear_state_arena.LinearStateArena", _FakeLinearStateArena)
+
+    engine = ServingEngine(
+        "/tmp/fake-model",
+        device="cpu",
+        graph_batch_sizes=[],
+        compile_layers=True,
+    )
+
+    assert calls["compile_model"] == 1
+    assert calls["warmup"] == 0
+    assert engine.runtime_policy()["compile_layers"] is True
+
+
+def test_serving_engine_skips_decode_warmup_when_decode_graphs_are_enabled(monkeypatch):
+    cfg = SimpleNamespace(
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=8,
+        vocab_size=16,
+        layer_types=None,
+    )
+    fake_model = SimpleNamespace(config=cfg)
+    warmup_kwargs = []
+
+    class _FakeRunner:
+        def __init__(self, model, kv_mgr, **kwargs):
+            del model, kv_mgr, kwargs
+
+        def warmup(self, *args, **kwargs):
+            del args
+            warmup_kwargs.append(dict(kwargs))
+
+        def capture_decode_graphs(self, *args, **kwargs):
+            del args, kwargs
+            return None
+
+        def compile_model(self, *args, **kwargs):
+            del args, kwargs
+            return None
+
+    monkeypatch.setattr("serve.engine.serving.load_model", lambda *args, **kwargs: fake_model)
+    monkeypatch.setattr("serve.engine.serving.AutoTokenizer.from_pretrained", lambda *args, **kwargs: _FakeTokenizer())
+    monkeypatch.setattr("serve.engine.serving._estimate_loaded_model_bytes", lambda model: 0)
+    monkeypatch.setattr("serve.engine.serving.PagePool", _FakePagePool)
+    monkeypatch.setattr("serve.engine.serving.PrefixCheckpointCache", lambda pool, state_arena=None: SimpleNamespace(pool=pool))
+    monkeypatch.setattr("serve.engine.serving.start_startup_session", lambda: None)
+    monkeypatch.setattr("torch.cuda.mem_get_info", lambda: (8 * 1024**3, 16 * 1024**3))
+    monkeypatch.setattr("serve.engine.runner.ModelRunner", _FakeRunner)
+
+    ServingEngine(
+        "/tmp/fake-model",
+        device="cpu",
+        graph_batch_sizes=[1, 2, 4],
+    )
+
+    assert len(warmup_kwargs) == 1
+    assert warmup_kwargs[0]["warm_decode"] is False
+
+
+def test_paged_attention_uses_extend_workspace_for_unsupported_decode_shapes():
+    attn = B12xPagedAttention(
+        num_q_heads=16,
+        num_kv_heads=8,
+        head_dim=128,
+        hidden_size=2048,
+        rotary_dim=128,
+        rms_norm_eps=1e-5,
+        qkv_weight=torch.zeros(4096, 2048, dtype=torch.bfloat16),
+        o_proj_weight=torch.zeros(2048, 2048, dtype=torch.bfloat16),
+        q_norm_weight=torch.zeros(128, dtype=torch.bfloat16),
+        k_norm_weight=torch.zeros(128, dtype=torch.bfloat16),
+    )
+
+    workspaces = attn.allocate_workspaces(
+        device="cpu",
+        kv_dtype=torch.bfloat16,
+        page_size=64,
+        num_cache_pages=128,
+        max_total_q=4,
+        max_batch=4,
+        max_page_table_width=128,
+        use_cuda_graph=True,
+    )
+
+    assert workspaces["decode"] is workspaces["extend"]
+    assert workspaces["decode"].mode == "extend"

@@ -303,6 +303,12 @@ def _load_experts(loader, prefix, cfg, device, rank=0, world_size=1):
     down_rows, down_cols_tp = loader.dim1_shard_shape(f"{ep0}.down_proj.weight", unit=8)
     gate_s_rows_tp, gate_s_cols = loader.dim0_shard_shape(f"{ep0}.gate_proj.weight_scale", unit=8)
     down_s_rows, down_s_cols_tp = loader.dim1_shard_shape(f"{ep0}.down_proj.weight_scale")
+    gate_w0 = loader.dim0_shard(f"{ep0}.gate_proj.weight", unit=8)
+    up_w0 = loader.dim0_shard(f"{ep0}.up_proj.weight", unit=8)
+    gate_s0 = loader.dim0_shard(f"{ep0}.gate_proj.weight_scale", unit=8)
+    up_s0 = loader.dim0_shard(f"{ep0}.up_proj.weight_scale", unit=8)
+    down_w0 = loader.dim1_shard(f"{ep0}.down_proj.weight", unit=8)
+    down_s0 = loader.dim1_shard(f"{ep0}.down_proj.weight_scale")
 
     # Compute per-rank shapes.
     # Shard gate and up SEPARATELY, then cat [up, gate] per rank.
@@ -320,16 +326,26 @@ def _load_experts(loader, prefix, cfg, device, rank=0, world_size=1):
 
     for e in range(E):
         ep = f"{prefix}.mlp.experts.{e}"
-        gate_w = loader.dim0_shard(f"{ep}.gate_proj.weight", unit=8)
-        up_w = loader.dim0_shard(f"{ep}.up_proj.weight", unit=8)
+        if e == 0:
+            gate_w = gate_w0
+            up_w = up_w0
+            gate_s = gate_s0
+            up_s = up_s0
+            down_w = down_w0
+            down_s = down_s0
+        else:
+            gate_w = loader.dim0_shard(f"{ep}.gate_proj.weight", unit=8)
+            up_w = loader.dim0_shard(f"{ep}.up_proj.weight", unit=8)
+            gate_s = loader.dim0_shard(f"{ep}.gate_proj.weight_scale", unit=8)
+            up_s = loader.dim0_shard(f"{ep}.up_proj.weight_scale", unit=8)
+            down_w = loader.dim1_shard(f"{ep}.down_proj.weight", unit=8)
+            down_s = loader.dim1_shard(f"{ep}.down_proj.weight_scale")
         w13_weight[e] = torch.cat([up_w, gate_w], dim=0).to(device)
 
-        gate_s = loader.dim0_shard(f"{ep}.gate_proj.weight_scale", unit=8)
-        up_s = loader.dim0_shard(f"{ep}.up_proj.weight_scale", unit=8)
         w13_scale[e] = torch.cat([up_s, gate_s], dim=0).to(device)
 
-        w2_weight[e] = loader.dim1_shard(f"{ep}.down_proj.weight", unit=8).to(device)
-        w2_scale[e] = loader.dim1_shard(f"{ep}.down_proj.weight_scale").to(device)
+        w2_weight[e] = down_w.to(device)
+        w2_scale[e] = down_s.to(device)
 
         gate_is = loader.scalar(f"{ep}.gate_proj.input_scale", default=None)
         down_is = loader.scalar(f"{ep}.down_proj.input_scale", default=None)
@@ -338,13 +354,13 @@ def _load_experts(loader, prefix, cfg, device, rank=0, world_size=1):
 
         # Store reciprocal input scales (matching sglang's w13_input_scale_quant).
         if gate_is is not None:
-            a1_gscale[e] = (1.0 / gate_is).float()
+            a1_gscale[e] = float(1.0 / gate_is)
         if down_is is not None:
-            a2_gscale[e] = (1.0 / down_is).float()
+            a2_gscale[e] = float(1.0 / down_is)
         if gate_is is not None and gate_s2 is not None:
-            g1_alphas[e] = (gate_is * gate_s2).float()
+            g1_alphas[e] = float(gate_is * gate_s2)
         if down_is is not None and down_s2 is not None:
-            g2_alphas[e] = (down_is * down_s2).float()
+            g2_alphas[e] = float(down_is * down_s2)
 
     w13_blockscale = swizzle_block_scale(w13_scale)
     w2_blockscale = swizzle_block_scale(w2_scale)

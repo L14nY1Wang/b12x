@@ -26,3 +26,5 @@ class StepState:
     cu_seqlens_q: torch.Tensor
     mamba: MambaForwardMetadata | None = None
     is_decode: bool = False
+    attn_workspaces_prepared: bool = False
+    prepared_attn_workspace_ids: set[int] | None = None

@@ -41,8 +41,8 @@ def test_layer_compile_disabled_by_default():
     )
 
 
-def test_layer_compile_disabled_for_hybrid_models():
-    assert not _should_enable_layer_compile(
+def test_layer_compile_enabled_for_hybrid_models_when_requested():
+    assert _should_enable_layer_compile(
         is_hybrid=True,
         compile_layers=True,
     )

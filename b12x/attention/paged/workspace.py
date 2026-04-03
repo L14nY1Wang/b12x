@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 import torch
+from torch.profiler import record_function
 
 from .planner import (
     PagedPlan,
@@ -94,6 +95,7 @@ class PagedAttentionWorkspace:
     _decode_graph_chunk_pages_lut: torch.Tensor | None = None
     _decode_graph_max_chunks_per_req: int | None = None
     _use_regular_decode_graph_replay: bool = False
+    _decode_graph_metadata_captured_in_graph: bool = False
     _live_plane_tma_desc_cache: dict[tuple[int, int, tuple[int, ...], tuple[int, ...], int, int], tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor, torch.Tensor]] = field(
         default_factory=dict
     )
@@ -363,53 +365,140 @@ class PagedAttentionWorkspace:
         fixed_split_size: int | None = None,
         disable_split_kv: bool = False,
     ) -> PagedAttentionWorkspace:
-        if self.use_cuda_graph and torch.cuda.is_current_stream_capturing():
-            if self._plan is None:
-                raise RuntimeError(
-                    "graph-mode paged workspace must be prepared before CUDA graph capture"
+        with record_function(f"paged_workspace.prepare.{self.mode}"):
+            if self.use_cuda_graph and torch.cuda.is_current_stream_capturing():
+                if self._plan is None:
+                    raise RuntimeError(
+                        "graph-mode paged workspace must be prepared before CUDA graph capture"
+                    )
+                with record_function("paged_workspace.copy_runtime_metadata.capture"):
+                    self._copy_runtime_metadata(page_table, cache_seqlens, cu_seqlens_q)
+                return self
+
+            if (
+                self.use_cuda_graph
+                and self.mode == "decode"
+                and self._decode_graph_chunk_pages_lut is not None
+                and self._plan is not None
+            ):
+                with record_function("paged_workspace.copy_runtime_metadata"):
+                    self._copy_runtime_metadata(page_table, cache_seqlens, cu_seqlens_q)
+                if not self._decode_graph_metadata_captured_in_graph:
+                    with record_function("paged_workspace.update_decode_graph_replay_metadata"):
+                        self.update_decode_graph_replay_metadata_from_runtime_cache_seqlens()
+                return self
+
+            with record_function("paged_workspace.infer_mode"):
+                inferred_mode = infer_paged_mode(cu_seqlens_q)
+            if inferred_mode != self.mode and not (
+                self.mode == "extend" and inferred_mode == "decode"
+            ) and not (
+                self.mode == "verify" and inferred_mode == "extend"
+            ):
+                raise ValueError(f"workspace mode {self.mode} does not match prepared mode {inferred_mode}")
+            active_total_q = int(cu_seqlens_q[-1].item())
+            with record_function("paged_workspace.ensure_plan_contract"):
+                self._ensure_plan_contract(active_total_q)
+            assert self._plan_q is not None
+            assert self._plan_k_cache is not None
+            assert self._plan_v_cache is not None
+            if active_total_q <= 0 or active_total_q > int(self._plan_q.shape[0]):
+                raise ValueError(
+                    f"cu_seqlens_q implies total_q={active_total_q}, but workspace capacity is {int(self._plan_q.shape[0])}"
                 )
-            self._copy_runtime_metadata(page_table, cache_seqlens, cu_seqlens_q)
+
+            with record_function("paged_workspace.create_paged_plan"):
+                plan = create_paged_plan(
+                    self._plan_q[:active_total_q],
+                    self._plan_k_cache,
+                    self._plan_v_cache,
+                    page_table,
+                    cache_seqlens,
+                    cu_seqlens_q,
+                    mode=self.mode,
+                    fixed_split_size=-1 if fixed_split_size is None else int(fixed_split_size),
+                    disable_split_kv=disable_split_kv,
+                    enable_cuda_graph=self.use_cuda_graph,
+                    graph_chunk_policy=self.use_cuda_graph,
+                    plan_budget=(
+                        self.planner_budget
+                        if self.mode in ("extend", "verify") and not self.use_cuda_graph
+                        else None
+                    ),
+                )
+            with record_function("paged_workspace.ensure_capacity"):
+                self._ensure_capacity(plan)
+            with record_function("paged_workspace.copy_runtime_metadata"):
+                self._copy_runtime_metadata(page_table, cache_seqlens, cu_seqlens_q)
+            with record_function("paged_workspace.copy_plan_metadata"):
+                self._copy_plan_metadata(plan)
+            self._plan = plan
             return self
 
-        inferred_mode = infer_paged_mode(cu_seqlens_q)
-        if inferred_mode != self.mode and not (
-            self.mode == "extend" and inferred_mode == "decode"
-        ) and not (
-            self.mode == "verify" and inferred_mode == "extend"
-        ):
-            raise ValueError(f"workspace mode {self.mode} does not match prepared mode {inferred_mode}")
-        active_total_q = int(cu_seqlens_q[-1].item())
-        self._ensure_plan_contract(active_total_q)
-        assert self._plan_q is not None
-        assert self._plan_k_cache is not None
-        assert self._plan_v_cache is not None
-        if active_total_q <= 0 or active_total_q > int(self._plan_q.shape[0]):
-            raise ValueError(
-                f"cu_seqlens_q implies total_q={active_total_q}, but workspace capacity is {int(self._plan_q.shape[0])}"
+    def update_decode_graph_replay_metadata_from_runtime_cache_seqlens(
+        self,
+    ) -> PagedAttentionWorkspace:
+        if not self.use_cuda_graph:
+            raise RuntimeError(
+                "update_decode_graph_replay_metadata_from_runtime_cache_seqlens "
+                "is only valid for graph-mode workspaces"
             )
+        if self.mode != "decode":
+            raise RuntimeError(
+                "update_decode_graph_replay_metadata_from_runtime_cache_seqlens "
+                "is only valid for decode workspaces"
+            )
+        if self._decode_graph_chunk_pages_lut is None:
+            raise RuntimeError("decode graph replay policy has not been prepared")
+        if self.cache_seqlens is None:
+            raise RuntimeError("decode graph workspace is missing cache_seqlens")
+        if self.request_indices is None:
+            raise RuntimeError("decode graph workspace is missing request indices")
+        if self.merge_indptr is None or self.o_indptr is None:
+            raise RuntimeError("decode graph workspace is missing indptr buffers")
+        if self.kv_chunk_size_ptr is None:
+            raise RuntimeError("decode graph workspace is missing kv_chunk_size_ptr")
+        if self.block_valid_mask is None:
+            raise RuntimeError("decode graph workspace is missing block_valid_mask")
 
-        plan = create_paged_plan(
-            self._plan_q[:active_total_q],
-            self._plan_k_cache,
-            self._plan_v_cache,
-            page_table,
-            cache_seqlens,
-            cu_seqlens_q,
-            mode=self.mode,
-            fixed_split_size=-1 if fixed_split_size is None else int(fixed_split_size),
-            disable_split_kv=disable_split_kv,
-            enable_cuda_graph=self.use_cuda_graph,
-            graph_chunk_policy=self.use_cuda_graph,
-            plan_budget=(
-                self.planner_budget
-                if self.mode in ("extend", "verify") and not self.use_cuda_graph
-                else None
-            ),
-        )
-        self._ensure_capacity(plan)
-        self._copy_runtime_metadata(page_table, cache_seqlens, cu_seqlens_q)
-        self._copy_plan_metadata(plan)
-        self._plan = plan
+        self._validate_decode_graph_replay_capacity(batch=int(self.cache_seqlens.shape[0]))
+
+        if self._use_regular_decode_graph_replay:
+            from .graph_replay import update_regular_decode_graph_chunk_metadata
+
+            max_cache_pages = torch.div(
+                self.cache_seqlens.amax() + (self.page_size - 1),
+                self.page_size,
+                rounding_mode="floor",
+            ).clamp_(min=1, max=self._decode_graph_chunk_pages_lut.shape[0] - 1)
+            decode_chunk_pages = torch.index_select(
+                self._decode_graph_chunk_pages_lut,
+                0,
+                max_cache_pages.to(torch.int64).view(1),
+            )
+            kv_chunk_size = (decode_chunk_pages * self.page_size).to(torch.int32)
+            max_chunks_per_req = int(self.request_indices.shape[0] // self.cache_seqlens.shape[0])
+            update_regular_decode_graph_chunk_metadata(
+                cache_seqlens=self.cache_seqlens,
+                merge_indptr=self.merge_indptr,
+                o_indptr=self.o_indptr,
+                kv_chunk_size_ptr=self.kv_chunk_size_ptr,
+                kv_chunk_size=kv_chunk_size,
+                max_chunks_per_req=max_chunks_per_req,
+            )
+        else:
+            from .graph_replay import update_decode_graph_chunk_metadata
+
+            update_decode_graph_chunk_metadata(
+                cache_seqlens=self.cache_seqlens,
+                request_indices=self.request_indices,
+                merge_indptr=self.merge_indptr,
+                o_indptr=self.o_indptr,
+                block_valid_mask=self.block_valid_mask,
+                kv_chunk_size_ptr=self.kv_chunk_size_ptr,
+                decode_chunk_pages_lut=self._decode_graph_chunk_pages_lut,
+                page_size=self.page_size,
+            )
         return self
 
     def prepare_for_cuda_graph_replay(
@@ -439,7 +528,9 @@ class PagedAttentionWorkspace:
     ) -> PagedAttentionWorkspace:
         if not self.use_cuda_graph:
             raise RuntimeError("bind_cuda_graph_runtime_metadata is only valid for graph-mode workspaces")
-        inferred_mode = infer_paged_mode(cu_seqlens_q)
+        # Decode graph replay already selected the workspace by mode, so avoid
+        # re-reading cu_seqlens_q back to the CPU just to rediscover q_len=1.
+        inferred_mode = self.mode if self.mode == "decode" else infer_paged_mode(cu_seqlens_q)
         if inferred_mode != self.mode and not (
             self.mode == "extend" and inferred_mode == "decode"
         ) and not (
@@ -470,16 +561,29 @@ class PagedAttentionWorkspace:
 
         from .graph_replay import make_decode_chunk_pages_lut_tensor, summarize_decode_chunk_pages_lut
 
-        decode_chunk_pages_lut = build_decode_chunk_pages_lut(
-            q_dtype=self.dtype,
-            kv_dtype=self.kv_dtype,
-            batch=batch,
-            page_size=self.page_size,
-            head_dim_qk=self.head_dim_qk,
-            head_dim_vo=self.head_dim_vo,
-            gqa_group_size=self.num_q_heads // self.num_kv_heads,
-            max_effective_kv_pages=max_cache_page_count,
-        )
+        try:
+            decode_chunk_pages_lut = build_decode_chunk_pages_lut(
+                q_dtype=self.dtype,
+                kv_dtype=self.kv_dtype,
+                batch=batch,
+                page_size=self.page_size,
+                head_dim_qk=self.head_dim_qk,
+                head_dim_vo=self.head_dim_vo,
+                gqa_group_size=self.num_q_heads // self.num_kv_heads,
+                max_effective_kv_pages=max_cache_page_count,
+            )
+        except KeyError:
+            self._decode_graph_chunk_pages_lut = None
+            self._decode_graph_max_chunks_per_req = None
+            self._use_regular_decode_graph_replay = False
+            self._decode_graph_metadata_captured_in_graph = False
+            self.prepare_for_capacity(
+                batch=batch,
+                total_q_capacity=total_q_capacity,
+                max_page_table_width=max_page_table_width,
+                max_cache_seqlen=max_cache_page_count * self.page_size,
+            )
+            return self
         worst_page_count, max_chunks_per_req = summarize_decode_chunk_pages_lut(decode_chunk_pages_lut)
         self._decode_graph_chunk_pages_lut = make_decode_chunk_pages_lut_tensor(
             decode_chunk_pages_lut,
@@ -638,8 +742,31 @@ class PagedAttentionWorkspace:
         output: torch.Tensor,
         k_descale: torch.Tensor | None = None,
         v_descale: torch.Tensor | None = None,
+        prepare_decode_graph_metadata: bool | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from .api import paged_attention_forward
+
+        if prepare_decode_graph_metadata is None:
+            prepare_decode_graph_metadata = (
+                self.use_cuda_graph
+                and self.mode == "decode"
+                and self._decode_graph_chunk_pages_lut is not None
+                and self._plan is not None
+                and torch.cuda.is_current_stream_capturing()
+            )
+        if prepare_decode_graph_metadata:
+            if not self.use_cuda_graph:
+                raise RuntimeError("prepare_decode_graph_metadata requires a graph-mode workspace")
+            if self.mode != "decode":
+                raise RuntimeError("prepare_decode_graph_metadata is only valid for decode workspaces")
+            if self._decode_graph_chunk_pages_lut is None or self._plan is None:
+                raise RuntimeError(
+                    "prepare_decode_graph_metadata requires a decode replay-state workspace"
+                )
+            with record_function("paged_workspace.capture_decode_graph_replay_metadata"):
+                self.update_decode_graph_replay_metadata_from_runtime_cache_seqlens()
+            if torch.cuda.is_current_stream_capturing():
+                self._decode_graph_metadata_captured_in_graph = True
 
         out, lse = paged_attention_forward(
             q,
@@ -810,17 +937,21 @@ class PagedAttentionWorkspace:
         assert self.cache_seqlens is not None
         assert self.cu_seqlens_q is not None
 
-        page_table_i32 = page_table if page_table.dtype == torch.int32 else page_table.to(torch.int32)
-        cache_seqlens_i32 = (
-            cache_seqlens if cache_seqlens.dtype == torch.int32 else cache_seqlens.to(torch.int32)
-        )
-        cu_seqlens_q_i32 = (
-            cu_seqlens_q if cu_seqlens_q.dtype == torch.int32 else cu_seqlens_q.to(torch.int32)
-        )
+        with record_function("paged_workspace.runtime_cast_metadata"):
+            page_table_i32 = page_table if page_table.dtype == torch.int32 else page_table.to(torch.int32)
+            cache_seqlens_i32 = (
+                cache_seqlens if cache_seqlens.dtype == torch.int32 else cache_seqlens.to(torch.int32)
+            )
+            cu_seqlens_q_i32 = (
+                cu_seqlens_q if cu_seqlens_q.dtype == torch.int32 else cu_seqlens_q.to(torch.int32)
+            )
 
-        self.page_table[: page_table_i32.shape[0], : page_table_i32.shape[1]].copy_(page_table_i32)
-        self.cache_seqlens[: cache_seqlens_i32.shape[0]].copy_(cache_seqlens_i32)
-        self.cu_seqlens_q[: cu_seqlens_q_i32.shape[0]].copy_(cu_seqlens_q_i32)
+        with record_function("paged_workspace.runtime_copy_page_table"):
+            self.page_table[: page_table_i32.shape[0], : page_table_i32.shape[1]].copy_(page_table_i32)
+        with record_function("paged_workspace.runtime_copy_cache_seqlens"):
+            self.cache_seqlens[: cache_seqlens_i32.shape[0]].copy_(cache_seqlens_i32)
+        with record_function("paged_workspace.runtime_copy_cu_seqlens_q"):
+            self.cu_seqlens_q[: cu_seqlens_q_i32.shape[0]].copy_(cu_seqlens_q_i32)
 
     def _copy_regular_decode_graph_plan_metadata(self, plan: PagedPlan) -> None:
         assert self.request_indices is not None
@@ -893,22 +1024,26 @@ class PagedAttentionWorkspace:
                 return
             self._use_regular_decode_graph_replay = True
 
-        request_indices = _copy_int_metadata(plan.request_indices, device=self.device)
-        qo_tile_indices = _copy_int_metadata(plan.qo_tile_indices, device=self.device)
-        kv_tile_indices = _copy_int_metadata(plan.kv_tile_indices, device=self.device)
-        merge_indptr = _copy_int_metadata(plan.merge_indptr, device=self.device)
-        o_indptr = _copy_int_metadata(plan.o_indptr, device=self.device)
-        block_valid_mask = torch.tensor(plan.block_valid_mask, dtype=torch.int32, device=self.device)
+        with record_function("paged_workspace.plan_metadata_to_device"):
+            request_indices = _copy_int_metadata(plan.request_indices, device=self.device)
+            qo_tile_indices = _copy_int_metadata(plan.qo_tile_indices, device=self.device)
+            kv_tile_indices = _copy_int_metadata(plan.kv_tile_indices, device=self.device)
+            merge_indptr = _copy_int_metadata(plan.merge_indptr, device=self.device)
+            o_indptr = _copy_int_metadata(plan.o_indptr, device=self.device)
+            block_valid_mask = torch.tensor(plan.block_valid_mask, dtype=torch.int32, device=self.device)
 
-        self.request_indices.zero_()
-        self.qo_tile_indices.zero_()
-        self.kv_tile_indices.zero_()
-        self.request_indices[: request_indices.shape[0]].copy_(request_indices)
-        self.qo_tile_indices[: qo_tile_indices.shape[0]].copy_(qo_tile_indices)
-        self.kv_tile_indices[: kv_tile_indices.shape[0]].copy_(kv_tile_indices)
-        self.merge_indptr[: merge_indptr.shape[0]].copy_(merge_indptr)
-        self.o_indptr[: o_indptr.shape[0]].copy_(o_indptr)
-        self.block_valid_mask.zero_()
-        self.block_valid_mask[: block_valid_mask.shape[0]].copy_(block_valid_mask)
-        self.kv_chunk_size_ptr[0] = int(plan.kv_chunk_size)
-        self.total_num_rows_ptr[0] = int(plan.total_q)
+        with record_function("paged_workspace.plan_metadata_zero_buffers"):
+            self.request_indices.zero_()
+            self.qo_tile_indices.zero_()
+            self.kv_tile_indices.zero_()
+            self.block_valid_mask.zero_()
+        with record_function("paged_workspace.plan_metadata_copy_buffers"):
+            self.request_indices[: request_indices.shape[0]].copy_(request_indices)
+            self.qo_tile_indices[: qo_tile_indices.shape[0]].copy_(qo_tile_indices)
+            self.kv_tile_indices[: kv_tile_indices.shape[0]].copy_(kv_tile_indices)
+            self.merge_indptr[: merge_indptr.shape[0]].copy_(merge_indptr)
+            self.o_indptr[: o_indptr.shape[0]].copy_(o_indptr)
+            self.block_valid_mask[: block_valid_mask.shape[0]].copy_(block_valid_mask)
+        with record_function("paged_workspace.plan_metadata_scalar_updates"):
+            self.kv_chunk_size_ptr[0] = int(plan.kv_chunk_size)
+            self.total_num_rows_ptr[0] = int(plan.total_q)

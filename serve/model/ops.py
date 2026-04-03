@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
+from torch.profiler import record_function
 
 
 def rms_norm(
@@ -21,11 +22,14 @@ def rms_norm(
     If gemma_style, scale = (1 + weight) (Gemma/Qwen3.5 convention where
     checkpoint stores the offset from 1.0).
     """
-    dtype = x.dtype
-    x = x.float()
-    rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
-    scale = (1.0 + weight) if gemma_style else weight
-    return (x * rms).to(dtype) * scale
+    with record_function("model.rms_norm"):
+        dtype = x.dtype
+        with record_function("model.rms_norm.cast_fp32"):
+            x = x.float()
+        rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+        scale = (1.0 + weight) if gemma_style else weight
+        with record_function("model.rms_norm.cast_output"):
+            return (x * rms).to(dtype) * scale
 
 
 class RMSNorm(torch.nn.Module):

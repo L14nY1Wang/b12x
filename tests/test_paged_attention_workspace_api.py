@@ -879,6 +879,37 @@ def test_prepare_decode_graph_replay_state_is_batch_specific() -> None:
     assert int(workspace_bs8.kv_chunk_size_ptr[0].item()) == 384
 
 
+def test_prepare_decode_graph_replay_state_falls_back_when_no_tuned_policy_exists() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    num_pages = 256
+    page_size = 64
+    head_dim = 128
+    q = torch.randn(1, 16, head_dim, device="cuda", dtype=torch.bfloat16) / 4
+    k_cache = torch.randn(num_pages, page_size, 8, head_dim, device="cuda", dtype=torch.bfloat16) / 4
+    v_cache = torch.randn(num_pages, page_size, 8, head_dim, device="cuda", dtype=torch.bfloat16) / 4
+
+    workspace = _make_workspace(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+        use_cuda_graph=True,
+    )
+
+    workspace.prepare_decode_graph_replay_state(
+        batch=1,
+        total_q_capacity=1,
+        max_page_table_width=64,
+        max_cache_page_count=64,
+    )
+
+    assert workspace._decode_graph_chunk_pages_lut is None
+    assert workspace.plan.mode == "decode"
+    assert workspace.plan.enable_cuda_graph is True
+
+
 def test_update_decode_graph_replay_metadata_updates_workspace_buffers() -> None:
     require_sm120()
     clear_attention_caches()
@@ -1049,6 +1080,97 @@ def test_regular_decode_graph_replay_runs_end_to_end_at_bs4() -> None:
     clear_attention_caches()
     gc.collect()
     torch.cuda.synchronize()
+
+
+def test_decode_replay_metadata_can_be_captured_into_cuda_graph() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_paged_inputs(
+        q_seqlens=[1] * 4,
+        cache_seqlens=[512, 768, 1024, 1536],
+        page_size=64,
+        seed=109,
+        page_table_width=64,
+        num_pages=1024,
+    )
+    workspace = _make_workspace(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        cu_seqlens_q=cu_seqlens_q,
+        use_cuda_graph=True,
+    )
+    workspace.prepare_decode_graph_replay_state(
+        batch=4,
+        total_q_capacity=4,
+        max_page_table_width=int(page_table.shape[1]),
+        max_cache_page_count=int(page_table.shape[1]),
+    )
+
+    bound_page_table = torch.empty_like(page_table)
+    bound_cache_seqlens = cache_seqlens.clone()
+    bound_cu_seqlens_q = cu_seqlens_q.clone()
+    workspace.bind_cuda_graph_runtime_metadata(
+        page_table=bound_page_table,
+        cache_seqlens=bound_cache_seqlens,
+        cu_seqlens_q=bound_cu_seqlens_q,
+    )
+    output = torch.empty_like(q)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        workspace.run(
+            q,
+            k_cache,
+            v_cache,
+            output=output,
+            prepare_decode_graph_metadata=True,
+        )
+
+    assert workspace._decode_graph_metadata_captured_in_graph is True
+
+    q_2, k_cache_2, v_cache_2, page_table_2, cache_seqlens_2, cu_seqlens_q_2 = _make_paged_inputs(
+        q_seqlens=[1] * 4,
+        cache_seqlens=[2048, 2048, 4096, 4096],
+        page_size=64,
+        seed=113,
+        page_table_width=int(page_table.shape[1]),
+        num_pages=int(k_cache.shape[0]),
+    )
+    q.copy_(q_2)
+    k_cache.copy_(k_cache_2)
+    v_cache.copy_(v_cache_2)
+
+    original_update = workspace.update_decode_graph_replay_metadata_from_runtime_cache_seqlens
+
+    def _fail_if_called() -> None:
+        raise AssertionError("decode replay metadata should come from the captured graph")
+
+    workspace.update_decode_graph_replay_metadata_from_runtime_cache_seqlens = _fail_if_called
+    workspace.prepare(page_table_2, cache_seqlens_2, cu_seqlens_q_2)
+
+    ref_out, ref_lse = paged_attention_reference(
+        q,
+        k_cache,
+        v_cache,
+        page_table_2,
+        cache_seqlens_2,
+        cu_seqlens_q_2,
+        causal=True,
+    )
+
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.allclose(output.to(torch.float32), ref_out.to(torch.float32), atol=2e-2, rtol=2e-2)
+    assert torch.allclose(
+        _lse_base2_to_natural(workspace.current_lse_view()),
+        ref_lse,
+        atol=3e-2,
+        rtol=3e-2,
+    )
+
+    workspace.update_decode_graph_replay_metadata_from_runtime_cache_seqlens = original_update
 
 
 

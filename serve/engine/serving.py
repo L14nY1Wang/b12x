@@ -16,6 +16,7 @@ from typing import Optional
 
 import torch
 import torch.distributed as dist
+from torch.profiler import record_function
 
 from transformers import AutoTokenizer
 
@@ -30,6 +31,15 @@ from serve.tp.launch import get_active_tp_health
 from serve.tp.group import TPGroup
 
 LOGGER = get_logger(__name__)
+
+
+def _startup_debug_enabled() -> bool:
+    return os.environ.get("B12X_SERVE_STARTUP_DEBUG", "").strip().lower() in {"1", "true", "yes"}
+
+
+def _startup_debug(message: str, *, rank: int) -> None:
+    if rank == 0 and _startup_debug_enabled():
+        print(f"[serve-startup] {message}", flush=True)
 
 @dataclass
 class GenerationResult:
@@ -60,9 +70,8 @@ def _should_enable_layer_compile(
     compile_layers: bool,
 ) -> bool:
     """Decide whether per-layer torch.compile should run."""
-    if not compile_layers:
-        return False
-    return not is_hybrid
+    del is_hybrid
+    return compile_layers
 
 
 def _estimate_loaded_model_bytes(model: LoadedModel) -> int:
@@ -157,6 +166,7 @@ class ServingEngine:
 
         if self.rank == 0:
             LOGGER.info(f"Loading model [bold](TP={self.world_size})[/]")
+        _startup_debug("load_model:start", rank=self.rank)
 
         self.model = load_model(
             model_path,
@@ -164,8 +174,10 @@ class ServingEngine:
             tp_group=tp_group,
             load_backend=load_backend,
         )
+        _startup_debug("load_model:done", rank=self.rank)
         self.cfg = self.model.config
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=False)
+        _startup_debug("tokenizer:done", rank=self.rank)
         if not self.tokenizer.chat_template:
             import pathlib
             jinja_path = pathlib.Path(model_path) / "chat_template.jinja"
@@ -337,6 +349,7 @@ class ServingEngine:
             kv_dtype=kv_dtype,
             device=device,
         )
+        _startup_debug("page_pool:done", rank=self.rank)
         self.cache = PrefixCheckpointCache(
             self.pool,
             state_arena=linear_state_arena,
@@ -356,6 +369,7 @@ class ServingEngine:
             pool=self.pool,
             ssm_pool=linear_state_arena,
         )
+        _startup_debug("runner:done", rank=self.rank)
 
         if self.rank == 0:
             LOGGER.info(f"KV cache: {self.pool.num_pages} pages ({self.pool.num_pages * 64} tokens)")
@@ -366,33 +380,53 @@ class ServingEngine:
             is_hybrid=is_hybrid,
             compile_layers=compile_layers,
         )
+        warm_decode = not bool(graph_sizes)
         startup = start_startup_session()
-        if self.rank == 0 and compile_layers and not enable_layer_compile:
-            LOGGER.warning("Layer compile disabled for hybrid models.")
-
         if not is_hybrid:
             # Warmup uses kv_mgr-based path which doesn't support SSM layers.
             if self.rank == 0:
                 LOGGER.info("Warming up")
+            _startup_debug("warmup:start", rank=self.rank)
             prefill_lengths = warmup_prefill_lengths or [4, 64]
-            self.runner.warmup(batch_sizes=[1], prefill_lengths=prefill_lengths, startup=startup)
+            self.runner.warmup(
+                batch_sizes=[1],
+                prefill_lengths=prefill_lengths,
+                warm_decode=warm_decode,
+                startup=startup,
+            )
+            _startup_debug("warmup:done", rank=self.rank)
 
         if enable_layer_compile:
             if self.rank == 0:
                 LOGGER.info("Compiling layers")
+            _startup_debug("compile:start", rank=self.rank)
             self.runner.compile_model()
+            _startup_debug("compile:done", rank=self.rank)
 
         if enable_layer_compile:
-            self.runner.warmup(batch_sizes=[1], prefill_lengths=[4, prefill_chunk_size], startup=startup)
+            if is_hybrid:
+                if self.rank == 0:
+                    LOGGER.info("Skipping legacy post-compile warmup for hybrid model; first real request will materialize compiled layers")
+            else:
+                _startup_debug("post_compile_warmup:start", rank=self.rank)
+                self.runner.warmup(
+                    batch_sizes=[1],
+                    prefill_lengths=[4, prefill_chunk_size],
+                    warm_decode=warm_decode,
+                    startup=startup,
+                )
+                _startup_debug("post_compile_warmup:done", rank=self.rank)
 
         if graph_sizes:
             if self.rank == 0:
                 LOGGER.info("Capturing CUDA graphs")
+            _startup_debug(f"capture_decode_graphs:start batch_sizes={graph_sizes}", rank=self.rank)
             self.runner.capture_decode_graphs(
                 batch_sizes=graph_sizes,
                 prefill_chunk_size=prefill_chunk_size if capture_prefill_graph else None,
                 startup=startup,
             )
+            _startup_debug("capture_decode_graphs:done", rank=self.rank)
 
         # Warmup/compile/graph capture all touch shared runtime state. Reset it
         # before the scheduler starts serving real requests.
@@ -436,10 +470,16 @@ class ServingEngine:
         self._tp_health: dict | None = None
 
         if self.world_size > 1:
-            dist.barrier()
+            _startup_debug("dist_barrier:start", rank=self.rank)
+            barrier_kwargs = {}
+            if self.device.startswith("cuda"):
+                barrier_kwargs["device_ids"] = [torch.device(self.device).index]
+            dist.barrier(**barrier_kwargs)
+            _startup_debug("dist_barrier:done", rank=self.rank)
 
         if self.rank == 0:
             LOGGER.info("Ready")
+        _startup_debug("ready", rank=self.rank)
 
     # -- public API (rank 0) -----------------------------------------------
 
@@ -501,15 +541,16 @@ class ServingEngine:
         input_ids: list[int],
         params: SamplingParams | None = None,
     ) -> GenerationResult:
-        req = self.submit(input_ids, params)
+        with record_function("serve.generate"):
+            req = self.submit(input_ids, params)
 
-        if self._has_server_loop():
-            req._done_event.wait()
-        else:
-            while not req.is_finished:
-                self._step()
+            if self._has_server_loop():
+                req._done_event.wait()
+            else:
+                while not req.is_finished:
+                    self._step()
 
-        return self._to_result(req)
+            return self._to_result(req)
 
     def generate_batch(
         self,
@@ -517,20 +558,21 @@ class ServingEngine:
         params: SamplingParams | None = None,
     ) -> list[GenerationResult]:
         """Generate for multiple prompts concurrently."""
-        if params is None:
-            params = SamplingParams()
-        self._ensure_stop_ids(params)
+        with record_function("serve.generate_batch"):
+            if params is None:
+                params = SamplingParams()
+            self._ensure_stop_ids(params)
 
-        reqs = [self.submit(ids, params) for ids in prompts]
+            reqs = [self.submit(ids, params) for ids in prompts]
 
-        if self._has_server_loop():
-            for r in reqs:
-                r._done_event.wait()
-        else:
-            while not all(r.is_finished for r in reqs):
-                self._step()
+            if self._has_server_loop():
+                for r in reqs:
+                    r._done_event.wait()
+            else:
+                while not all(r.is_finished for r in reqs):
+                    self._step()
 
-        return [self._to_result(r) for r in reqs]
+            return [self._to_result(r) for r in reqs]
 
     def generate_stream(
         self,
@@ -624,35 +666,41 @@ class ServingEngine:
         In TP mode, broadcasts step info to followers before the forward
         pass so they can mirror it.
         """
-        with self._lock:
-            batch = self.scheduler.step()
-            ssm_control_ops = self.scheduler.drain_ssm_control_ops()
+        with record_function("serve.step"):
+            with record_function("serve.scheduler_step"):
+                with self._lock:
+                    batch = self.scheduler.step()
+                    ssm_control_ops = self.scheduler.drain_ssm_control_ops()
         if batch is None:
             if self.world_size > 1:
-                self._broadcast_ssm_control_ops(ssm_control_ops)
-                self._broadcast_step_idle()
+                with record_function("serve.tp_idle_broadcast"):
+                    self._broadcast_ssm_control_ops(ssm_control_ops)
+                    self._broadcast_step_idle()
             return
 
         # Broadcast batch to followers.
         if self.world_size > 1:
-            self._broadcast_ssm_control_ops(ssm_control_ops)
-            self._broadcast_step(batch)
+            with record_function("serve.tp_batch_broadcast"):
+                self._broadcast_ssm_control_ops(ssm_control_ops)
+                self._broadcast_step(batch)
 
         # Build SSM cache indices if model has SSM layers.
         ssm_indices = None
         if self.scheduler.ssm_pool is not None:
-            ssm_indices = torch.tensor(
-                [r.ssm_slot for r in batch.requests],
-                dtype=torch.int64, device=self.device,
-            )
+            with record_function("serve.build_ssm_indices"):
+                ssm_indices = torch.tensor(
+                    [r.ssm_slot for r in batch.requests],
+                    dtype=torch.int64, device=self.device,
+                )
 
-        logits = self.runner.forward_batch(
-            batch.token_ids, batch.q_seqlens,
-            batch.page_table, batch.cache_seqlens,
-            mode=batch.mode,
-            graph_bs=batch.graph_bs,
-            ssm_cache_indices=ssm_indices,
-        )
+        with record_function(f"serve.forward_batch.{batch.mode}"):
+            logits = self.runner.forward_batch(
+                batch.token_ids, batch.q_seqlens_t,
+                batch.page_table, batch.cache_seqlens,
+                mode=batch.mode,
+                graph_bs=batch.graph_bs,
+                ssm_cache_indices=ssm_indices,
+            )
 
         step_log_path = os.environ.get("B12X_STEP_LOG_PATH")
         if step_log_path and batch.mode == "prefill":
@@ -674,20 +722,27 @@ class ServingEngine:
                 pass
 
         if batch.mode == "prefill" and not batch.is_last_chunk:
-            with self._lock:
-                self.scheduler.process_prefill_chunk(None, batch.requests)
+            with record_function("serve.process_prefill_chunk.partial"):
+                with self._lock:
+                    self.scheduler.process_prefill_chunk(None, batch.requests)
             return
 
-        params_list = [r.sampling_params for r in batch.requests]
-        gen_ids = [list(r.output_ids) for r in batch.requests]
-        next_tokens = sample_batch(logits, params_list, gen_ids)
-        token_list = next_tokens.tolist()
+        with record_function("serve.collect_sampling_inputs"):
+            params_list = [r.sampling_params for r in batch.requests]
+            gen_ids = [list(r.output_ids) for r in batch.requests]
+        with record_function("serve.sample_batch"):
+            next_tokens = sample_batch(logits, params_list, gen_ids)
+        with record_function("serve.sample_to_list"):
+            token_list = next_tokens.tolist()
 
-        with self._lock:
-            if batch.mode == "prefill":
-                self.scheduler.process_prefill_chunk(token_list, batch.requests)
-            else:
-                self.scheduler.process_decode_output(token_list)
+        if batch.mode == "prefill":
+            with record_function("serve.process_prefill_chunk.final"):
+                with self._lock:
+                    self.scheduler.process_prefill_chunk(token_list, batch.requests)
+        else:
+            with record_function("serve.process_decode_output"):
+                with self._lock:
+                    self.scheduler.process_decode_output(token_list)
 
     # -- helpers -----------------------------------------------------------
 
@@ -795,12 +850,13 @@ class ServingEngine:
     _MODE_SHUTDOWN = 255
 
     def _broadcast_ssm_control_ops(self, ops: list[tuple[int, int, int, int]]) -> None:
-        header = torch.tensor([len(ops)], dtype=torch.long, device=self.device)
-        dist.broadcast(header, src=0)
-        if not ops:
-            return
-        payload = torch.tensor(ops, dtype=torch.long, device=self.device)
-        dist.broadcast(payload, src=0)
+        with record_function("serve.tp_broadcast_ssm_ops"):
+            header = torch.tensor([len(ops)], dtype=torch.long, device=self.device)
+            dist.broadcast(header, src=0)
+            if not ops:
+                return
+            payload = torch.tensor(ops, dtype=torch.long, device=self.device)
+            dist.broadcast(payload, src=0)
 
     def _receive_ssm_control_ops(self) -> list[tuple[int, int, int, int]]:
         header = torch.empty(1, dtype=torch.long, device=self.device)
@@ -850,24 +906,31 @@ class ServingEngine:
         graph_bs = batch.graph_bs or 0
         page_table_width = batch.page_table.shape[1]
 
-        header = torch.tensor([mode_code, total_q, bs, graph_bs, page_table_width],
-                              dtype=torch.long, device=self.device)
-        dist.broadcast(header, src=0)
+        with record_function("serve.tp_build_header"):
+            header = torch.tensor([mode_code, total_q, bs, graph_bs, page_table_width],
+                                  dtype=torch.long, device=self.device)
+        with record_function("serve.tp_broadcast_header"):
+            dist.broadcast(header, src=0)
 
         # Broadcast batch tensors.
-        dist.broadcast(batch.token_ids, src=0)
-        q_seqlens_t = torch.tensor(batch.q_seqlens, dtype=torch.int32, device=self.device)
-        dist.broadcast(q_seqlens_t, src=0)
-        dist.broadcast(batch.page_table, src=0)
-        dist.broadcast(batch.cache_seqlens, src=0)
+        with record_function("serve.tp_broadcast_token_ids"):
+            dist.broadcast(batch.token_ids, src=0)
+        with record_function("serve.tp_broadcast_q_seqlens"):
+            dist.broadcast(batch.q_seqlens_t, src=0)
+        with record_function("serve.tp_broadcast_page_table"):
+            dist.broadcast(batch.page_table, src=0)
+        with record_function("serve.tp_broadcast_cache_seqlens"):
+            dist.broadcast(batch.cache_seqlens, src=0)
 
         # Broadcast SSM cache indices if hybrid model.
         if self.scheduler.ssm_pool is not None:
-            ssm_idx = torch.tensor(
-                [r.ssm_slot for r in batch.requests],
-                dtype=torch.int64, device=self.device,
-            )
-            dist.broadcast(ssm_idx, src=0)
+            with record_function("serve.tp_build_ssm_idx"):
+                ssm_idx = torch.tensor(
+                    [r.ssm_slot for r in batch.requests],
+                    dtype=torch.int64, device=self.device,
+                )
+            with record_function("serve.tp_broadcast_ssm_idx"):
+                dist.broadcast(ssm_idx, src=0)
 
     def _receive_step(self):
         """Receive a step broadcast from rank 0.
@@ -893,7 +956,6 @@ class ServingEngine:
         dist.broadcast(token_ids, src=0)
         q_seqlens_t = torch.empty(bs, dtype=torch.int32, device=self.device)
         dist.broadcast(q_seqlens_t, src=0)
-        q_seqlens = q_seqlens_t.tolist()
 
         page_table = torch.empty(bs, page_table_width, dtype=torch.int32, device=self.device)
         dist.broadcast(page_table, src=0)
@@ -906,4 +968,4 @@ class ServingEngine:
             ssm_indices = torch.empty(bs, dtype=torch.int64, device=self.device)
             dist.broadcast(ssm_indices, src=0)
 
-        return mode, token_ids, q_seqlens, page_table, cache_seqlens, graph_bs, ssm_indices
+        return mode, token_ids, q_seqlens_t, page_table, cache_seqlens, graph_bs, ssm_indices

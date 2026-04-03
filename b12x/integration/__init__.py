@@ -1,7 +1,9 @@
 from .attention import (
     PagedAttentionWorkspace,
     clear_attention_caches,
+    create_paged_plan,
     infer_paged_attention_mode,
+    paged_attention_forward,
 )
 from .tp_moe import (
     B12XFP4ExpertWeights,
@@ -14,7 +16,9 @@ from .tp_moe import (
 __all__ = [
     "PagedAttentionWorkspace",
     "clear_attention_caches",
+    "create_paged_plan",
     "infer_paged_attention_mode",
+    "paged_attention_forward",
     "B12XFP4ExpertWeights",
     "B12XTopKRouting",
     "b12x_moe_fp4",

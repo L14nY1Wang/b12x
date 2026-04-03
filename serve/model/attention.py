@@ -12,7 +12,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from b12x.attention.paged import PagedAttentionWorkspace, paged_attention_forward
+from b12x.integration.attention import PagedAttentionWorkspace, paged_attention_forward
 
 from serve.model.ops import apply_partial_rope, rms_norm, write_kv_to_cache
 
@@ -62,6 +62,48 @@ class B12xPagedAttention(torch.nn.Module):
         self.register_buffer("o_proj_weight", o_proj_weight)
         self.register_buffer("q_norm_weight", q_norm_weight)
         self.register_buffer("k_norm_weight", k_norm_weight)
+
+    def workspace_cache_key(
+        self,
+        *,
+        kv_dtype: torch.dtype,
+        page_size: int,
+        num_cache_pages: int,
+        max_total_q: int,
+        max_batch: int,
+        max_page_table_width: int,
+        use_cuda_graph: bool,
+    ) -> tuple[object, ...]:
+        return (
+            self.qkv_weight.dtype,
+            kv_dtype,
+            self.num_q_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            page_size,
+            num_cache_pages,
+            max_total_q,
+            max_batch,
+            max_page_table_width,
+            use_cuda_graph,
+        )
+
+    def _supports_native_decode_workspace(
+        self,
+        *,
+        kv_dtype: torch.dtype,
+        page_size: int,
+    ) -> bool:
+        return (
+            self.qkv_weight.dtype == torch.bfloat16
+            and kv_dtype in (torch.bfloat16, torch.float8_e4m3fn)
+            and self.head_dim == 256
+            and page_size == 64
+            and self.num_kv_heads > 0
+            and self.num_q_heads % self.num_kv_heads == 0
+            and (self.num_q_heads // self.num_kv_heads) == 8
+        )
+
     def allocate_workspaces(
         self,
         *,
@@ -102,8 +144,13 @@ class B12xPagedAttention(torch.nn.Module):
                 **common,
             )
         )
+        decode_workspace = (
+            PagedAttentionWorkspace.for_contract(mode="decode", **common)
+            if self._supports_native_decode_workspace(kv_dtype=kv_dtype, page_size=page_size)
+            else extend_workspace
+        )
         return {
-            "decode": PagedAttentionWorkspace.for_contract(mode="decode", **common),
+            "decode": decode_workspace,
             "extend": extend_workspace,
         }
 
@@ -121,6 +168,7 @@ class B12xPagedAttention(torch.nn.Module):
         cache_seqlens, cu_seqlens_q, post_write_seqlens,
         k_descale, v_descale,
         is_decode: bool,
+        prepare_workspace: bool,
     ):
         """KV cache write + paged attention. Opaque to torch.compile."""
         write_kv_to_cache(
@@ -134,7 +182,8 @@ class B12xPagedAttention(torch.nn.Module):
                 device=q.device,
             )
         workspace = self._workspace["decode" if is_decode else "extend"]
-        workspace.prepare(page_table, post_write_seqlens, cu_seqlens_q)
+        if prepare_workspace:
+            workspace.prepare(page_table, post_write_seqlens, cu_seqlens_q)
         return workspace.run(
             q, k_cache, v_cache,
             k_descale=k_descale, v_descale=v_descale,
@@ -148,12 +197,25 @@ class B12xPagedAttention(torch.nn.Module):
 
     def forward_from_state(self, hidden_states: torch.Tensor, state) -> torch.Tensor:
         """Forward using StepState. Called by TransformerLayer."""
+        prepare_workspace = not state.attn_workspaces_prepared
+        if prepare_workspace:
+            prepared = state.prepared_attn_workspace_ids
+            if prepared is None:
+                prepared = set()
+                state.prepared_attn_workspace_ids = prepared
+            workspace = self._workspace["decode" if state.is_decode else "extend"]
+            workspace_id = id(workspace)
+            if workspace_id in prepared:
+                prepare_workspace = False
+            else:
+                prepared.add(workspace_id)
         return self.forward(
             hidden_states, state.cos, state.sin, state.positions,
             self._k_cache, self._v_cache, state.page_table,
             state.cache_seqlens, state.cu_seqlens_q,
             output_gate=self.output_gate,
             is_decode=state.is_decode,
+            prepare_workspace=prepare_workspace,
         )
 
     def forward(
@@ -171,6 +233,7 @@ class B12xPagedAttention(torch.nn.Module):
         v_descale: Optional[torch.Tensor] = None,
         output_gate: bool = False,
         is_decode: bool = False,
+        prepare_workspace: bool = True,
     ) -> torch.Tensor:
         """Full attention: QKV → norm → RoPE → KV write → attention → O proj."""
         total_q = hidden_states.shape[0]
@@ -220,6 +283,7 @@ class B12xPagedAttention(torch.nn.Module):
             cache_seqlens, cu_seqlens_q, post_write_seqlens,
             k_descale, v_descale,
             is_decode,
+            prepare_workspace,
         )
 
         # Apply output gate if present.

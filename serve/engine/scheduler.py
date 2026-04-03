@@ -26,6 +26,7 @@ class BatchStep:
     requests: list[Request]        # Requests in this batch.
     token_ids: torch.Tensor        # [total_tokens].
     q_seqlens: list[int]           # Tokens per request in this forward.
+    q_seqlens_t: torch.Tensor      # [batch] int32 tokens per request.
     page_table: torch.Tensor       # [batch, max_pages].
     cache_seqlens: torch.Tensor    # [batch].
     graph_bs: Optional[int] = None # Which graph to use.
@@ -267,6 +268,7 @@ class BatchScheduler:
             requests=reqs,
             token_ids=torch.tensor(token_ids_list, dtype=torch.long, device=self.device),
             q_seqlens=q_seqlens,
+            q_seqlens_t=torch.tensor(q_seqlens, dtype=torch.int32, device=self.device),
             page_table=page_table,
             cache_seqlens=cache_seqlens,
             is_last_chunk=True,
@@ -319,6 +321,7 @@ class BatchScheduler:
             requests=[req],
             token_ids=torch.tensor(chunk_tokens, dtype=torch.long, device=self.device),
             q_seqlens=[chunk_len],
+            q_seqlens_t=torch.tensor([chunk_len], dtype=torch.int32, device=self.device),
             page_table=page_table,
             cache_seqlens=cache_seqlens,
             graph_bs=graph_bs,
@@ -347,6 +350,7 @@ class BatchScheduler:
             requests=list(self.running),
             token_ids=torch.tensor(token_ids, dtype=torch.long, device=self.device),
             q_seqlens=[1] * bs,
+            q_seqlens_t=torch.ones(bs, dtype=torch.int32, device=self.device),
             page_table=page_table,
             cache_seqlens=cache_seqlens,
             graph_bs=graph_bs,

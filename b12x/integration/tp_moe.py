@@ -10,6 +10,7 @@ import cutlass
 import cutlass.cute as cute
 import torch
 import torch.nn.functional as F
+from torch.profiler import record_function
 
 from b12x.cute.fp4 import align_up, as_grouped_scale_view
 from b12x.cute.utils import current_cuda_stream, get_max_active_clusters, get_num_sm, make_ptr
@@ -287,48 +288,58 @@ def _get_dynamic_chunk_multiplier() -> int:
 
 
 def _flatten_routing_ids(topk_ids: torch.Tensor) -> torch.Tensor:
-    flat_ids = topk_ids.view(-1)
-    if flat_ids.dtype not in (torch.int32, torch.int64):
-        return flat_ids.to(torch.int32)
-    if not flat_ids.is_contiguous():
-        return flat_ids.contiguous()
-    return flat_ids
+    with record_function("tp_moe.flatten_routing_ids"):
+        flat_ids = topk_ids.view(-1)
+        if flat_ids.dtype not in (torch.int32, torch.int64):
+            with record_function("tp_moe.flatten_routing_ids.cast_int32"):
+                return flat_ids.to(torch.int32)
+        if not flat_ids.is_contiguous():
+            with record_function("tp_moe.flatten_routing_ids.contiguous"):
+                return flat_ids.contiguous()
+        return flat_ids
 
 
 def _flatten_routing_weights(topk_weights: torch.Tensor) -> torch.Tensor:
-    flat_weights = topk_weights.view(-1)
-    if flat_weights.dtype != torch.float32:
-        return flat_weights.to(torch.float32)
-    if not flat_weights.is_contiguous():
-        return flat_weights.contiguous()
-    return flat_weights
+    with record_function("tp_moe.flatten_routing_weights"):
+        flat_weights = topk_weights.view(-1)
+        if flat_weights.dtype != torch.float32:
+            with record_function("tp_moe.flatten_routing_weights.cast_fp32"):
+                return flat_weights.to(torch.float32)
+        if not flat_weights.is_contiguous():
+            with record_function("tp_moe.flatten_routing_weights.contiguous"):
+                return flat_weights.contiguous()
+        return flat_weights
 
 
 def _prepare_expert_scale(scale: torch.Tensor, weight_E: int) -> torch.Tensor:
-    if scale.numel() == 1:
-        return scale.expand(weight_E).to(torch.float32).contiguous()
-    if scale.numel() != weight_E:
-        raise ValueError(f"expected expert scale with {weight_E} elements, got {scale.numel()}")
-    return _get_plain_cuda_tensor(scale, dtype=torch.float32)
+    with record_function("tp_moe.prepare_expert_scale"):
+        if scale.numel() == 1:
+            with record_function("tp_moe.prepare_expert_scale.expand_scalar"):
+                return scale.expand(weight_E).to(torch.float32).contiguous()
+        if scale.numel() != weight_E:
+            raise ValueError(f"expected expert scale with {weight_E} elements, got {scale.numel()}")
+        return _get_plain_cuda_tensor(scale, dtype=torch.float32)
 
 
 def _get_plain_cuda_tensor(t: torch.Tensor, *, dtype: torch.dtype | None = None) -> torch.Tensor:
-    target_dtype = t.dtype if dtype is None else dtype
-    key = (
-        t.data_ptr(),
-        tuple(t.shape),
-        tuple(t.stride()),
-        t.dtype,
-        target_dtype,
-        int(t._version),
-    )
-    cached = _PLAIN_PARAM_CACHE.get(key)
-    if cached is not None:
-        return cached
-    plain = torch.empty(tuple(t.shape), dtype=target_dtype, device=t.device)
-    plain.copy_(t.to(target_dtype) if t.dtype != target_dtype else t)
-    _PLAIN_PARAM_CACHE[key] = plain
-    return plain
+    with record_function("tp_moe.get_plain_cuda_tensor"):
+        target_dtype = t.dtype if dtype is None else dtype
+        key = (
+            t.data_ptr(),
+            tuple(t.shape),
+            tuple(t.stride()),
+            t.dtype,
+            target_dtype,
+            int(t._version),
+        )
+        cached = _PLAIN_PARAM_CACHE.get(key)
+        if cached is not None:
+            return cached
+        plain = torch.empty(tuple(t.shape), dtype=target_dtype, device=t.device)
+        with record_function("tp_moe.get_plain_cuda_tensor.copy"):
+            plain.copy_(t.to(target_dtype) if t.dtype != target_dtype else t)
+        _PLAIN_PARAM_CACHE[key] = plain
+        return plain
 
 
 def _safe_max_rows_per_launch(E: int, k: int, n: int) -> int:

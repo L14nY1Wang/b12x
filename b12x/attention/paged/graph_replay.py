@@ -17,9 +17,9 @@ def build_decode_graph_page_table_triton(
     req_to_token_ptr,
     req_pool_indices_ptr,
     page_table_ptr,
+    active_max_pages_ptr,
     req_to_token_row_stride,
     page_table_row_stride,
-    max_pages_per_req,
     PAGE_SIZE: tl.constexpr,
     BLOCK_PAGES: tl.constexpr,
 ):
@@ -27,8 +27,9 @@ def build_decode_graph_page_table_triton(
     page_block_idx = tl.program_id(axis=1)
 
     req_pool_idx = tl.load(req_pool_indices_ptr + req_idx).to(tl.int64)
+    active_max_pages = tl.load(active_max_pages_ptr).to(tl.int32)
     page_offsets = page_block_idx * BLOCK_PAGES + tl.arange(0, BLOCK_PAGES)
-    page_mask = page_offsets < max_pages_per_req
+    page_mask = page_offsets < active_max_pages
     flat_token_offsets = req_pool_idx * req_to_token_row_stride + page_offsets.to(tl.int64) * PAGE_SIZE
     token_indices = tl.load(req_to_token_ptr + flat_token_offsets, mask=page_mask, other=0)
     tl.store(
@@ -158,6 +159,7 @@ def update_decode_graph_replay_metadata(
         page_size,
         rounding_mode="floor",
     ).clamp_(min=1, max=page_table.shape[1]).to(torch.int64)
+    active_max_pages = max_cache_pages.to(torch.int32)
     decode_chunk_pages = torch.index_select(decode_chunk_pages_lut, 0, max_cache_pages.view(1))
 
     page_blocks = triton.cdiv(int(page_table.shape[1]), _DECODE_BLOCK_PAGES)
@@ -165,9 +167,9 @@ def update_decode_graph_replay_metadata(
         req_to_token,
         req_pool_indices,
         page_table,
+        active_max_pages,
         req_to_token.stride(0),
         page_table.stride(0),
-        page_table.shape[1],
         PAGE_SIZE=page_size,
         BLOCK_PAGES=_DECODE_BLOCK_PAGES,
     )
@@ -227,6 +229,7 @@ def update_regular_decode_graph_replay_metadata(
         page_size,
         rounding_mode="floor",
     ).clamp_(min=1, max=page_table.shape[1]).to(torch.int64)
+    active_max_pages = max_cache_pages.to(torch.int32)
     decode_chunk_pages = torch.index_select(decode_chunk_pages_lut, 0, max_cache_pages.view(1))
 
     page_blocks = triton.cdiv(int(page_table.shape[1]), _DECODE_BLOCK_PAGES)
@@ -234,9 +237,9 @@ def update_regular_decode_graph_replay_metadata(
         req_to_token,
         req_pool_indices,
         page_table,
+        active_max_pages,
         req_to_token.stride(0),
         page_table.stride(0),
-        page_table.shape[1],
         PAGE_SIZE=page_size,
         BLOCK_PAGES=_DECODE_BLOCK_PAGES,
     )
@@ -263,7 +266,7 @@ def update_regular_decode_graph_chunk_metadata(
     merge_indptr: torch.Tensor,
     o_indptr: torch.Tensor,
     kv_chunk_size_ptr: torch.Tensor,
-    kv_chunk_size: int,
+    kv_chunk_size: int | torch.Tensor,
     max_chunks_per_req: int,
 ) -> None:
     device = cache_seqlens.device
@@ -271,8 +274,6 @@ def update_regular_decode_graph_chunk_metadata(
         raise ValueError("indptr buffers and cache_seqlens must be on the same device")
     if kv_chunk_size_ptr.device != device:
         raise ValueError("decode graph buffers and cache_seqlens must be on the same device")
-    if kv_chunk_size <= 0:
-        raise ValueError("kv_chunk_size must be positive")
     if max_chunks_per_req <= 0:
         raise ValueError("max_chunks_per_req must be positive")
 
@@ -280,15 +281,36 @@ def update_regular_decode_graph_chunk_metadata(
     if bs <= 0:
         raise ValueError("decode graph replay requires bs > 0")
 
+    if isinstance(kv_chunk_size, torch.Tensor):
+        if kv_chunk_size.device != device:
+            raise ValueError("kv_chunk_size tensor and cache_seqlens must be on the same device")
+        if kv_chunk_size.numel() != 1:
+            raise ValueError("kv_chunk_size tensor must contain exactly one element")
+        kv_chunk_size_i32 = kv_chunk_size.reshape(1).to(torch.int32)
+    else:
+        if kv_chunk_size <= 0:
+            raise ValueError("kv_chunk_size must be positive")
+        kv_chunk_size_i32 = None
+
     merge_indptr.zero_()
-    num_chunks = torch.maximum(
-        torch.div(
-            cache_seqlens[:bs] + (int(kv_chunk_size) - 1),
-            int(kv_chunk_size),
-            rounding_mode="floor",
-        ),
-        torch.ones(bs, dtype=torch.int32, device=device),
-    )
+    if kv_chunk_size_i32 is None:
+        num_chunks = torch.maximum(
+            torch.div(
+                cache_seqlens[:bs] + (int(kv_chunk_size) - 1),
+                int(kv_chunk_size),
+                rounding_mode="floor",
+            ),
+            torch.ones(bs, dtype=torch.int32, device=device),
+        )
+    else:
+        num_chunks = torch.maximum(
+            torch.div(
+                cache_seqlens[:bs] + (kv_chunk_size_i32 - 1),
+                kv_chunk_size_i32,
+                rounding_mode="floor",
+            ),
+            torch.ones(bs, dtype=torch.int32, device=device),
+        )
     merge_indptr[1 : bs + 1].copy_(num_chunks)
     torch.cumsum(
         merge_indptr[1 : bs + 1],
@@ -296,4 +318,68 @@ def update_regular_decode_graph_chunk_metadata(
         out=merge_indptr[1 : bs + 1],
     )
     o_indptr[: bs + 1].copy_(merge_indptr[: bs + 1])
-    kv_chunk_size_ptr[0] = int(kv_chunk_size)
+    if kv_chunk_size_i32 is None:
+        kv_chunk_size_ptr[0] = int(kv_chunk_size)
+    else:
+        kv_chunk_size_ptr[:1].copy_(kv_chunk_size_i32.to(kv_chunk_size_ptr.dtype))
+
+
+def update_decode_graph_chunk_metadata(
+    *,
+    cache_seqlens: torch.Tensor,
+    request_indices: torch.Tensor,
+    merge_indptr: torch.Tensor,
+    o_indptr: torch.Tensor,
+    block_valid_mask: torch.Tensor,
+    kv_chunk_size_ptr: torch.Tensor,
+    decode_chunk_pages_lut: torch.Tensor,
+    page_size: int,
+) -> None:
+    device = cache_seqlens.device
+    if request_indices.device != device:
+        raise ValueError("request_indices and cache_seqlens must be on the same device")
+    if merge_indptr.device != device or o_indptr.device != device:
+        raise ValueError("indptr buffers and cache_seqlens must be on the same device")
+    if block_valid_mask.device != device or kv_chunk_size_ptr.device != device:
+        raise ValueError("decode graph buffers and cache_seqlens must be on the same device")
+    if decode_chunk_pages_lut.device != device:
+        raise ValueError("decode_chunk_pages_lut and cache_seqlens must be on the same device")
+    if page_size <= 0:
+        raise ValueError("page_size must be positive")
+
+    bs = int(cache_seqlens.shape[0])
+    if bs <= 0:
+        raise ValueError("decode graph replay requires bs > 0")
+    work_items_capacity = int(request_indices.shape[0])
+    if work_items_capacity % bs != 0:
+        raise RuntimeError("decode graph workspace request_indices shape is incompatible with the batch bucket")
+    max_chunks_per_req = work_items_capacity // bs
+    if max_chunks_per_req <= 0:
+        raise RuntimeError("decode graph workspace must allocate at least one chunk per request")
+
+    max_cache_pages = torch.div(
+        cache_seqlens[:bs].amax() + (page_size - 1),
+        page_size,
+        rounding_mode="floor",
+    ).clamp_(min=1, max=decode_chunk_pages_lut.shape[0] - 1).to(torch.int64)
+    decode_chunk_pages = torch.index_select(decode_chunk_pages_lut, 0, max_cache_pages.view(1))
+
+    block_valid_mask.zero_()
+    merge_indptr.zero_()
+    chunk_blocks = triton.cdiv(max_chunks_per_req, _DECODE_BLOCK_CHUNKS)
+    update_decode_graph_metadata_triton[(bs, chunk_blocks)](
+        cache_seqlens,
+        merge_indptr,
+        block_valid_mask,
+        decode_chunk_pages,
+        max_chunks_per_req,
+        PAGE_SIZE=page_size,
+        BLOCK_CHUNKS=_DECODE_BLOCK_CHUNKS,
+    )
+    torch.cumsum(
+        merge_indptr[1 : bs + 1],
+        dim=0,
+        out=merge_indptr[1 : bs + 1],
+    )
+    o_indptr[: bs + 1].copy_(merge_indptr[: bs + 1])
+    kv_chunk_size_ptr.copy_(decode_chunk_pages * page_size)

@@ -11,6 +11,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 
 import torch
+from torch.profiler import record_function
 
 from serve.cache.page_pool import PagePool, _PAGE_SIZE
 
@@ -115,20 +116,22 @@ class KVCacheManager:
         device: torch.device | str = "cuda",
     ) -> torch.Tensor:
         """Build ``[batch, max_pages]`` page table for the given requests."""
-        if not request_ids:
-            return torch.zeros((0, 1), dtype=torch.int32, device=device)
-        states = [self._requests[rid] for rid in request_ids]
-        max_pages = max(s.num_pages for s in states)
-        max_pages = max(max_pages, 1)
-        table = torch.zeros(
-            (len(request_ids), max_pages), dtype=torch.int32, device=device
-        )
-        for i, state in enumerate(states):
-            if state.page_ids:
-                table[i, : len(state.page_ids)] = torch.tensor(
-                    state.page_ids, dtype=torch.int32, device=device
-                )
-        return table
+        with record_function("kv.build_page_table"):
+            if not request_ids:
+                return torch.zeros((0, 1), dtype=torch.int32, device=device)
+            states = [self._requests[rid] for rid in request_ids]
+            max_pages = max(s.num_pages for s in states)
+            max_pages = max(max_pages, 1)
+            table = torch.zeros(
+                (len(request_ids), max_pages), dtype=torch.int32, device=device
+            )
+            for i, state in enumerate(states):
+                if state.page_ids:
+                    with record_function("kv.page_ids_to_device"):
+                        table[i, : len(state.page_ids)] = torch.tensor(
+                            state.page_ids, dtype=torch.int32, device=device
+                        )
+            return table
 
     def build_cache_seqlens(
         self,
@@ -136,8 +139,9 @@ class KVCacheManager:
         device: torch.device | str = "cuda",
     ) -> torch.Tensor:
         """Build ``[batch]`` cache sequence lengths."""
-        lens = [self._requests[rid].cache_len for rid in request_ids]
-        return torch.tensor(lens, dtype=torch.int32, device=device)
+        with record_function("kv.build_cache_seqlens"):
+            lens = [self._requests[rid].cache_len for rid in request_ids]
+            return torch.tensor(lens, dtype=torch.int32, device=device)
 
     def build_cu_seqlens_q(
         self,
@@ -145,7 +149,8 @@ class KVCacheManager:
         device: torch.device | str = "cuda",
     ) -> torch.Tensor:
         """Build ``[batch + 1]`` cumulative Q sequence lengths."""
-        cu = [0]
-        for s in q_seqlens:
-            cu.append(cu[-1] + s)
-        return torch.tensor(cu, dtype=torch.int32, device=device)
+        with record_function("kv.build_cu_seqlens_q"):
+            cu = [0]
+            for s in q_seqlens:
+                cu.append(cu[-1] + s)
+            return torch.tensor(cu, dtype=torch.int32, device=device)
