@@ -303,12 +303,15 @@ def _build_merge_kernel(
     dtype: torch.dtype,
     head_dim: int,
     persistent_ctas: int,
+    total_rows: int,
 ) -> PagedPersistentMergeKernel:
     cutlass_dtype = _torch_to_cutlass_dtype(dtype)
+    merge_bdy = 8 if int(total_rows) <= 2 else 4
     return PagedPersistentMergeKernel(
         cutlass_dtype,
         cutlass_dtype,
         head_dim=head_dim,
+        bdy=merge_bdy,
         persistent_ctas=persistent_ctas,
     )
 
@@ -568,7 +571,7 @@ def paged_attention_forward(
             num_heads=plan.num_q_heads,
             device=output.device,
         )
-        merge_kernel = _build_merge_kernel(output.dtype, plan.head_dim_vo, persistent_ctas)
+        merge_kernel = _build_merge_kernel(output.dtype, plan.head_dim_vo, persistent_ctas, plan.total_q)
         tmp_output_arg = _to_kernel_tensor(workspace.tmp_output, _torch_to_cutlass_dtype(workspace.tmp_output.dtype))
         tmp_lse_arg = _to_kernel_tensor(workspace.tmp_lse, cutlass.Float32)
         merge_indptr_arg = _to_kernel_tensor(workspace.merge_indptr, cutlass.Int32, assumed_align=4)
