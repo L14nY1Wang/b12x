@@ -2715,8 +2715,6 @@ class PagedForwardKernel:
             and self.traits.num_mma_q == 1
             and self.traits.num_warps_q == 1
             and self.traits.num_warps_kv == 4
-            and mQ.shape[1] == 8
-            and mKCache.shape[2] == 1
         )
         sOStage = cute.make_tensor(
             sQ.iterator,
