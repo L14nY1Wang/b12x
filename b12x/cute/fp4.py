@@ -967,6 +967,31 @@ def cvt_bf16x2_to_e4m3x2(src: Uint32, *, loc=None, ip=None) -> Uint32:
 
 
 @dsl_user_op
+def cvt_bf16x2x2_to_e4m3x4(lo: Uint32, hi: Uint32, *, loc=None, ip=None) -> Uint32:
+    """Convert two bf16x2 values and pack the e4m3x2 results into one u32."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Uint32(lo).ir_value(loc=loc, ip=ip), Uint32(hi).ir_value(loc=loc, ip=ip)],
+            """
+            {
+                .reg .b16 out_lo, out_hi;
+                cvt.rn.satfinite.e4m3x2.bf16x2 out_lo, $1;
+                cvt.rn.satfinite.e4m3x2.bf16x2 out_hi, $2;
+                mov.b32 $0, {out_lo, out_hi};
+            }
+            """,
+            "=r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def bfloat2_add(a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
     """Add two BFloat2 values element-wise: (a.x+b.x, a.y+b.y)."""
     return Uint32(
