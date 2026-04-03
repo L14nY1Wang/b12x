@@ -9,8 +9,6 @@ Status as of 2026-04-02:
 - capture defaults to the registered decode graph tuning policy when available
 - `--check` now reports reference-relative metrics instead of only raw backend
   deltas
-- zero-context is still blocked in pure replay as
-  `zero-context-replay-mismatch`
 
 ## Goal
 
@@ -32,8 +30,8 @@ the default benchmark path.
 
 The initial realistic context ladder is:
 
-- `0,16384,32768,65536,131072` tokens
-- equivalently `0,256,512,1024,2048` pages at `page_size=64`
+- `128,16384,32768,65536,131072` tokens
+- equivalently `2,256,512,1024,2048` pages at `page_size=64`
 
 The Qwen3.5 geometry is:
 
@@ -55,8 +53,6 @@ Today the benchmark does not match the serving graph contract closely enough:
 3. Its default decode matrix is short-context synthetic coverage
    (`64,512,2048,8192`), not the long-context Qwen3.5 ladder.
 4. It reports generic per-case geomeans instead of per-bucket serving tables.
-5. Zero-context decode is still not valid in the pure graph-replay path and is
-   reported as `blocked=zero-context-replay-mismatch`.
 
 ## Constraints
 
@@ -121,7 +117,7 @@ current serving path, then optimize it.
 Add options along these lines:
 
 - `--batch-buckets 1,2,4,8,12,16`
-- `--decode-contexts 0,16384,32768,65536,131072`
+- `--decode-contexts 128,16384,32768,65536,131072`
 - `--capture-context 0` to use the tuned per-bucket capture contract
 - `--mode decode-graph-buckets`
 
@@ -131,22 +127,14 @@ Optional later extension:
 
 The important contract is still one capture per batch bucket.
 
-### 5. Handle zero-context honestly
+### 5. Keep Decode Contexts Positive
 
-The target ladder includes `0` context. The benchmark now represents that as
-effective KV length `1`, but the pure replay path still fails correctness
-there.
+The default ladder starts at `128`, and decode-bucket mode should stay scoped
+to strictly positive contexts.
 
-Preferred fix:
-
-- teach the graph-replay path to match the reference implementation for true
-  zero-context decode
-
-Until that lands:
-
-- do not silently replace `0` with `64`
-- do not claim the benchmark covers the `0` point
-- report the `0`-context point as unsupported or blocked
+Do not add benchmark-only empty-KV handling. If someone wants to study true
+empty-KV decode, that should be a separate targeted investigation with its own
+correctness contract.
 
 ### 6. Keep FA2 on the same contract
 
@@ -184,8 +172,7 @@ Add tests that prove the new benchmark contract:
 - one bucket can replay multiple context lengths without recapture
 - the b12x bucket and FA2 bucket both update metadata correctly
 - batch buckets `1,2,4,8,12,16` are accepted by default
-- zero-context behavior is either supported or explicitly rejected with a clear
-  error
+- zero and negative decode contexts are rejected with a clear error
 
 Existing correctness tests stay in place.
 
@@ -196,7 +183,7 @@ Existing correctness tests stay in place.
 Land the bucket abstraction and prove it at:
 
 - batch `1`
-- contexts `0,16384,32768,65536,131072`
+- contexts `128,16384,32768,65536,131072`
 
 This is the minimal end-to-end proof that the benchmark matches the intended
 serving model.

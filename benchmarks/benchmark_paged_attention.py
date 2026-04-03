@@ -432,14 +432,6 @@ class DecodeReplayCase:
     def effective_cache_tokens(self) -> int:
         return _decode_effective_cache_tokens(context_tokens=self.context_tokens)
 
-def _decode_graph_case_blocker(
-    *,
-    case: DecodeReplayCase,
-) -> str | None:
-    if case.context_tokens == 0:
-        return "zero-context-replay-mismatch"
-    return None
-
 
 def _build_decode_replay_cases(
     *,
@@ -452,8 +444,8 @@ def _build_decode_replay_cases(
         raise ValueError("expected at least one decode context")
     if any(batch <= 0 for batch in batch_buckets):
         raise ValueError("decode batch buckets must be positive")
-    if any(context < 0 for context in context_tokens):
-        raise ValueError("decode contexts must be non-negative")
+    if any(context <= 0 for context in context_tokens):
+        raise ValueError("decode graph bucket contexts must be positive")
     return [
         DecodeReplayCase(
             batch=int(batch),
@@ -1419,17 +1411,6 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
         )
 
         for case in (case for case in cases if case.batch == batch):
-            blocker = _decode_graph_case_blocker(case=case)
-            if blocker is not None:
-                print(
-                    f"decode-graph "
-                    f"bs={case.batch:2d} "
-                    f"ctx={case.context_tokens:6d} "
-                    f"kv={case.effective_cache_tokens:6d} "
-                    f"cap={bucket_policy.capture_context_tokens:6d} "
-                    f"blocked={blocker}"
-                )
-                continue
             try:
                 b12x_bucket.prepare_replay(context_tokens=case.context_tokens)
             except Exception as exc:
@@ -1545,7 +1526,7 @@ def main() -> None:
     )
     parser.add_argument("--batch", type=int, default=8)
     parser.add_argument("--batch-buckets", type=str, default="1,2,4,8,12,16")
-    parser.add_argument("--decode-contexts", type=str, default="0,16384,32768,65536,131072")
+    parser.add_argument("--decode-contexts", type=str, default="128,16384,32768,65536,131072")
     parser.add_argument("--capture-context", type=int, default=0)
     parser.add_argument("--q-seqlens", type=str, default="1")
     parser.add_argument("--cache-seqlens", type=str, default="64,512,2048,8192")

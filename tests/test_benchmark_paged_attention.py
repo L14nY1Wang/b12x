@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from benchmarks.benchmark_paged_attention import (
@@ -8,7 +9,6 @@ from benchmarks.benchmark_paged_attention import (
     _capture_flashinfer_decode_graph_bucket,
     _cosine_similarity,
     _decode_reference_output,
-    _decode_graph_case_blocker,
     _make_decode_bucket_shared_inputs,
     _relative_l2_error,
     _resolve_decode_graph_bucket_policy,
@@ -20,15 +20,22 @@ from .helpers import require_sm120
 def test_decode_replay_cases_cover_requested_qwen35_batch_buckets() -> None:
     cases = _build_decode_replay_cases(
         batch_buckets=[1, 2, 4, 8, 12, 16],
-        context_tokens=[0, 16_384],
+        context_tokens=[128, 16_384],
     )
 
     assert sorted({case.batch for case in cases}) == [1, 2, 4, 8, 12, 16]
-    assert sorted({case.context_tokens for case in cases}) == [0, 16_384]
+    assert sorted({case.context_tokens for case in cases}) == [128, 16_384]
 
-    zero_case = next(case for case in cases if case.batch == 1 and case.context_tokens == 0)
-    assert zero_case.effective_cache_tokens == 1
-    assert _decode_graph_case_blocker(case=zero_case) == "zero-context-replay-mismatch"
+    first_case = next(case for case in cases if case.batch == 1 and case.context_tokens == 128)
+    assert first_case.effective_cache_tokens == 129
+
+
+def test_decode_replay_cases_reject_zero_contexts() -> None:
+    with pytest.raises(ValueError, match="decode graph bucket contexts must be positive"):
+        _build_decode_replay_cases(
+            batch_buckets=[1, 2, 4, 8, 12, 16],
+            context_tokens=[0, 16_384],
+        )
 
 
 def test_decode_graph_bucket_policy_defaults_to_registered_qwen35_capture_contract() -> None:
@@ -37,7 +44,7 @@ def test_decode_graph_bucket_policy_defaults_to_registered_qwen35_capture_contra
         q_dtype=torch.bfloat16,
         kv_dtype=torch.bfloat16,
         page_size=64,
-        decode_contexts=[0, 16_384, 32_768, 65_536, 131_072],
+        decode_contexts=[128, 16_384, 32_768, 65_536, 131_072],
         capture_context_override=0,
         fixed_split_pages_override=0,
         graph_ctas_per_sm_override=0,
@@ -60,7 +67,7 @@ def test_decode_graph_buckets_reuse_single_graph_across_long_contexts_and_match_
         q_dtype=torch.bfloat16,
         kv_dtype=torch.bfloat16,
         page_size=64,
-        decode_contexts=[0, 16_384, 32_768, 65_536, 131_072],
+        decode_contexts=[128, 16_384, 32_768, 65_536, 131_072],
         capture_context_override=0,
         fixed_split_pages_override=0,
         graph_ctas_per_sm_override=0,
