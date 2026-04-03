@@ -66,6 +66,10 @@ def _ceil_div(x: int, y: int) -> int:
     return (x + y - 1) // y
 
 
+def _align_up(x: int, y: int) -> int:
+    return _ceil_div(x, y) * y
+
+
 def _graph_max_batch_size_if_split(
     *,
     device: torch.device,
@@ -644,7 +648,12 @@ def create_paged_plan(
             )
         else:
             max_batch_size_if_split = max(total_num_qo_tiles, 1) * max(max(effective_kv_len_arr), 1)
+    regularized_decode_graph = bool(
+        enable_cuda_graph and mode == "decode" and total_num_qo_tiles == batch and batch in (4, 12, 16)
+    )
     padded_batch_size = max(max_batch_size_if_split, total_num_qo_tiles) if enable_cuda_graph else 0
+    if regularized_decode_graph:
+        padded_batch_size = _align_up(padded_batch_size, max(batch, 1))
 
     if not _merge_backend_supports_split_kv(output_dtype=q.dtype, head_dim_vo=head_dim_vo):
         disable_split_kv = True
@@ -730,6 +739,7 @@ def create_paged_plan(
     kv_tile_indices: list[int] = []
     merge_indptr: list[int] = [0]
     o_indptr: list[int] = [0]
+    request_num_chunks_kv: list[int] = []
     new_batch_size = 0
 
     for request_idx, (packed_qo_len, qo_len, kv_len) in enumerate(
@@ -737,6 +747,7 @@ def create_paged_plan(
     ):
         num_tiles_q = _ceil_div(packed_qo_len, cta_tile_q)
         num_chunks_kv = 1 if disable_split_kv and not force_split_kv else _ceil_div(max(kv_len, 1), kv_chunk_size_pages)
+        request_num_chunks_kv.append(int(num_chunks_kv))
         if not disable_split_kv or force_split_kv:
             split_kv = split_kv or num_chunks_kv > 1
         for q_tile_idx in range(num_tiles_q):
@@ -750,6 +761,8 @@ def create_paged_plan(
         o_indptr.append(o_indptr[-1] + qo_len * num_chunks_kv)
 
     padded_batch_size = max(max_batch_size_if_split, total_num_qo_tiles) if enable_cuda_graph else new_batch_size
+    if regularized_decode_graph:
+        padded_batch_size = _align_up(padded_batch_size, max(batch, 1))
     if new_batch_size > padded_batch_size:
         raise ValueError(
             "new_batch_size exceeds padded_batch_size; fixed_split_size is incompatible with the chosen graph budget"
@@ -764,7 +777,15 @@ def create_paged_plan(
     ):
         raise ValueError("paged prefill plan exceeds the configured eager workspace budget")
 
-    block_valid_mask = [idx < new_batch_size for idx in range(padded_batch_size)]
+    if regularized_decode_graph:
+        max_chunks_per_req = padded_batch_size // max(batch, 1)
+        block_valid_mask = [False for _ in range(padded_batch_size)]
+        for request_idx, num_chunks_kv in enumerate(request_num_chunks_kv):
+            base_idx = request_idx * max_chunks_per_req
+            for kv_tile_idx in range(num_chunks_kv):
+                block_valid_mask[base_idx + kv_tile_idx] = True
+    else:
+        block_valid_mask = [idx < new_batch_size for idx in range(padded_batch_size)]
     kv_chunk_size = kv_chunk_size_pages * page_size
 
     if (

@@ -569,7 +569,19 @@ class PagedAttentionWorkspace:
         if self.kv_chunk_size_ptr is None:
             raise RuntimeError("decode graph workspace is missing kv_chunk_size_ptr")
 
-        self._validate_decode_graph_replay_capacity(batch=int(self.cache_seqlens.shape[0]))
+        regularized_decode_graph = bool(
+            self._plan is not None
+            and self._plan.mode == "decode"
+            and self._plan.enable_cuda_graph
+            and self._plan.split_kv
+            and self._plan.num_qo_tiles == self._plan.page_table_shape[0]
+            and self._plan.page_table_shape[0] in (4, 12, 16)
+        )
+
+        self._validate_decode_graph_replay_capacity(
+            batch=int(self.cache_seqlens.shape[0]),
+            regularized_decode_graph=regularized_decode_graph,
+        )
 
         from .graph_replay import update_decode_graph_replay_metadata
 
@@ -585,6 +597,7 @@ class PagedAttentionWorkspace:
             kv_chunk_size_ptr=self.kv_chunk_size_ptr,
             decode_chunk_pages_lut=self._decode_graph_chunk_pages_lut,
             page_size=self.page_size,
+            regularized_decode_graph=regularized_decode_graph,
         )
         return self
 
@@ -740,17 +753,22 @@ class PagedAttentionWorkspace:
         self,
         *,
         batch: int,
+        regularized_decode_graph: bool = False,
     ) -> None:
         if self._decode_graph_max_chunks_per_req is None:
             raise RuntimeError("decode graph replay policy has not been prepared")
         if self.request_indices is None:
             raise RuntimeError("decode graph workspace is missing request indices")
+        if self.block_valid_mask is None:
+            raise RuntimeError("decode graph workspace is missing block_valid_mask")
         if batch <= 0:
             raise ValueError("decode graph replay requires bs > 0")
-        work_items_capacity = int(self.request_indices.shape[0])
+        work_items_capacity = (
+            int(self.block_valid_mask.shape[0]) if regularized_decode_graph else int(self.request_indices.shape[0])
+        )
         if work_items_capacity % batch != 0:
             raise RuntimeError(
-                "decode graph workspace request_indices shape is incompatible with the batch bucket"
+                "decode graph workspace work-item capacity is incompatible with the batch bucket"
             )
         max_chunks_per_req = work_items_capacity // batch
         if max_chunks_per_req <= 0:

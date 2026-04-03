@@ -112,6 +112,7 @@ def update_decode_graph_replay_metadata(
     kv_chunk_size_ptr: torch.Tensor,
     decode_chunk_pages_lut: torch.Tensor,
     page_size: int,
+    regularized_decode_graph: bool = False,
 ) -> None:
     if req_to_token.device != page_table.device:
         raise ValueError("req_to_token and page_table must be on the same device")
@@ -129,7 +130,7 @@ def update_decode_graph_replay_metadata(
         raise ValueError("decode graph replay requires bs > 0")
     if int(req_pool_indices.shape[0]) != bs:
         raise ValueError("req_pool_indices shape must match cache_seqlens batch")
-    work_items_capacity = int(request_indices.shape[0])
+    work_items_capacity = int(block_valid_mask.shape[0]) if regularized_decode_graph else int(request_indices.shape[0])
     if work_items_capacity % bs != 0:
         raise RuntimeError("decode graph workspace request_indices shape is incompatible with the batch bucket")
     max_chunks_per_req = work_items_capacity // bs

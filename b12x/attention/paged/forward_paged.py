@@ -1759,6 +1759,7 @@ class PagedForwardKernel:
         split_kv: bool,
         single_request_decode_graph: bool = False,
         single_qtile_decode_graph: bool = False,
+        regularized_decode_graph: bool = False,
         mxfp8_turbo: bool = False,
         enable_mxfp8_pv: bool = False,
     ):
@@ -1770,6 +1771,7 @@ class PagedForwardKernel:
         self.split_kv = split_kv
         self.single_request_decode_graph = single_request_decode_graph
         self.single_qtile_decode_graph = single_qtile_decode_graph
+        self.regularized_decode_graph = regularized_decode_graph
         self.kv_is_fp8 = dtype_kv == cutlass.Float8E4M3FN
         self.vec_size = traits.head_dim_vo // 32
         self.total_warps = traits.num_warps_q * traits.num_warps_kv
@@ -2270,13 +2272,19 @@ class PagedForwardKernel:
             request_partial_start = Int32(0)
             request_partial_end = mOIndptr[1]
         elif const_expr(self.single_qtile_decode_graph):
-            request_idx = mRequestIndices[work_idx]
+            if const_expr(self.regularized_decode_graph):
+                batch = mPageTable.shape[0]
+                max_chunks_per_req = mBlockValidMask.shape[0] // batch
+                request_idx = work_idx // max_chunks_per_req
+                kv_tile_idx = work_idx - request_idx * max_chunks_per_req
+            else:
+                request_idx = mRequestIndices[work_idx]
+                kv_tile_idx = work_idx - mOIndptr[mRequestIndices[work_idx]]
             q_start = request_idx
             q_end = request_idx + 1
             qo_len = Int32(1)
             request_partial_start = mOIndptr[request_idx]
             request_partial_end = mOIndptr[request_idx + 1]
-            kv_tile_idx = work_idx - request_partial_start
         else:
             request_idx = mRequestIndices[work_idx]
             qo_tile_idx = mQoTileIndices[work_idx]
