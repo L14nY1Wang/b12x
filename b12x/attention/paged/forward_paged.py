@@ -1540,7 +1540,6 @@ def _literal_update_mdo_states_fp32_pack_p(
     num_mma_q,
     num_mma_kv,
     num_mma_d_vo,
-    p_frag_scalar: cute.Tensor | None = None,
 ):
     for mma_q in cutlass.range_constexpr(num_mma_q):
         for row_slot in cutlass.range_constexpr(2):
@@ -1605,11 +1604,6 @@ def _literal_update_mdo_states_fp32_pack_p(
                 )
                 p_frag[mma_q, mma_kv, row_slot + 0] = pack_f32x2_to_bfloat2(p0, p1)
                 p_frag[mma_q, mma_kv, row_slot + 2] = pack_f32x2_to_bfloat2(p2, p3)
-                if const_expr(p_frag_scalar is not None):
-                    p_frag_scalar[mma_q, mma_kv, row_slot * 2 + 0] = cutlass.BFloat16(p0)
-                    p_frag_scalar[mma_q, mma_kv, row_slot * 2 + 1] = cutlass.BFloat16(p1)
-                    p_frag_scalar[mma_q, mma_kv, row_slot * 2 + 4] = cutlass.BFloat16(p2)
-                    p_frag_scalar[mma_q, mma_kv, row_slot * 2 + 5] = cutlass.BFloat16(p3)
 
             m_frag[mma_q, row_slot] = Float32(m_new)
 
@@ -3175,7 +3169,6 @@ class PagedForwardKernel:
                             )
                         _exit_thread()
 
-                p_frag_scalar = None
                 _literal_update_mdo_states_fp32_pack_p(
                     frag_S,
                     o_frag,
@@ -3186,7 +3179,6 @@ class PagedForwardKernel:
                     num_mma_q,
                     num_mma_kv,
                     num_mma_d_vo,
-                    p_frag_scalar,
                 )
                 if const_expr(self.debug_dump_paged_kv_pregs):
                     if (
@@ -4410,7 +4402,6 @@ class PagedFp8DecodeRawForwardKernel:
                 1,
                 1,
                 self.num_mma_d_vo,
-                None,
             )
             if const_expr(os.environ.get("B12X_PAGED_KV_DEBUG_DUMP", "") == "SREGS"):
                 if kv_head_idx == Int32(0) and warp_q_idx == Int32(0) and warp_kv_idx == Int32(0):
@@ -5202,7 +5193,6 @@ class PagedBf16ExtendRawForwardKernel:
                             self.num_mma_q,
                             self.num_mma_kv,
                             self.num_mma_d_vo,
-                            None,
                         )
                         for mma_q in cutlass.range_constexpr(self.num_mma_q):
                             d0, d1 = bf16_rowsum_m16k16_f32(
@@ -5895,7 +5885,6 @@ class PagedFp8ExtendRawForwardKernel:
                             self.num_mma_q,
                             self.num_mma_kv,
                             self.num_mma_d_vo,
-                            None,
                         )
                         for mma_q in cutlass.range_constexpr(self.num_mma_q):
                             for mma_kv in cutlass.range_constexpr(self.num_mma_kv):
