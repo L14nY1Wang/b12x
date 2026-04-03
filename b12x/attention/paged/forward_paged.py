@@ -3476,6 +3476,10 @@ class PagedForwardKernel:
                     scale1 = Float32(0.0)
                     scale2 = Float32(0.0)
                     scale3 = Float32(0.0)
+                    norm0 = Float32(0.0)
+                    norm1 = Float32(0.0)
+                    norm2 = Float32(0.0)
+                    norm3 = Float32(0.0)
                     merged_m = attention_utils.fmax(
                         attention_utils.fmax(part_m0, part_m1),
                         attention_utils.fmax(part_m2, part_m3),
@@ -3492,6 +3496,10 @@ class PagedForwardKernel:
                             + part_d3 * scale3
                         )
                         inv_d = cute.arch.rcp_approx(merged_d)
+                        norm0 = scale0 * inv_d
+                        norm1 = scale1 * inv_d
+                        norm2 = scale2 * inv_d
+                        norm3 = scale3 * inv_d
 
                     for mma_d in cutlass.range_constexpr(num_mma_d_vo):
                         dim_low = mma_d * 16 + lane_pair_base
@@ -3502,40 +3510,28 @@ class PagedForwardKernel:
                         out_high1 = Float32(0.0)
                         if merged_m != -Float32.inf:
                             out_low0 = Float32(
-                                (
-                                    sSyncO[0, packed_row_local, dim_low + 0] * scale0
-                                    + sSyncO[1, packed_row_local, dim_low + 0] * scale1
-                                    + sSyncO[2, packed_row_local, dim_low + 0] * scale2
-                                    + sSyncO[3, packed_row_local, dim_low + 0] * scale3
-                                )
-                                * inv_d
+                                sSyncO[0, packed_row_local, dim_low + 0] * norm0
+                                + sSyncO[1, packed_row_local, dim_low + 0] * norm1
+                                + sSyncO[2, packed_row_local, dim_low + 0] * norm2
+                                + sSyncO[3, packed_row_local, dim_low + 0] * norm3
                             )
                             out_low1 = Float32(
-                                (
-                                    sSyncO[0, packed_row_local, dim_low + 1] * scale0
-                                    + sSyncO[1, packed_row_local, dim_low + 1] * scale1
-                                    + sSyncO[2, packed_row_local, dim_low + 1] * scale2
-                                    + sSyncO[3, packed_row_local, dim_low + 1] * scale3
-                                )
-                                * inv_d
+                                sSyncO[0, packed_row_local, dim_low + 1] * norm0
+                                + sSyncO[1, packed_row_local, dim_low + 1] * norm1
+                                + sSyncO[2, packed_row_local, dim_low + 1] * norm2
+                                + sSyncO[3, packed_row_local, dim_low + 1] * norm3
                             )
                             out_high0 = Float32(
-                                (
-                                    sSyncO[0, packed_row_local, dim_high + 0] * scale0
-                                    + sSyncO[1, packed_row_local, dim_high + 0] * scale1
-                                    + sSyncO[2, packed_row_local, dim_high + 0] * scale2
-                                    + sSyncO[3, packed_row_local, dim_high + 0] * scale3
-                                )
-                                * inv_d
+                                sSyncO[0, packed_row_local, dim_high + 0] * norm0
+                                + sSyncO[1, packed_row_local, dim_high + 0] * norm1
+                                + sSyncO[2, packed_row_local, dim_high + 0] * norm2
+                                + sSyncO[3, packed_row_local, dim_high + 0] * norm3
                             )
                             out_high1 = Float32(
-                                (
-                                    sSyncO[0, packed_row_local, dim_high + 1] * scale0
-                                    + sSyncO[1, packed_row_local, dim_high + 1] * scale1
-                                    + sSyncO[2, packed_row_local, dim_high + 1] * scale2
-                                    + sSyncO[3, packed_row_local, dim_high + 1] * scale3
-                                )
-                                * inv_d
+                                sSyncO[0, packed_row_local, dim_high + 1] * norm0
+                                + sSyncO[1, packed_row_local, dim_high + 1] * norm1
+                                + sSyncO[2, packed_row_local, dim_high + 1] * norm2
+                                + sSyncO[3, packed_row_local, dim_high + 1] * norm3
                             )
 
                         if const_expr(self.dtype_o == cutlass.BFloat16):
