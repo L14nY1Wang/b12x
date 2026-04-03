@@ -1848,6 +1848,9 @@ def _run_batch(
     if requested_workers <= 0:
         requested_workers = visible_gpu_count
     worker_count = max(1, min(requested_workers, visible_gpu_count, len(all_page_counts)))
+    # Keep downstream helpers on the same effective worker count after
+    # clamping to the GPUs visible to this agent.
+    batch_args.parallel_workers = int(worker_count)
     sampled_page_counts = _progressive_sample_page_counts(
         page_start=batch_args.page_start,
         page_stop=batch_args.page_stop,
