@@ -1748,6 +1748,8 @@ def _literal_update_mdo_states_fp32_pack_p_pairwise(
 
 
 class PagedForwardKernel:
+    DECODE_MXFP8_RUNTIME_CHUNK_THRESHOLD = 11 * 64
+
     def __init__(
         self,
         dtype_q: Type[cutlass.Numeric],
@@ -1763,6 +1765,7 @@ class PagedForwardKernel:
         mxfp8_turbo: bool = False,
         enable_mxfp8_pv: bool = False,
         decode_only: bool = False,
+        decode_mxfp8_runtime_chunk_guard: bool = False,
     ):
         self.dtype_q = dtype_q
         self.dtype_kv = dtype_kv
@@ -1871,6 +1874,7 @@ class PagedForwardKernel:
             and traits.num_warps_kv == 1
             and traits.num_mma_kv % 2 == 0
         )
+        self.decode_mxfp8_runtime_chunk_guard = self.use_mxfp8_qk and decode_only and decode_mxfp8_runtime_chunk_guard
         self.softmax_scale_log2 = Float32((traits.head_dim_qk ** -0.5) * attention_utils.LOG2_E)
 
     def _get_shared_storage_cls(self):
@@ -3020,8 +3024,7 @@ class PagedForwardKernel:
 
             subtile_base = Int32(0) if const_expr(self.traits.num_warps_kv == 1) else warp_kv_base
             for _ in cutlass.range_constexpr(1):
-                if const_expr(self.use_mxfp8_qk):
-                    k_smem_base_addr = shared_ptr_to_u32(sKStageBytes.iterator + Int32(consume_stage_idx * k_stage_bytes))
+                if const_expr(self.kv_is_fp8):
                     frag_S = cute.make_rmem_tensor(
                         cute.make_layout(
                             (num_mma_q, num_mma_kv, 8),
@@ -3030,65 +3033,81 @@ class PagedForwardKernel:
                         Float32,
                     )
                     frag_S.fill(0.0)
-                    _literal_qk_mma_into_sfrag_mxfp8_raw(
-                        frag_S,
-                        q_smem_base_addr,
-                        k_smem_base_addr,
-                        lane,
-                        warp_q_idx,
-                        warp_kv_idx,
-                        Int32(0) if const_expr(self.traits.num_warps_kv > 1) else subtile_base,
-                        num_mma_q,
-                        num_mma_kv,
-                        self.traits.num_mma_d_qk,
-                        tc_upcast_stride_qk,
-                        self.traits.upcast_stride_k,
+                    k_smem_base_addr = shared_ptr_to_u32(
+                        sKStageBytes.iterator + Int32(consume_stage_idx * k_stage_bytes)
                     )
-                    for mma_q in cutlass.range_constexpr(num_mma_q):
-                        for mma_kv in cutlass.range_constexpr(num_mma_kv):
-                            for reg_id in cutlass.range_constexpr(8):
-                                row_slot = (reg_id % 4) // 2
-                                key_local = (
-                                    warp_kv_base + mma_kv * 16 + lane_pair_base + 8 * (reg_id // 4) + (reg_id % 2)
-                                )
-                                valid = row_valid[mma_q, row_slot] != 0
-                                if valid:
-                                    valid = valid and key_local < tile_tokens
-                                if valid:
-                                    valid = valid and (tile_base + key_local) <= causal_k_limit[mma_q, row_slot]
-                                if valid:
-                                    frag_S[mma_q, mma_kv, reg_id] = frag_S[mma_q, mma_kv, reg_id] * k_scale
-                                else:
-                                    frag_S[mma_q, mma_kv, reg_id] = Float32(-Float32.inf)
-                elif const_expr(self.kv_is_fp8):
-                    frag_S = cute.make_rmem_tensor(
-                        cute.make_layout(
-                            (num_mma_q, num_mma_kv, 8),
-                            stride=(num_mma_kv * 8, 8, 1),
-                        ),
-                        Float32,
-                    )
-                    frag_S.fill(0.0)
                     k_stage_plane_offset = Int32(consume_stage_idx * kv_plane_stage_bytes)
-                    _literal_qk_mma_into_sfrag_plane_fp8_raw(
-                        frag_S,
-                        q_smem_base_addr,
-                        shared_ptr_to_u32(
-                            sKStageBytes.iterator + k_stage_plane_offset + Int32(0 * kv_plane_total_bytes)
-                        ),
-                        shared_ptr_to_u32(
-                            sKStageBytes.iterator + k_stage_plane_offset + Int32(1 * kv_plane_total_bytes)
-                        ),
-                        lane,
-                        warp_q_idx,
-                        warp_kv_idx,
-                        Int32(0) if const_expr(self.traits.num_warps_kv > 1) else subtile_base,
-                        num_mma_q,
-                        num_mma_kv,
-                        self.traits.num_mma_d_qk,
-                        tc_upcast_stride_qk,
-                        tc_upcast_stride_plane,
-                    )
+                    if const_expr(self.use_mxfp8_qk and not self.decode_mxfp8_runtime_chunk_guard):
+                        _literal_qk_mma_into_sfrag_mxfp8_raw(
+                            frag_S,
+                            q_smem_base_addr,
+                            k_smem_base_addr,
+                            lane,
+                            warp_q_idx,
+                            warp_kv_idx,
+                            Int32(0) if const_expr(self.traits.num_warps_kv > 1) else subtile_base,
+                            num_mma_q,
+                            num_mma_kv,
+                            self.traits.num_mma_d_qk,
+                            tc_upcast_stride_qk,
+                            self.traits.upcast_stride_k,
+                        )
+                    elif const_expr(self.use_mxfp8_qk and self.decode_mxfp8_runtime_chunk_guard):
+                        if kv_chunk_size >= Int32(self.DECODE_MXFP8_RUNTIME_CHUNK_THRESHOLD):
+                            _literal_qk_mma_into_sfrag_mxfp8_raw(
+                                frag_S,
+                                q_smem_base_addr,
+                                k_smem_base_addr,
+                                lane,
+                                warp_q_idx,
+                                warp_kv_idx,
+                                Int32(0) if const_expr(self.traits.num_warps_kv > 1) else subtile_base,
+                                num_mma_q,
+                                num_mma_kv,
+                                self.traits.num_mma_d_qk,
+                                tc_upcast_stride_qk,
+                                self.traits.upcast_stride_k,
+                            )
+                        else:
+                            _literal_qk_mma_into_sfrag_plane_fp8_raw(
+                                frag_S,
+                                q_smem_base_addr,
+                                shared_ptr_to_u32(
+                                    sKStageBytes.iterator + k_stage_plane_offset + Int32(0 * kv_plane_total_bytes)
+                                ),
+                                shared_ptr_to_u32(
+                                    sKStageBytes.iterator + k_stage_plane_offset + Int32(1 * kv_plane_total_bytes)
+                                ),
+                                lane,
+                                warp_q_idx,
+                                warp_kv_idx,
+                                Int32(0) if const_expr(self.traits.num_warps_kv > 1) else subtile_base,
+                                num_mma_q,
+                                num_mma_kv,
+                                self.traits.num_mma_d_qk,
+                                tc_upcast_stride_qk,
+                                tc_upcast_stride_plane,
+                            )
+                    else:
+                        _literal_qk_mma_into_sfrag_plane_fp8_raw(
+                            frag_S,
+                            q_smem_base_addr,
+                            shared_ptr_to_u32(
+                                sKStageBytes.iterator + k_stage_plane_offset + Int32(0 * kv_plane_total_bytes)
+                            ),
+                            shared_ptr_to_u32(
+                                sKStageBytes.iterator + k_stage_plane_offset + Int32(1 * kv_plane_total_bytes)
+                            ),
+                            lane,
+                            warp_q_idx,
+                            warp_kv_idx,
+                            Int32(0) if const_expr(self.traits.num_warps_kv > 1) else subtile_base,
+                            num_mma_q,
+                            num_mma_kv,
+                            self.traits.num_mma_d_qk,
+                            tc_upcast_stride_qk,
+                            tc_upcast_stride_plane,
+                        )
                     for mma_q in cutlass.range_constexpr(num_mma_q):
                         for mma_kv in cutlass.range_constexpr(num_mma_kv):
                             for reg_id in cutlass.range_constexpr(8):

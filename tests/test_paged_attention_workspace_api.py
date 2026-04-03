@@ -258,10 +258,9 @@ def test_paged_workspace_preserves_opt_in_attention_mode() -> None:
     [
         (2, 16384, True),
         (4, 16384, False),
-        (4, 32768, True),
     ],
 )
-def test_decode_turbo_dispatch_tracks_batch_and_chunk_regime(
+def test_decode_turbo_dispatch_tracks_batch_and_chunk_regime_eager(
     batch: int,
     cache_len: int,
     expect_turbo: bool,
@@ -287,18 +286,61 @@ def test_decode_turbo_dispatch_tracks_batch_and_chunk_regime(
         k_cache=k_fp8,
         v_cache=v_fp8,
         cu_seqlens_q=cu_seqlens_q,
-        use_cuda_graph=True,
+        use_cuda_graph=False,
         attn_mode="turbo",
     )
     workspace.prepare(page_table, cache_seqlens_t, cu_seqlens_q)
 
-    mxfp8_turbo, enable_mxfp8_pv = _resolve_mxfp8_turbo_flags(attn_mode=workspace.attn_mode, plan=workspace.plan)
+    mxfp8_turbo, enable_mxfp8_pv, decode_runtime_chunk_guard = _resolve_mxfp8_turbo_flags(
+        attn_mode=workspace.attn_mode,
+        plan=workspace.plan,
+    )
 
     assert workspace.plan.mode == "decode"
     assert workspace.plan.kv_dtype == torch.float8_e4m3fn
     assert (workspace.plan.kv_chunk_size < 11 * workspace.plan.page_size) == (cache_len == 16384)
     assert mxfp8_turbo is expect_turbo
     assert enable_mxfp8_pv is (expect_turbo and workspace.plan.kv_chunk_size <= 384)
+    assert decode_runtime_chunk_guard is False
+
+
+def test_decode_graph_turbo_dispatch_enables_runtime_short_chunk_guard() -> None:
+    require_sm120()
+    clear_attention_caches()
+
+    q, k_cache, v_cache, page_table, cache_seqlens_t, cu_seqlens_q = _make_paged_inputs(
+        q_seqlens=[1, 1, 1, 1],
+        cache_seqlens=[16384, 16384, 16384, 16384],
+        page_size=64,
+        seed=73,
+        num_pages=(4 * 16384) // 64,
+    )
+    k_fp8, v_fp8, _k_descale, _v_descale = _quantize_paged_kv_cache_e4m3(
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens_t,
+    )
+    workspace = _make_workspace(
+        q=q,
+        k_cache=k_fp8,
+        v_cache=v_fp8,
+        cu_seqlens_q=cu_seqlens_q,
+        use_cuda_graph=True,
+        attn_mode="turbo",
+    )
+    workspace.prepare(page_table, cache_seqlens_t, cu_seqlens_q)
+
+    mxfp8_turbo, enable_mxfp8_pv, decode_runtime_chunk_guard = _resolve_mxfp8_turbo_flags(
+        attn_mode=workspace.attn_mode,
+        plan=workspace.plan,
+    )
+
+    assert workspace.plan.mode == "decode"
+    assert workspace.plan.enable_cuda_graph is True
+    assert mxfp8_turbo is True
+    assert enable_mxfp8_pv is True
+    assert decode_runtime_chunk_guard is True
 
 
 def test_paged_workspace_matches_reference_for_fp8_kv_cache() -> None:

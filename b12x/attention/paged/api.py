@@ -78,18 +78,23 @@ def _resolve_mxfp8_turbo_flags(
     *,
     attn_mode: Literal["default", "turbo"] | None,
     plan,
-) -> tuple[bool, bool]:
+) -> tuple[bool, bool, bool]:
     mxfp8_turbo = _attn_turbo_enabled(attn_mode) and plan.kv_dtype == torch.float8_e4m3fn
+    decode_runtime_chunk_guard = False
     if (
         mxfp8_turbo
         and plan.mode in ("decode", "verify")
-        and plan.total_q > _DECODE_MXFP8_TURBO_MAX_SMALL_BATCH
-        and plan.kv_chunk_size < _DECODE_MXFP8_TURBO_MIN_LONG_CHUNK_PAGES * plan.page_size
     ):
-        # Mid-batch short-chunk decode picks up most of turbo's numeric loss for negligible replay gain.
-        mxfp8_turbo = False
+        if plan.enable_cuda_graph and plan.total_q > _DECODE_MXFP8_TURBO_MAX_SMALL_BATCH:
+            decode_runtime_chunk_guard = True
+        elif (
+            plan.total_q > _DECODE_MXFP8_TURBO_MAX_SMALL_BATCH
+            and plan.kv_chunk_size < _DECODE_MXFP8_TURBO_MIN_LONG_CHUNK_PAGES * plan.page_size
+        ):
+            # Mid-batch short-chunk decode picks up most of turbo's numeric loss for negligible replay gain.
+            mxfp8_turbo = False
     enable_mxfp8_pv = mxfp8_turbo and plan.mode in ("decode", "verify") and plan.kv_chunk_size <= 384
-    return mxfp8_turbo, enable_mxfp8_pv
+    return mxfp8_turbo, enable_mxfp8_pv, decode_runtime_chunk_guard
 
 
 @lru_cache(maxsize=16)
@@ -294,6 +299,7 @@ def _build_forward_kernel(
     mxfp8_turbo: bool,
     enable_mxfp8_pv: bool,
     decode_only: bool,
+    decode_mxfp8_runtime_chunk_guard: bool,
 ) -> PagedForwardKernel:
     return PagedForwardKernel(
         _torch_to_cutlass_dtype(traits.q_dtype),
@@ -308,6 +314,7 @@ def _build_forward_kernel(
         mxfp8_turbo=mxfp8_turbo,
         enable_mxfp8_pv=enable_mxfp8_pv,
         decode_only=decode_only,
+        decode_mxfp8_runtime_chunk_guard=decode_mxfp8_runtime_chunk_guard,
     )
 
 
@@ -381,7 +388,10 @@ def paged_attention_forward(
         raise ValueError("fp8 paged caches require k_descale and v_descale")
 
     traits = select_paged_forward_traits_from_plan(plan)
-    mxfp8_turbo, enable_mxfp8_pv = _resolve_mxfp8_turbo_flags(attn_mode=workspace.attn_mode, plan=plan)
+    mxfp8_turbo, enable_mxfp8_pv, decode_mxfp8_runtime_chunk_guard = _resolve_mxfp8_turbo_flags(
+        attn_mode=workspace.attn_mode,
+        plan=plan,
+    )
     if plan.mode == "extend":
         if plan.split_kv:
             raise ValueError("extend plans no longer support split-kv")
@@ -415,6 +425,7 @@ def paged_attention_forward(
             mxfp8_turbo,
             enable_mxfp8_pv,
             plan.mode == "decode",
+            decode_mxfp8_runtime_chunk_guard,
         )
     forward_output = workspace.tmp_output if plan.split_kv else output
     forward_lse = workspace.tmp_lse if plan.split_kv else workspace.lse

@@ -44,6 +44,7 @@ def _make_workspace(
 
 def _run_decode_graph_check(
     *,
+    batch: int = 8,
     cache_seqlen: int,
     b12x_attn_mode: str = "default",
 ) -> tuple[torch.Tensor, torch.Tensor, str]:
@@ -57,7 +58,7 @@ def _run_decode_graph_check(
         capture_cache_seqlens,
         cu_seqlens_q,
     ) = _make_uniform_paged_inputs(
-        batch=8,
+        batch=batch,
         q_seqlen=1,
         cache_seqlen=cache_seqlen,
         capture_cache_seqlen=None,
@@ -71,7 +72,7 @@ def _run_decode_graph_check(
     k_fp8, v_fp8, k_descale, v_descale, k_scale, v_scale = _quantize_paged_kv_cache_global_e4m3(
         k_cache,
         v_cache,
-        batch=8,
+        batch=batch,
         kv_heads=1,
     )
     backend = _capture_backend_graph(
@@ -115,6 +116,7 @@ def _run_decode_graph_check(
 
 def _run_decode_reference_check(
     *,
+    batch: int = 8,
     cache_seqlen: int,
     b12x_attn_mode: str = "default",
 ) -> tuple[torch.Tensor, torch.Tensor, str]:
@@ -128,7 +130,7 @@ def _run_decode_reference_check(
         capture_cache_seqlens,
         cu_seqlens_q,
     ) = _make_uniform_paged_inputs(
-        batch=8,
+        batch=batch,
         q_seqlen=1,
         cache_seqlen=cache_seqlen,
         capture_cache_seqlen=None,
@@ -142,7 +144,7 @@ def _run_decode_reference_check(
     k_fp8, v_fp8, k_descale, v_descale, _k_scale, _v_scale = _quantize_paged_kv_cache_global_e4m3(
         k_cache,
         v_cache,
-        batch=8,
+        batch=batch,
         kv_heads=1,
     )
     backend = _capture_backend_graph(
@@ -359,6 +361,27 @@ def test_paged_forward_turbo_matches_reference_with_split_fp8_decode() -> None:
     assert plan_desc.endswith(",split")
     assert (output - ref_out).abs().max().item() <= 0.01
     assert _cosine_similarity(output, ref_out) >= 0.995
+
+
+@torch.inference_mode()
+def test_paged_forward_turbo_short_chunk_graph_decode_matches_default_batch4() -> None:
+    require_sm120()
+    default_out, ref_out, default_plan_desc = _run_decode_reference_check(
+        batch=4,
+        cache_seqlen=16384,
+        b12x_attn_mode="default",
+    )
+    turbo_out, _turbo_ref, turbo_plan_desc = _run_decode_reference_check(
+        batch=4,
+        cache_seqlen=16384,
+        b12x_attn_mode="turbo",
+    )
+
+    assert default_plan_desc.endswith(",split")
+    assert turbo_plan_desc == default_plan_desc
+    assert (turbo_out - default_out).abs().max().item() <= 1e-5
+    assert _cosine_similarity(turbo_out, default_out) >= 0.999999
+    assert _cosine_similarity(turbo_out, ref_out) >= 0.99999
 
 
 @torch.inference_mode()
