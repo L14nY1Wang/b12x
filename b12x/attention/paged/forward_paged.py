@@ -3464,33 +3464,60 @@ class PagedForwardKernel:
                     merged_m = Float32(-Float32.inf)
                     merged_d = Float32(1.0)
                     inv_d = Float32(0.0)
-                    merge_scale = cute.make_rmem_tensor(
-                        cute.make_layout((self.traits.num_warps_kv,), stride=(1,)),
-                        Float32,
-                    )
-                    merge_scale.fill(0.0)
-                    for kv_warp in cutlass.range_constexpr(self.traits.num_warps_kv):
-                        part_m = sSyncMD[kv_warp, packed_row_local, 0]
-                        part_d = sSyncMD[kv_warp, packed_row_local, 1]
+                    part_m0 = sSyncMD[0, packed_row_local, 0]
+                    part_d0 = sSyncMD[0, packed_row_local, 1]
+                    part_m1 = sSyncMD[1, packed_row_local, 0]
+                    part_d1 = sSyncMD[1, packed_row_local, 1]
+                    part_m2 = sSyncMD[2, packed_row_local, 0]
+                    part_d2 = sSyncMD[2, packed_row_local, 1]
+                    part_m3 = sSyncMD[3, packed_row_local, 0]
+                    part_d3 = sSyncMD[3, packed_row_local, 1]
+                    scale0 = Float32(0.0)
+                    scale1 = Float32(0.0)
+                    scale2 = Float32(0.0)
+                    scale3 = Float32(0.0)
+                    if part_m0 != -Float32.inf:
+                        merged_m = part_m0
+                        merged_d = part_d0
+                    if part_m1 != -Float32.inf:
                         if merged_m == -Float32.inf:
-                            merged_m = part_m
-                            merged_d = part_d
-                        elif part_m != -Float32.inf:
-                            new_m = attention_utils.fmax(merged_m, part_m)
+                            merged_m = part_m1
+                            merged_d = part_d1
+                        else:
+                            new_m = attention_utils.fmax(merged_m, part_m1)
                             merged_d = Float32(
                                 merged_d * _exp2_approx_ftz_f32(merged_m - new_m)
-                                + part_d * _exp2_approx_ftz_f32(part_m - new_m)
+                                + part_d1 * _exp2_approx_ftz_f32(part_m1 - new_m)
+                            )
+                            merged_m = new_m
+                    if part_m2 != -Float32.inf:
+                        if merged_m == -Float32.inf:
+                            merged_m = part_m2
+                            merged_d = part_d2
+                        else:
+                            new_m = attention_utils.fmax(merged_m, part_m2)
+                            merged_d = Float32(
+                                merged_d * _exp2_approx_ftz_f32(merged_m - new_m)
+                                + part_d2 * _exp2_approx_ftz_f32(part_m2 - new_m)
+                            )
+                            merged_m = new_m
+                    if part_m3 != -Float32.inf:
+                        if merged_m == -Float32.inf:
+                            merged_m = part_m3
+                            merged_d = part_d3
+                        else:
+                            new_m = attention_utils.fmax(merged_m, part_m3)
+                            merged_d = Float32(
+                                merged_d * _exp2_approx_ftz_f32(merged_m - new_m)
+                                + part_d3 * _exp2_approx_ftz_f32(part_m3 - new_m)
                             )
                             merged_m = new_m
                     if merged_m != -Float32.inf:
                         inv_d = cute.arch.rcp_approx(merged_d)
-                        for kv_warp in cutlass.range_constexpr(self.traits.num_warps_kv):
-                            part_m = sSyncMD[kv_warp, packed_row_local, 0]
-                            merge_scale[kv_warp] = (
-                                Float32(0.0)
-                                if part_m == -Float32.inf
-                                else _exp2_approx_ftz_f32(part_m - merged_m)
-                            )
+                        scale0 = Float32(0.0) if part_m0 == -Float32.inf else _exp2_approx_ftz_f32(part_m0 - merged_m)
+                        scale1 = Float32(0.0) if part_m1 == -Float32.inf else _exp2_approx_ftz_f32(part_m1 - merged_m)
+                        scale2 = Float32(0.0) if part_m2 == -Float32.inf else _exp2_approx_ftz_f32(part_m2 - merged_m)
+                        scale3 = Float32(0.0) if part_m3 == -Float32.inf else _exp2_approx_ftz_f32(part_m3 - merged_m)
 
                     for mma_d in cutlass.range_constexpr(num_mma_d_vo):
                         dim_low = mma_d * 16 + lane_pair_base
@@ -3500,20 +3527,42 @@ class PagedForwardKernel:
                         out_high0 = Float32(0.0)
                         out_high1 = Float32(0.0)
                         if merged_m != -Float32.inf:
-                            acc_low0 = Float32(0.0)
-                            acc_low1 = Float32(0.0)
-                            acc_high0 = Float32(0.0)
-                            acc_high1 = Float32(0.0)
-                            for kv_warp in cutlass.range_constexpr(self.traits.num_warps_kv):
-                                scale = merge_scale[kv_warp]
-                                acc_low0 += sSyncO[kv_warp, packed_row_local, dim_low + 0] * scale
-                                acc_low1 += sSyncO[kv_warp, packed_row_local, dim_low + 1] * scale
-                                acc_high0 += sSyncO[kv_warp, packed_row_local, dim_high + 0] * scale
-                                acc_high1 += sSyncO[kv_warp, packed_row_local, dim_high + 1] * scale
-                            out_low0 = acc_low0 * inv_d
-                            out_low1 = acc_low1 * inv_d
-                            out_high0 = acc_high0 * inv_d
-                            out_high1 = acc_high1 * inv_d
+                            out_low0 = Float32(
+                                (
+                                    sSyncO[0, packed_row_local, dim_low + 0] * scale0
+                                    + sSyncO[1, packed_row_local, dim_low + 0] * scale1
+                                    + sSyncO[2, packed_row_local, dim_low + 0] * scale2
+                                    + sSyncO[3, packed_row_local, dim_low + 0] * scale3
+                                )
+                                * inv_d
+                            )
+                            out_low1 = Float32(
+                                (
+                                    sSyncO[0, packed_row_local, dim_low + 1] * scale0
+                                    + sSyncO[1, packed_row_local, dim_low + 1] * scale1
+                                    + sSyncO[2, packed_row_local, dim_low + 1] * scale2
+                                    + sSyncO[3, packed_row_local, dim_low + 1] * scale3
+                                )
+                                * inv_d
+                            )
+                            out_high0 = Float32(
+                                (
+                                    sSyncO[0, packed_row_local, dim_high + 0] * scale0
+                                    + sSyncO[1, packed_row_local, dim_high + 0] * scale1
+                                    + sSyncO[2, packed_row_local, dim_high + 0] * scale2
+                                    + sSyncO[3, packed_row_local, dim_high + 0] * scale3
+                                )
+                                * inv_d
+                            )
+                            out_high1 = Float32(
+                                (
+                                    sSyncO[0, packed_row_local, dim_high + 1] * scale0
+                                    + sSyncO[1, packed_row_local, dim_high + 1] * scale1
+                                    + sSyncO[2, packed_row_local, dim_high + 1] * scale2
+                                    + sSyncO[3, packed_row_local, dim_high + 1] * scale3
+                                )
+                                * inv_d
+                            )
 
                         if const_expr(self.dtype_o == cutlass.BFloat16):
                             sDecodeStageU32[0, packed_row_local, dim_low // 2] = pack_f32x2_to_bfloat2(
