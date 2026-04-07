@@ -60,6 +60,7 @@ class TPCompactStaticWorkspace(TPMoEWorkspace):
     weight_expert_ids: torch.Tensor
     global_to_local_expert: torch.Tensor
     compact_topk_ids: torch.Tensor
+    tile_scales: torch.Tensor
 
 
 @dataclass(kw_only=True)
@@ -83,6 +84,7 @@ class TPDynamicWorkspace(TPMoEWorkspace):
     task_slice_count: torch.Tensor
     task_valid_rows: torch.Tensor
     tile_write_count: torch.Tensor
+    tile_scales: torch.Tensor
     input_gs_src_ptr: int = 0
     down_input_scale_src_ptr: int = 0
 
@@ -235,6 +237,16 @@ def _first_env(*names: str) -> str | None:
         if value is not None:
             return value
     return None
+
+
+_DYNAMIC_AMAX_CACHE: bool | None = None
+
+
+def _dynamic_amax_enabled() -> bool:
+    global _DYNAMIC_AMAX_CACHE
+    if _DYNAMIC_AMAX_CACHE is None:
+        _DYNAMIC_AMAX_CACHE = os.environ.get("B12X_ENABLE_DYNAMIC_AMAX", "0") == "1"
+    return _DYNAMIC_AMAX_CACHE
 
 
 def _get_static_compact_cutover_pairs() -> int:
@@ -588,6 +600,7 @@ def _alloc_workspace(
             weight_expert_ids=torch.arange(state_E, dtype=torch.int32, device=device),
             global_to_local_expert=torch.empty(weight_E, dtype=torch.int32, device=device),
             compact_topk_ids=torch.empty(state_E, dtype=torch.int32, device=device),
+            tile_scales=torch.zeros(state_E, k // 128, dtype=torch.float32, device=device),
         )
         _finalize_workspace_views(workspace)
         return workspace
@@ -623,6 +636,7 @@ def _alloc_workspace(
         task_slice_count=torch.zeros(dynamic_max_tasks, dtype=torch.int32, device=device),
         task_valid_rows=torch.zeros(dynamic_max_tasks, dtype=torch.int32, device=device),
         tile_write_count=torch.zeros(dynamic_tiles, dtype=torch.int32, device=device),
+        tile_scales=torch.zeros(state_E, k // 128, dtype=torch.float32, device=device),
     )
     _refresh_dynamic_workspace_scales(
         workspace,
@@ -1107,7 +1121,7 @@ def _get_static_kernel(
     global _LAST_KERNEL
     cache_key = (
         "static", state_E, weight_E, m, k, n, num_topk, max_rows, mac, topk_ids_dtype,
-        input_scales_are_reciprocal, fast_math,
+        input_scales_are_reciprocal, fast_math, _dynamic_amax_enabled(), _dynamic_amax_enabled(),
     )
     last_kkey, last_kval = _LAST_KERNEL
     if last_kkey == cache_key:
@@ -1131,6 +1145,7 @@ def _get_static_kernel(
         output_tile_count_n=max(1, (n + 128 - 1) // 128),
         input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
+        dynamic_amax=_dynamic_amax_enabled(),
     )
 
     rows_pad_k = align_up(max_rows, 128)
@@ -1204,6 +1219,10 @@ def _get_static_kernel(
     token_weights_fake = cute.runtime.make_fake_compact_tensor(
         alpha_dtype, (state_E, max_rows), stride_order=(1, 0), assumed_align=16,
     )
+    num_k_tiles = k // 128
+    tile_scales_fake = cute.runtime.make_fake_compact_tensor(
+        alpha_dtype, (state_E, num_k_tiles), stride_order=(1, 0), assumed_align=16,
+    )
     compiled = cute.compile(
         kernel,
         a_input_fake, topk_ids_fake, topk_weights_fake,
@@ -1215,6 +1234,7 @@ def _get_static_kernel(
         row_counts_fake, active_expert_count_fake, weight_expert_ids_fake, global_to_local_expert_fake,
         input_gs_fake, alpha_fake, down_alpha_fake, global_scale_fake,
         scatter_fake, token_map_fake, token_weights_fake,
+        tile_scales_fake,
         mac, current_cuda_stream(),
     )
 
@@ -1245,7 +1265,7 @@ def _get_micro_kernel(
     global _LAST_KERNEL
     cache_key = (
         "micro", state_E, weight_E, m, k, n, num_topk, max_rows, mac, topk_ids_dtype,
-        input_scales_are_reciprocal, fast_math,
+        input_scales_are_reciprocal, fast_math, _dynamic_amax_enabled(),
     )
     last_kkey, last_kval = _LAST_KERNEL
     if last_kkey == cache_key:
@@ -1268,6 +1288,7 @@ def _get_micro_kernel(
         output_tile_count_n=max(1, (n + 128 - 1) // 128),
         input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
+        dynamic_amax=_dynamic_amax_enabled(),
     )
 
     rows_pad_k = align_up(max_rows, 128)
@@ -1341,6 +1362,10 @@ def _get_micro_kernel(
     token_weights_fake = cute.runtime.make_fake_compact_tensor(
         alpha_dtype, (state_E, max_rows), stride_order=(1, 0), assumed_align=16,
     )
+    num_k_tiles = k // 128
+    tile_scales_fake = cute.runtime.make_fake_compact_tensor(
+        alpha_dtype, (state_E, num_k_tiles), stride_order=(1, 0), assumed_align=16,
+    )
     compiled = cute.compile(
         kernel,
         a_input_fake, topk_ids_fake, topk_weights_fake,
@@ -1352,6 +1377,7 @@ def _get_micro_kernel(
         row_counts_fake, active_expert_count_fake, weight_expert_ids_fake, global_to_local_expert_fake,
         input_gs_fake, alpha_fake, down_alpha_fake, global_scale_fake,
         scatter_fake, token_map_fake, token_weights_fake,
+        tile_scales_fake,
         mac, current_cuda_stream(),
     )
 
@@ -1410,6 +1436,7 @@ class _DynamicMoELaunch:
         scatter_ptr: cute.Pointer,
         token_map_ptr: cute.Pointer,
         token_weights_ptr: cute.Pointer,
+        tile_scales: cute.Tensor,
         num_tokens: cutlass.Int32,
         max_rows: cutlass.Int32,
         rows_padded: cutlass.Int32,
@@ -1463,7 +1490,7 @@ class _DynamicMoELaunch:
             b_down, sfb_down_ptr,
             row_counts, expert_write_rows, expert_tile_base,
             input_global_scale, alpha, down_alpha, global_scale,
-            scatter_output, token_map, token_weights_t,
+            scatter_output, token_map, token_weights_t, tile_scales,
             max_active_clusters=max_active_clusters,
             stream=stream,
         )
@@ -1488,7 +1515,7 @@ def _get_dynamic_kernel(
     global _LAST_KERNEL
     cache_key = (
         "dynamic", E, k, n, num_topk, mac, topk_ids_dtype,
-        input_scales_are_reciprocal, fast_math,
+        input_scales_are_reciprocal, fast_math, _dynamic_amax_enabled(),
     )
     last_kkey, last_kval = _LAST_KERNEL
     if last_kkey == cache_key:
@@ -1513,6 +1540,7 @@ def _get_dynamic_kernel(
         mma_tiler_mn=(_LEVEL_TILE_M, _LEVEL_TILE_N),
         input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
+        dynamic_amax=_dynamic_amax_enabled(),
     )
     launch = _DynamicMoELaunch(kernel, k=k, num_topk=num_topk)
 
@@ -1591,6 +1619,10 @@ def _get_dynamic_kernel(
     scatter_fake = make_ptr(a_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     token_map_fake = make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
     token_weights_fake = make_ptr(alpha_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+    num_k_tiles = k // 128
+    tile_scales_fake = cute.runtime.make_fake_compact_tensor(
+        alpha_dtype, (E, num_k_tiles), stride_order=(1, 0), assumed_align=16,
+    )
     compiled = cute.compile(
         launch,
         a_input_fake, topk_ids_fake, topk_weights_fake,
@@ -1607,6 +1639,7 @@ def _get_dynamic_kernel(
         row_counts_fake, expert_write_rows_fake, expert_tile_base_fake,
         input_gs_fake, alpha_fake, down_alpha_fake, global_scale_fake,
         scatter_fake, token_map_fake, token_weights_fake,
+        tile_scales_fake,
         1, 1, 1, 1, 1, mac, current_cuda_stream(),
     )
 
@@ -1675,6 +1708,7 @@ def _launch_dynamic(
         _gptr(cutlass.BFloat16, scatter_output),
         _gptr(cutlass.Int32, workspace.token_map, 4),
         _gptr(cutlass.Float32, workspace.token_weights, 4),
+        workspace.tile_scales,
         m, max_rows,
         workspace.physical_tiles_capacity * _LEVEL_TILE_M,
         workspace.task_capacity,
@@ -1741,7 +1775,7 @@ def _launch_compact_static(
             mac_override=static_mac,
         )
         launch_ids = flat_ids
-    compiled(
+    common_args = (
         a, launch_ids, flat_weights,
         workspace.packed_a_view, workspace.sfa_ptr,
         workspace.packed_a_flat, workspace.scale_flat,
@@ -1751,8 +1785,8 @@ def _launch_compact_static(
         workspace.row_counts, workspace.active_expert_count, workspace.weight_expert_ids, workspace.global_to_local_expert,
         input_gs, weights.w1_alpha, weights.w2_alpha, down_input_scale,
         scatter_output, workspace.token_map, workspace.token_weights,
-        mac, stream,
     )
+    compiled(*common_args, workspace.tile_scales, mac, stream)
 
 
 @torch._dynamo.disable
