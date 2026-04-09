@@ -217,8 +217,6 @@ def clear_tp_moe_caches() -> None:
     _STATIC_COMPACT_CUTOVER_PAIRS_CACHE = None
     _DYNAMIC_MULTICTA_CACHE = None
     _DYNAMIC_CHUNK_MULTIPLIER_CACHE = None
-    global _DYNAMIC_AMAX_CACHE
-    _DYNAMIC_AMAX_CACHE = None
     _LAST_WEIGHTS = (None, None)
     _LAST_KERNEL = (None, None)
 

@@ -356,27 +356,9 @@ def make_input_activations(
     seed: int,
     device: torch.device,
 ) -> torch.Tensor:
-    """Synthetic post-attention activations with realistic structure."""
     generator = torch.Generator(device="cpu")
     generator.manual_seed(seed)
-    num_heads = 16
-    head_dim = spec.hidden_size // num_heads
-    q = torch.randn(m, num_heads, head_dim, generator=generator, dtype=torch.float32)
-    k = torch.randn(m, num_heads, head_dim, generator=generator, dtype=torch.float32)
-    v = torch.randn(m, num_heads, head_dim, generator=generator, dtype=torch.float32)
-    logits = torch.einsum("thd,shd->hts", q, k) / (head_dim ** 0.5)
-    pos = torch.arange(m, dtype=torch.float32)
-    locality_bias = -0.18 * (pos[:, None] - pos[None, :]).abs()
-    head_bias = 0.35 * torch.randn(num_heads, 1, 1, generator=generator, dtype=torch.float32)
-    logits = logits + locality_bias.unsqueeze(0) + head_bias
-    spike_mask = torch.rand(num_heads, m, m, generator=generator, dtype=torch.float32) < 0.01
-    if spike_mask.any():
-        spike_mag = torch.exp(1.0 + 0.8 * torch.randn(num_heads, m, m, generator=generator, dtype=torch.float32))
-        logits = logits + spike_mask.to(torch.float32) * spike_mag
-    attn = torch.softmax(logits, dim=-1)
-    x = torch.einsum("hts,shd->thd", attn, v).reshape(m, spec.hidden_size)
-    row_rms = x.square().mean(dim=-1, keepdim=True).add_(1e-6).sqrt_()
-    x = x / row_rms
+    x = torch.randn(m, spec.hidden_size, generator=generator, dtype=torch.float32)
     return x.to(device=device, dtype=torch.bfloat16)
 
 

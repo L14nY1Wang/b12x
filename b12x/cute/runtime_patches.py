@@ -108,43 +108,12 @@ def _runtime_toolchain_key() -> tuple[object, ...]:
         except Exception:
             cutlass_version = ""
 
-    cuda_runtime_version = ""
-    cuda_driver_version = ""
-    try:
-        import torch
-        if torch.cuda.is_available():
-            cuda_runtime_version = str(torch.version.cuda or "")
-            cuda_driver_version = str(torch.cuda.get_device_properties(0).major) + "." + str(torch.cuda.get_device_properties(0).minor)
-    except Exception:
-        pass
-    try:
-        import cuda.bindings.runtime as crt
-        v = crt.cudaRuntimeGetVersion()
-        if isinstance(v, tuple):
-            cuda_runtime_version = str(v[1]) if len(v) > 1 else cuda_runtime_version
-        else:
-            cuda_runtime_version = str(v) if v else cuda_runtime_version
-    except Exception:
-        pass
-    try:
-        import cuda.bindings.driver as cdrv
-        cdrv.cuInit(0)
-        v = cdrv.cuDriverGetVersion()
-        if isinstance(v, tuple):
-            cuda_driver_version = str(v[1]) if len(v) > 1 else cuda_driver_version
-        else:
-            cuda_driver_version = str(v) if v else cuda_driver_version
-    except Exception:
-        pass
-
     return (
         ("python", sys.implementation.name, sys.version_info[:3]),
         ("torch", torch_version),
         ("torch_cuda", torch_cuda_version),
         ("cutlass_dsl", cutlass_version),
         ("cuda_bindings", _distribution_version("cuda-bindings")),
-        ("cuda_runtime", cuda_runtime_version),
-        ("cuda_driver", cuda_driver_version),
     )
 
 
@@ -357,8 +326,7 @@ def _build_compile_disk_cache_key(
     kwargs: dict[str, Any],
 ) -> str:
     payload = (
-        "b12x_cute_compile_cache_v3",
-        _distribution_version("b12x"),
+        "b12x_cute_compile_cache_v2",
         _normalize_compile_target(func, set()),
         _b12x_package_fingerprint(),
         _runtime_toolchain_key(),

@@ -100,7 +100,6 @@ from b12x.cute.fp4 import (
     atomic_add_global_i32,
     fabs_f32,
     fmax_f32,
-    fmin_f32,
     rcp_approx_ftz,
     warp_reduce,
     quantize_block_fp4,
@@ -655,7 +654,7 @@ class MoEMicroKernel:
 
         @cute.struct
         class Storage:
-            ctrl: cute.struct.MemRange[cutlass.Int32, 3]
+            ctrl: cute.struct.MemRange[cutlass.Int32, 8]
             pipeline_array: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
             up_pipeline_array: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
             phase2_pipeline_array: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
@@ -689,7 +688,6 @@ class MoEMicroKernel:
                 cute.struct.MemRange[cutlass.BFloat16, cute.cosize(epi_smem_staged)],
                 self.buffer_align_bytes,
             ]
-            reduce_scratch: cute.struct.MemRange[cutlass.Float32, 5]
 
         storage = smem.allocate(Storage)
 
@@ -740,7 +738,6 @@ class MoEMicroKernel:
         )
         sfa_base_addr = shared_ptr_to_u32(storage.sSFA.data_ptr())
         ctrl_base_addr = shared_ptr_to_u32(storage.ctrl.data_ptr())
-        reduce_scratch_addr = shared_ptr_to_u32(storage.reduce_scratch.data_ptr())
         scatter_tok_base_addr = shared_ptr_to_u32(storage.scatter_tok_cache.data_ptr())
         scatter_weight_base_addr = shared_ptr_to_u32(storage.scatter_weight_cache.data_ptr())
 
@@ -784,18 +781,33 @@ class MoEMicroKernel:
         )
 
         if const_expr(self.dynamic_amax):
+            # Phase 1a: zero tile_scales, route + atomicMax.
             k_tiles_per_row = cols // Int32(128)
+            ts_total = num_experts * k_tiles_per_row
+            i = flat_tid
+            while i < ts_total:
+                st_global_i32(get_ptr_as_int64(tile_scales, i), Int32(0))
+                i += flat_stride
 
-            # Phase 1a: route only (no a_input reads, no atomicMax).
             pair_idx = Int32(bidz)
             while pair_idx < total_pairs:
+                token_idx = Int32(0)
+                weight = cutlass.Float32(0.0)
+                if all_rows_unique == Int32(0):
+                    token_idx = pair_idx // num_topk
+                    weight = topk_weights[pair_idx].to(cutlass.Float32)
+
+                expert_id = Int32(0)
+                local_expert_id = Int32(0)
+                row = Int32(0)
                 if all_rows_unique > Int32(0):
-                    pass
+                    local_expert_id = pair_idx
+                    expert_id = weight_expert_ids[local_expert_id].to(Int32)
+                    token_idx = local_expert_id // num_topk
                 else:
                     if is_cta_leader > Int32(0):
-                        token_idx = pair_idx // num_topk
-                        weight = topk_weights[pair_idx].to(cutlass.Float32)
                         local_expert_id = topk_ids[pair_idx].to(Int32)
+                        expert_id = weight_expert_ids[local_expert_id].to(Int32)
                         row = atomic_add_global_i32(
                             get_ptr_as_int64(row_counts, local_expert_id),
                             Int32(1),
@@ -803,109 +815,95 @@ class MoEMicroKernel:
                         map_idx = local_expert_id * max_rows + row
                         st_global_i32(get_ptr_as_int64(token_map, map_idx), token_idx)
                         st_global_f32(get_ptr_as_int64(token_weights, map_idx), weight)
+                        _st_shared_i32(ctrl_base_addr + Int32(0), local_expert_id)
+                        _st_shared_i32(ctrl_base_addr + Int32(4), token_idx)
+                    cute.arch.sync_threads()
+                    local_expert_id = _ld_shared_i32(ctrl_base_addr + Int32(0))
+                    token_idx = _ld_shared_i32(ctrl_base_addr + Int32(4))
+
+                # All threads compute per-SF-block max and atomicMax to tile_scales.
+                sf_idx = Int32(tidx)
+                while sf_idx < sf_blocks_per_row:
+                    block_start = sf_idx * Int32(16)
+                    block_max = cutlass.Float32(0.0)
+                    for elem_idx in cutlass.range_constexpr(16):
+                        value = cutlass.Float32(a_input[token_idx, block_start + Int32(elem_idx)])
+                        block_max = fmax_f32(block_max, fabs_f32(value))
+                    k_tile_of_sf = sf_idx // Int32(4)
+                    ts_addr = get_ptr_as_int64(tile_scales, local_expert_id * k_tiles_per_row + k_tile_of_sf)
+                    _atomic_max_global_f32(ts_addr, block_max)
+                    sf_idx += Int32(self.threads_per_cta)
+
+                if all_rows_unique == Int32(0):
+                    cute.arch.sync_threads()
                 pair_idx += Int32(gdim_z)
 
             self._resident_grid_barrier(
                 barrier_count, barrier_epoch, Int32(gdim_z), is_cta_leader,
             )
 
-            # Phase 1b: scan tile max + quantize per (expert, k_tile).
+            # Phase 1b: tile-based quantize from pre-computed maxes.
             num_active = active_expert_count[Int32(0)].to(Int32)
             total_quant_tiles = num_active * k_tiles_per_row
-            tile_gs = cutlass.Float32(0.0)
-            tile_max = cutlass.Float32(0.0)
             qt_idx = Int32(bidz)
             while qt_idx < total_quant_tiles:
                 qt_expert = qt_idx // k_tiles_per_row
                 qt_k_tile = qt_idx % k_tiles_per_row
+                tile_max = tile_scales[qt_expert, qt_k_tile].to(cutlass.Float32)
+                tile_gs = tile_max * cutlass.Float32(_FC2_TILE_AMAX_GS_RCP)
+                if tile_gs == cutlass.Float32(0.0):
+                    tile_gs = cutlass.Float32(1.0)
+                st_global_f32(
+                    get_ptr_as_int64(tile_scales, qt_expert * k_tiles_per_row + qt_k_tile),
+                    tile_gs,
+                )
                 qt_row_count = row_counts[qt_expert].to(Int32)
-                k_col_base = qt_k_tile * Int32(128)
-                tile_sf_total = qt_row_count * Int32(8)
-
-                # Compute tile-wide max via scan + warp reduce + smem broadcast.
-                thread_max = cutlass.Float32(0.0)
-                blk = Int32(tidx)
-                while blk < tile_sf_total:
-                    r = blk // Int32(8)
-                    sf_in_tile = blk % Int32(8)
-                    tok = token_map[qt_expert, r].to(Int32)
-                    c0 = k_col_base + sf_in_tile * Int32(16)
-                    for e in cutlass.range_constexpr(16):
-                        v = cutlass.Float32(a_input[tok, c0 + Int32(e)])
-                        thread_max = fmax_f32(thread_max, fabs_f32(v))
-                    blk += Int32(self.threads_per_cta)
-                warp_max = warp_reduce(thread_max, fmax_f32)
-                lane_id = Int32(tidx) & Int32(31)
-                warp_id_local = Int32(tidx) // Int32(32)
-                if lane_id == Int32(0):
-                    _st_shared_f32(reduce_scratch_addr + warp_id_local * Int32(4), warp_max)
-                cute.arch.sync_threads()
-                if warp_id_local == 0:
-                    tile_max = cutlass.Float32(0.0)
-                    if lane_id < Int32(5):
-                        tile_max = _ld_shared_f32(reduce_scratch_addr + lane_id * Int32(4))
-                    tile_max = warp_reduce(tile_max, fmax_f32)
-                    if lane_id == Int32(0):
-                        _st_shared_f32(reduce_scratch_addr, tile_max)
-                cute.arch.sync_threads()
-                tile_max = _ld_shared_f32(reduce_scratch_addr)
-                tile_gs = tile_max * rcp_approx_ftz(cutlass.Float32(6.0 * 448.0))
-                tile_gs = fmax_f32(tile_gs, cutlass.Float32(1.0e-12))
-                calib_gs = input_global_scale[weight_expert_ids[qt_expert]].to(cutlass.Float32)
-                if const_expr(self.input_scales_are_reciprocal):
-                    if calib_gs != cutlass.Float32(0.0):
-                        calib_gs = rcp_approx_ftz(calib_gs)
-                tile_gs = fmin_f32(tile_gs, calib_gs)
-                if Int32(tidx) == Int32(0):
-                    st_global_f32(
-                        get_ptr_as_int64(tile_scales, qt_expert * k_tiles_per_row + qt_k_tile),
-                        tile_gs,
-                    )
-
-                # Quantize all SF blocks in this tile.
-                blk = Int32(tidx)
-                while blk < tile_sf_total:
-                    r_idx = blk // Int32(8)
-                    sf_in_tile = blk % Int32(8)
+                sf_base = qt_k_tile * Int32(4)
+                sf_end = sf_base + Int32(4)
+                if sf_end > sf_blocks_per_row:
+                    sf_end = sf_blocks_per_row
+                r_idx = Int32(tidx)
+                while r_idx < qt_row_count:
                     tok = token_map[qt_expert, r_idx].to(Int32)
-                    sf_idx = qt_k_tile * Int32(8) + sf_in_tile
-                    block_start = k_col_base + sf_in_tile * Int32(16)
-                    values = cute.make_rmem_tensor((16,), cutlass.Float32)
-                    block_max = cutlass.Float32(0.0)
-                    for elem_idx in cutlass.range_constexpr(16):
-                        value = cutlass.Float32(a_input[tok, block_start + Int32(elem_idx)])
-                        values[elem_idx] = value
-                        block_max = fmax_f32(block_max, fabs_f32(value))
-                    packed64 = Uint64(0)
-                    scale_byte = Uint8(0)
-                    if const_expr(self.fast_math):
-                        packed64, scale_byte = quantize_block_fp4_fast(values, block_max, tile_gs)
-                    else:
-                        packed64, scale_byte = quantize_block_fp4(values, block_max, tile_gs)
+                    sf_idx = sf_base
+                    while sf_idx < sf_end:
+                        block_start = sf_idx * Int32(16)
+                        values = cute.make_rmem_tensor((16,), cutlass.Float32)
+                        block_max = cutlass.Float32(0.0)
+                        for elem_idx in cutlass.range_constexpr(16):
+                            value = cutlass.Float32(a_input[tok, block_start + Int32(elem_idx)])
+                            values[elem_idx] = value
+                            block_max = fmax_f32(block_max, fabs_f32(value))
+                        packed64 = Uint64(0)
+                        scale_byte = Uint8(0)
+                        if const_expr(self.fast_math):
+                            packed64, scale_byte = quantize_block_fp4_fast(values, block_max, tile_gs)
+                        else:
+                            packed64, scale_byte = quantize_block_fp4(values, block_max, tile_gs)
 
-                    output_offset = (
-                        qt_expert * max_rows * output_bytes_per_row
-                        + r_idx * output_bytes_per_row
-                        + sf_idx * Int32(8)
-                    )
-                    st_global_u64(get_ptr_as_int64(packed_a_storage, output_offset), packed64)
+                        output_offset = (
+                            qt_expert * max_rows * output_bytes_per_row
+                            + r_idx * output_bytes_per_row
+                            + sf_idx * Int32(8)
+                        )
+                        st_global_u64(get_ptr_as_int64(packed_a_storage, output_offset), packed64)
 
-                    m_tile_idx = r_idx // Int32(32 * 4)
-                    k_tile_idx = sf_idx // Int32(4)
-                    outer_m_idx = r_idx % Int32(32)
-                    inner_m_idx = (r_idx % Int32(32 * 4)) // Int32(32)
-                    inner_k_idx = sf_idx % Int32(4)
-                    scale_offset = (
-                        qt_expert * expert_scale_stride
-                        + m_tile_idx * num_k_tiles * Int32(32 * 4 * 4)
-                        + k_tile_idx * Int32(32 * 4 * 4)
-                        + outer_m_idx * Int32(4 * 4)
-                        + inner_m_idx * Int32(4)
-                        + inner_k_idx
-                    )
-                    scale_storage[scale_offset] = scale_byte
-                    blk += Int32(self.threads_per_cta)
-                cute.arch.sync_threads()
+                        m_tile_idx = r_idx // Int32(32 * 4)
+                        k_tile_idx = sf_idx // Int32(4)
+                        outer_m_idx = r_idx % Int32(32)
+                        inner_m_idx = (r_idx % Int32(32 * 4)) // Int32(32)
+                        inner_k_idx = sf_idx % Int32(4)
+                        scale_offset = (
+                            qt_expert * expert_scale_stride
+                            + m_tile_idx * num_k_tiles * Int32(32 * 4 * 4)
+                            + k_tile_idx * Int32(32 * 4 * 4)
+                            + outer_m_idx * Int32(4 * 4)
+                            + inner_m_idx * Int32(4)
+                            + inner_k_idx
+                        )
+                        scale_storage[scale_offset] = scale_byte
+                        sf_idx += Int32(1)
+                    r_idx += Int32(self.threads_per_cta)
                 qt_idx += Int32(gdim_z)
 
             self._resident_grid_barrier(
@@ -926,7 +924,6 @@ class MoEMicroKernel:
                 if all_rows_unique > Int32(0):
                     local_expert_id = pair_idx
                     expert_id = weight_expert_ids[local_expert_id].to(Int32)
-                    token_idx = local_expert_id // num_topk
                 else:
                     if is_cta_leader > Int32(0):
                         local_expert_id = topk_ids[pair_idx].to(Int32)
@@ -1252,6 +1249,17 @@ class MoEMicroKernel:
                     for k_block_idx in cutlass.range_constexpr(num_k_blocks):
                         k_next = 0 if k_block_idx + 1 == num_k_blocks else k_block_idx + 1
                         if k_block_idx == num_k_blocks - 1:
+                            if const_expr(self.dynamic_amax):
+                                tgs = tile_scales[local_expert_idx, gate_k_tile_idx].to(cutlass.Float32)
+                                for _mt in range(self.num_m_tiles):
+                                    for _nt in range(self.num_n_tiles):
+                                        for _i in cutlass.range_constexpr(cute.size(gate_acc[None, 0, 0])):
+                                            gate_scaled_acc[None, _mt, _nt][_i] = (
+                                                gate_scaled_acc[None, _mt, _nt][_i]
+                                                + gate_acc[None, _mt, _nt][_i] * tgs
+                                            )
+                                            gate_acc[None, _mt, _nt][_i] = cutlass.Float32(0.0)
+                                gate_k_tile_idx += Int32(1)
                             ml_pipeline.consumer_release(cons_state)
                             cons_state.advance()
                             peek = ml_pipeline.consumer_try_wait(cons_state)
@@ -1279,18 +1287,6 @@ class MoEMicroKernel:
                         fz_csSFB_cur = cute.filter_zeros(csSFB[None, None, None, cons_state.index])
                         cute.copy(smem_copy_SFA, fz_csSFA_cur[None, None, k_next], fz_crSFA[None, None, k_next])
                         cute.copy(smem_copy_SFB, fz_csSFB_cur[None, None, k_next], fz_crSFB[None, None, k_next])
-                        if k_block_idx == num_k_blocks - 1:
-                            if const_expr(self.dynamic_amax):
-                                tgs = tile_scales[local_expert_idx, gate_k_tile_idx].to(cutlass.Float32)
-                                for _mt in range(self.num_m_tiles):
-                                    for _nt in range(self.num_n_tiles):
-                                        for _i in cutlass.range_constexpr(cute.size(gate_acc[None, 0, 0])):
-                                            gate_scaled_acc[None, _mt, _nt][_i] = (
-                                                gate_scaled_acc[None, _mt, _nt][_i]
-                                                + gate_acc[None, _mt, _nt][_i] * tgs
-                                            )
-                                            gate_acc[None, _mt, _nt][_i] = cutlass.Float32(0.0)
-                                gate_k_tile_idx += Int32(1)
                 for k_block_idx in cutlass.range_constexpr(num_k_blocks):
                     k_next = 0 if k_block_idx + 1 == num_k_blocks else k_block_idx + 1
                     if k_block_idx == num_k_blocks - 1:
@@ -1350,6 +1346,17 @@ class MoEMicroKernel:
                     for k_block_idx in cutlass.range_constexpr(num_k_blocks):
                         k_next = 0 if k_block_idx + 1 == num_k_blocks else k_block_idx + 1
                         if k_block_idx == num_k_blocks - 1:
+                            if const_expr(self.dynamic_amax):
+                                tgs = tile_scales[local_expert_idx, up_k_tile_idx].to(cutlass.Float32)
+                                for _mt in range(self.num_m_tiles):
+                                    for _nt in range(self.num_n_tiles):
+                                        for _i in cutlass.range_constexpr(cute.size(up_acc[None, 0, 0])):
+                                            up_scaled_acc[None, _mt, _nt][_i] = (
+                                                up_scaled_acc[None, _mt, _nt][_i]
+                                                + up_acc[None, _mt, _nt][_i] * tgs
+                                            )
+                                            up_acc[None, _mt, _nt][_i] = cutlass.Float32(0.0)
+                                up_k_tile_idx += Int32(1)
                             up_pipeline.consumer_release(up_cons_state)
                             up_cons_state.advance()
                             peek = up_pipeline.consumer_try_wait(up_cons_state)
@@ -1375,18 +1382,6 @@ class MoEMicroKernel:
                         cute.copy(smem_copy_B, csB_p[None, None, k_next], crB[None, None, k_next])
                         cute.copy(smem_copy_SFA, fz_csSFA_p[None, None, k_next], fz_crSFA[None, None, k_next])
                         cute.copy(smem_copy_SFB, fz_csSFB_p[None, None, k_next], fz_crSFB[None, None, k_next])
-                        if k_block_idx == num_k_blocks - 1:
-                            if const_expr(self.dynamic_amax):
-                                tgs = tile_scales[local_expert_idx, up_k_tile_idx].to(cutlass.Float32)
-                                for _mt in range(self.num_m_tiles):
-                                    for _nt in range(self.num_n_tiles):
-                                        for _i in cutlass.range_constexpr(cute.size(up_acc[None, 0, 0])):
-                                            up_scaled_acc[None, _mt, _nt][_i] = (
-                                                up_scaled_acc[None, _mt, _nt][_i]
-                                                + up_acc[None, _mt, _nt][_i] * tgs
-                                            )
-                                            up_acc[None, _mt, _nt][_i] = cutlass.Float32(0.0)
-                                up_k_tile_idx += Int32(1)
                 for k_block_idx in cutlass.range_constexpr(num_k_blocks):
                     k_next = 0 if k_block_idx + 1 == num_k_blocks else k_block_idx + 1
                     if k_block_idx == num_k_blocks - 1:
@@ -1484,23 +1479,10 @@ class MoEMicroKernel:
                                     cutlass.Float32(sC[sr, sc, silu_epi_buffer])
                                 ))
                                 scan_idx += Int32(self.num_mma_warps * self.num_threads_per_warp)
-                            warp_amax = warp_reduce(local_max, fmax_f32)
-                            lane_id = Int32(tidx) & Int32(31)
-                            if lane_id == Int32(0):
-                                _st_shared_f32(reduce_scratch_addr + warp_idx * Int32(4), warp_amax)
-                            self.epilog_sync_barrier.arrive_and_wait()
-                            if warp_idx == 0:
-                                tile_amax = cutlass.Float32(0.0)
-                                if lane_id < Int32(self.num_mma_warps):
-                                    tile_amax = _ld_shared_f32(reduce_scratch_addr + lane_id * Int32(4))
-                                tile_amax = warp_reduce(tile_amax, fmax_f32)
-                                if lane_id == Int32(0):
-                                    _st_shared_f32(reduce_scratch_addr, tile_amax)
-                            self.epilog_sync_barrier.arrive_and_wait()
-                            tile_amax = _ld_shared_f32(reduce_scratch_addr)
+                            tile_amax = warp_reduce(local_max, ctrl_base_addr, Int32(self.num_mma_warps))
                             tile_gs_value = tile_amax * cutlass.Float32(_FC2_TILE_AMAX_GS_RCP)
-                            tile_gs_value = fmax_f32(tile_gs_value, cutlass.Float32(1.0e-12))
-                            tile_gs_value = fmin_f32(tile_gs_value, gs_value)
+                            if tile_gs_value == cutlass.Float32(0.0):
+                                tile_gs_value = cutlass.Float32(1.0)
                             if gs_value != cutlass.Float32(0.0):
                                 fc2_down_alpha_value = down_alpha_value * (tile_gs_value / gs_value)
                             quant_gs_value = tile_gs_value
