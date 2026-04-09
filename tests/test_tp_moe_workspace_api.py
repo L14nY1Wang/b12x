@@ -11,7 +11,7 @@ from b12x.integration.tp_moe import (
     b12x_moe_fp4,
     clear_tp_moe_caches,
 )
-from b12x.moe.fused.reference import compare_to_reference
+from b12x.moe.fused.reference import compare_to_reference, moe_reference_nvfp4
 
 from .helpers import require_sm120
 
@@ -32,8 +32,106 @@ def _make_spec() -> ModelSpec:
     )
 
 
+def _make_top1_spec() -> ModelSpec:
+    return ModelSpec(
+        hidden_size=4096,
+        intermediate_size=1024,
+        num_experts=512,
+        top_k=1,
+        tp_size=TP_SIZE,
+        tp_rank=TP_RANK,
+    )
+
+
 def _dynamic_token_count(spec: ModelSpec) -> int:
     return (tp_moe._get_static_compact_cutover_pairs() // spec.top_k) + 1
+
+
+def _assert_oracle_match(metrics, *, label: str, max_abs: float = 2e-3, min_cos: float = 0.98) -> None:
+    assert metrics.max_abs <= max_abs, f"{label}: max_abs={metrics.max_abs:.6f}"
+    assert metrics.cos > min_cos, f"{label}: cos={metrics.cos:.6f}"
+
+
+def _run_single_expert_case(
+    *,
+    spec: ModelSpec,
+    weights,
+    m: int,
+    device: torch.device,
+    force_dynamic: bool = False,
+) -> tuple[tp_moe.TPMoEWorkspace, dict[str, int], object]:
+    torch.manual_seed(m * 100)
+    x = torch.randn((m, spec.hidden_size), device=device, dtype=torch.bfloat16)
+    topk_ids = torch.zeros((m, spec.top_k), device=device, dtype=torch.int32)
+    topk_weights = torch.ones((m, spec.top_k), device=device, dtype=torch.float32)
+
+    kernel_counts = {"static": 0, "micro": 0}
+    orig_select = tp_moe.select_tp_moe_backend
+    orig_static = tp_moe._get_static_kernel
+    orig_micro = tp_moe._get_micro_kernel
+
+    def _count_static(*args, **kwargs):
+        kernel_counts["static"] += 1
+        return orig_static(*args, **kwargs)
+
+    def _count_micro(*args, **kwargs):
+        kernel_counts["micro"] += 1
+        return orig_micro(*args, **kwargs)
+
+    tp_moe._get_static_kernel = _count_static
+    tp_moe._get_micro_kernel = _count_micro
+    if force_dynamic:
+        tp_moe.select_tp_moe_backend = lambda **_kwargs: "dynamic"
+
+    try:
+        workspace = allocate_tp_moe_workspace(
+            x,
+            weights.w13_input_scale_per_expert,
+            weights.w13_weight,
+            weights.w2_input_scale_per_expert,
+            weights.w2_weight,
+            topk_ids,
+            input_scales_static=True,
+        )
+        actual = b12x_moe_fp4(
+            x,
+            weights.w13_input_scale_per_expert,
+            weights.w13_weight,
+            weights.w13_blockscale_swizzled,
+            weights.g1_alphas_per_expert,
+            weights.w2_input_scale_per_expert,
+            weights.w2_weight,
+            weights.w2_blockscale_swizzled,
+            weights.g2_alphas_per_expert,
+            topk_weights,
+            topk_ids,
+            workspace=workspace,
+            input_scales_static=True,
+        )
+        torch.cuda.synchronize(device)
+    finally:
+        tp_moe.select_tp_moe_backend = orig_select
+        tp_moe._get_static_kernel = orig_static
+        tp_moe._get_micro_kernel = orig_micro
+
+    reference = moe_reference_nvfp4(
+        x,
+        weights.w13_weight,
+        weights.w13_blockscale_swizzled,
+        weights.g1_alphas_per_expert,
+        weights.w2_weight,
+        weights.w2_blockscale_swizzled,
+        weights.g2_alphas_per_expert,
+        weights.w13_input_scale_per_expert,
+        weights.w2_input_scale_per_expert,
+        topk_ids,
+        topk_weights,
+        spec.num_experts,
+        spec.hidden_size,
+        spec.I_tp,
+    )
+    metrics = compare_to_reference(actual, reference)
+    return workspace, kernel_counts, metrics
 
 
 def test_workspace_pool_handles_chunked_calls(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -421,6 +519,225 @@ def test_dynamic_workspace_uses_compact_storage() -> None:
     assert tuple(workspace.tile_write_count.shape) == (max_phys_tiles,)
     assert tuple(workspace.task_ready.shape) == (max_tasks,)
     assert tp_moe.select_tp_moe_backend(num_tokens=x.shape[0], num_topk=spec.top_k) == "dynamic"
+
+
+@pytest.mark.parametrize(
+    "m",
+    [
+        33,
+        64,
+        pytest.param(
+            65,
+            marks=pytest.mark.xfail(
+                strict=False,
+                reason="reverted compact static top-1 path is incorrect beyond m=64",
+            ),
+        ),
+        pytest.param(
+            96,
+            marks=pytest.mark.xfail(
+                strict=False,
+                reason="reverted compact static top-1 path is incorrect beyond m=64",
+            ),
+        ),
+        pytest.param(
+            127,
+            marks=pytest.mark.xfail(
+                strict=False,
+                reason="reverted compact static top-1 path is incorrect beyond m=64",
+            ),
+        ),
+    ],
+)
+def test_static_single_expert_edge_sizes_match_oracle(m: int) -> None:
+    require_sm120()
+    _require_model_weights()
+
+    clear_tp_moe_caches()
+
+    device = torch.device("cuda")
+    spec = _make_top1_spec()
+    weights = load_expert_weights(MODEL_PATH, spec, layer_idx=0)
+
+    workspace, kernel_counts, metrics = _run_single_expert_case(
+        spec=spec,
+        weights=weights,
+        m=m,
+        device=device,
+    )
+    assert isinstance(workspace, tp_moe.TPCompactStaticWorkspace)
+    assert kernel_counts["static"] > 0
+    assert kernel_counts["micro"] == 0
+    _assert_oracle_match(metrics, label=f"static edge size m={m}")
+
+
+def test_micro_uniform10_edge_sizes_match_oracle() -> None:
+    require_sm120()
+    _require_model_weights()
+
+    clear_tp_moe_caches()
+
+    device = torch.device("cuda")
+    spec = _make_spec()
+    weights = load_expert_weights(MODEL_PATH, spec, layer_idx=0)
+
+    for m in (1, 2):
+        x, _topk_ids, _topk_weights = make_routed_inputs(spec, m, seed=1701 + m, device=device)
+        topk_ids = torch.arange(spec.top_k, dtype=torch.int32, device=device).expand(m, -1).contiguous()
+        topk_weights = torch.full((m, spec.top_k), 1.0 / spec.top_k, dtype=torch.float32, device=device)
+
+        kernel_counts = {"static": 0, "micro": 0}
+        orig_static = tp_moe._get_static_kernel
+        orig_micro = tp_moe._get_micro_kernel
+
+        def _count_static(*args, **kwargs):
+            kernel_counts["static"] += 1
+            return orig_static(*args, **kwargs)
+
+        def _count_micro(*args, **kwargs):
+            kernel_counts["micro"] += 1
+            return orig_micro(*args, **kwargs)
+
+        tp_moe._get_static_kernel = _count_static
+        tp_moe._get_micro_kernel = _count_micro
+        try:
+            workspace = allocate_tp_moe_workspace(
+                x,
+                weights.w13_input_scale_per_expert,
+                weights.w13_weight,
+                weights.w2_input_scale_per_expert,
+                weights.w2_weight,
+                topk_ids,
+                input_scales_static=True,
+            )
+            actual = b12x_moe_fp4(
+                x,
+                weights.w13_input_scale_per_expert,
+                weights.w13_weight,
+                weights.w13_blockscale_swizzled,
+                weights.g1_alphas_per_expert,
+                weights.w2_input_scale_per_expert,
+                weights.w2_weight,
+                weights.w2_blockscale_swizzled,
+                weights.g2_alphas_per_expert,
+                topk_weights,
+                topk_ids,
+                workspace=workspace,
+                input_scales_static=True,
+            )
+            torch.cuda.synchronize(device)
+        finally:
+            tp_moe._get_static_kernel = orig_static
+            tp_moe._get_micro_kernel = orig_micro
+
+        reference = moe_reference_nvfp4(
+            x,
+            weights.w13_weight,
+            weights.w13_blockscale_swizzled,
+            weights.g1_alphas_per_expert,
+            weights.w2_weight,
+            weights.w2_blockscale_swizzled,
+            weights.g2_alphas_per_expert,
+            weights.w13_input_scale_per_expert,
+            weights.w2_input_scale_per_expert,
+            topk_ids,
+            topk_weights,
+            spec.num_experts,
+            spec.hidden_size,
+            spec.I_tp,
+        )
+        metrics = compare_to_reference(actual, reference)
+        assert isinstance(workspace, tp_moe.TPCompactStaticWorkspace)
+        assert kernel_counts["micro"] > 0
+        assert kernel_counts["static"] == 0
+        _assert_oracle_match(metrics, label=f"micro edge size m={m}", min_cos=0.99)
+
+
+@pytest.mark.parametrize("m", [65, 96, 127])
+def test_dynamic_uniform10_edge_sizes_match_oracle(m: int) -> None:
+    require_sm120()
+    _require_model_weights()
+
+    clear_tp_moe_caches()
+
+    device = torch.device("cuda")
+    spec = _make_spec()
+    weights = load_expert_weights(MODEL_PATH, spec, layer_idx=0)
+
+    x, _topk_ids, _topk_weights = make_routed_inputs(spec, m, seed=1701, device=device)
+    topk_ids = torch.arange(spec.top_k, dtype=torch.int32, device=device).expand(m, -1).contiguous()
+    topk_weights = torch.full((m, spec.top_k), 1.0 / spec.top_k, dtype=torch.float32, device=device)
+
+    workspace = allocate_tp_moe_workspace(
+        x,
+        weights.w13_input_scale_per_expert,
+        weights.w13_weight,
+        weights.w2_input_scale_per_expert,
+        weights.w2_weight,
+        topk_ids,
+        input_scales_static=True,
+    )
+    assert isinstance(workspace, tp_moe.TPDynamicWorkspace)
+
+    actual = b12x_moe_fp4(
+        x,
+        weights.w13_input_scale_per_expert,
+        weights.w13_weight,
+        weights.w13_blockscale_swizzled,
+        weights.g1_alphas_per_expert,
+        weights.w2_input_scale_per_expert,
+        weights.w2_weight,
+        weights.w2_blockscale_swizzled,
+        weights.g2_alphas_per_expert,
+        topk_weights,
+        topk_ids,
+        workspace=workspace,
+        input_scales_static=True,
+    )
+    torch.cuda.synchronize(device)
+
+    reference = moe_reference_nvfp4(
+        x,
+        weights.w13_weight,
+        weights.w13_blockscale_swizzled,
+        weights.g1_alphas_per_expert,
+        weights.w2_weight,
+        weights.w2_blockscale_swizzled,
+        weights.g2_alphas_per_expert,
+        weights.w13_input_scale_per_expert,
+        weights.w2_input_scale_per_expert,
+        topk_ids,
+        topk_weights,
+        spec.num_experts,
+        spec.hidden_size,
+        spec.I_tp,
+    )
+    metrics = compare_to_reference(actual, reference)
+    _assert_oracle_match(metrics, label=f"dynamic edge size m={m}", min_cos=0.99)
+
+
+def test_forced_dynamic_single_expert_edge_sizes_match_oracle() -> None:
+    require_sm120()
+    _require_model_weights()
+
+    clear_tp_moe_caches()
+
+    device = torch.device("cuda")
+    spec = _make_top1_spec()
+    weights = load_expert_weights(MODEL_PATH, spec, layer_idx=0)
+
+    for m in (33, 64, 65, 96, 127):
+        workspace, kernel_counts, metrics = _run_single_expert_case(
+            spec=spec,
+            weights=weights,
+            m=m,
+            device=device,
+            force_dynamic=True,
+        )
+        assert isinstance(workspace, tp_moe.TPDynamicWorkspace)
+        assert kernel_counts["static"] == 0
+        assert kernel_counts["micro"] == 0
+        _assert_oracle_match(metrics, label=f"forced dynamic edge size m={m}")
 
 
 def test_dynamic_workspace_pool_uses_eager_routing_geometry() -> None:
