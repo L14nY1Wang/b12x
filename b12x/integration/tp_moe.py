@@ -1115,9 +1115,10 @@ def _get_static_kernel(
 ):
     sf_vec_size = 16
     mac = mac_override if mac_override is not None else _get_impl_mac("static")
+    routed_rows = m * num_topk
     mma_tiler_mn = (128, 128)
     if num_topk > 1:
-        mma_tiler_mn = _select_micro_mma_tiler_mn(max_rows, n)
+        mma_tiler_mn = _select_micro_mma_tiler_mn(routed_rows, n)
 
     global _LAST_KERNEL
     cache_key = (
@@ -1256,7 +1257,8 @@ def _get_micro_kernel(
 ):
     sf_vec_size = 16
     mac = mac_override if mac_override is not None else _get_impl_mac("micro")
-    mma_tiler_mn = _select_micro_mma_tiler_mn(max_rows, n)
+    routed_rows = m * num_topk
+    mma_tiler_mn = _select_micro_mma_tiler_mn(routed_rows, n)
 
     global _LAST_KERNEL
     cache_key = (
