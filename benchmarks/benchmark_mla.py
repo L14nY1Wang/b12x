@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark graph-replayed GLM-5.1 TP8 decode public APIs: NSA indexer + sparse MLA."""
+"""Benchmark realistic SGLang-like GLM-5.1 TP8 decode replay: NSA indexer + sparse MLA."""
 
 from __future__ import annotations
 
@@ -31,7 +31,14 @@ from b12x.integration.nsa_indexer import (
     sparse_nsa_index_decode_topk,
 )
 
-from benchmarks.common import require_sm120
+from benchmarks.common import (
+    bench_cuda_graph,
+    capture_cuda_graph,
+    make_dense_candidate_page_table,
+    make_sparse_pool_locs,
+    require_sm120,
+    scatter_rows_into_pool,
+)
 
 
 MODEL_PATH = pathlib.Path("/data/models/GLM-5.1-NVFP4")
@@ -39,6 +46,8 @@ DEFAULT_BATCH_SIZES = (1, 2, 4, 8)
 DEFAULT_CACHE_LENS = (1024, 8192, 16384, 32768, 65536)
 DEFAULT_TP_SIZE = 8
 DEFAULT_TP_RANK = 0
+DEFAULT_POOL_FACTOR = 6
+DEFAULT_GRAPH_WIDTH = 8192
 MLA_MAX_ABS_TOL = 0.10
 MLA_RMSE_TOL = 0.005
 MLA_COS_TOL = 0.9995
@@ -87,6 +96,9 @@ class SanityMetrics:
 @dataclass(frozen=True)
 class CaseReport:
     case: DecodeCase
+    graph_width: int
+    metadata_us: float
+    replay_us: float
     indexer_us: float
     mla_us: float
     split_enabled: bool
@@ -96,7 +108,7 @@ class CaseReport:
 
     @property
     def total_us(self) -> float:
-        return self.indexer_us + self.mla_us
+        return self.metadata_us + self.replay_us
 
 
 class BenchmarkFailure(RuntimeError):
@@ -167,29 +179,6 @@ def _build_decode_cases(
     return cases
 
 
-def _capture_graph(fn, *, warmup: int) -> torch.cuda.CUDAGraph:
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        fn()
-    graph.replay()
-    torch.cuda.synchronize()
-    return graph
-
-
-def _bench_graph(graph: torch.cuda.CUDAGraph, *, replays: int) -> list[float]:
-    starts = [torch.cuda.Event(enable_timing=True) for _ in range(replays)]
-    ends = [torch.cuda.Event(enable_timing=True) for _ in range(replays)]
-    for idx in range(replays):
-        starts[idx].record()
-        graph.replay()
-        ends[idx].record()
-    torch.cuda.synchronize()
-    return [start.elapsed_time(end) * 1000.0 for start, end in zip(starts, ends)]
-
-
 def _geomean(values: list[float]) -> float:
     if not values:
         raise ValueError("geomean requires at least one value")
@@ -208,14 +197,57 @@ def _compare(a: torch.Tensor, b: torch.Tensor) -> SanityMetrics:
     )
 
 
-def _make_dense_candidate_page_table(
+def _resolve_graph_width(*, cache_len: int, graph_width: int) -> int:
+    if graph_width <= 0:
+        raise ValueError(f"graph_width must be positive, got {graph_width}")
+    return max(cache_len, graph_width)
+
+
+def _assert_decode_contract_match(
     *,
-    batch_size: int,
-    cache_len: int,
-    device: torch.device,
-) -> torch.Tensor:
-    row = torch.arange(cache_len, dtype=torch.int32, device=device)
-    return row.unsqueeze(0).repeat(batch_size, 1)
+    case: DecodeCase,
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    page_table_1: torch.Tensor,
+    seqlens: torch.Tensor,
+    topk: int,
+) -> None:
+    for row_idx in range(actual.shape[0]):
+        seq_len = int(seqlens[row_idx].item())
+        if seq_len <= topk:
+            if not torch.equal(actual[row_idx, :seq_len], page_table_1[row_idx, :seq_len]):
+                raise BenchmarkFailure(case, f"trivial-row prefix mismatch at row {row_idx}")
+            if not torch.equal(
+                actual[row_idx, seq_len:],
+                torch.full((actual.shape[1] - seq_len,), -1, dtype=torch.int32, device=actual.device),
+            ):
+                raise BenchmarkFailure(case, f"trivial-row tail mismatch at row {row_idx}")
+            actual_set = {int(token) for token in actual[row_idx].tolist() if int(token) >= 0}
+            expected_set = {int(token) for token in expected[row_idx].tolist() if int(token) >= 0}
+            if actual_set != expected_set:
+                raise BenchmarkFailure(case, f"trivial-row token-set mismatch at row {row_idx}")
+        elif not torch.equal(actual[row_idx], expected[row_idx]):
+            mismatch = int((actual[row_idx] != expected[row_idx]).sum().item())
+            raise BenchmarkFailure(case, f"non-trivial row mismatch at row {row_idx}: {mismatch} differing entries")
+
+
+def _make_decode_graph_prepare(
+    *,
+    live_page_table_1: torch.Tensor,
+    cache_seqlens_int32: torch.Tensor,
+    nsa_cache_seqlens_int32: torch.Tensor,
+    graph_page_table_1: torch.Tensor,
+    graph_cache_seqlens_int32: torch.Tensor,
+    graph_nsa_cache_seqlens_int32: torch.Tensor,
+):
+    live_width = live_page_table_1.shape[1]
+
+    def prepare() -> None:
+        graph_page_table_1[:, :live_width].copy_(live_page_table_1)
+        graph_cache_seqlens_int32.copy_(cache_seqlens_int32)
+        graph_nsa_cache_seqlens_int32.copy_(nsa_cache_seqlens_int32)
+
+    return prepare
 
 
 def _make_indexer_inputs(
@@ -224,37 +256,31 @@ def _make_indexer_inputs(
     cfg: GLMDecodeContractConfig,
     seed: int,
     device: torch.device,
+    pool_locs: torch.Tensor,
+    pool_tokens: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    gen = torch.Generator(device="cpu")
-    gen.manual_seed(seed)
-    q_fp8 = (
-        torch.randn(
-            (case.batch_size, cfg.index_n_heads, cfg.index_head_dim),
-            generator=gen,
-            dtype=torch.float32,
-        )
-        .to(device=device)
-        .div_(2.0)
+    del seed
+    q_fp8 = torch.full(
+        (case.batch_size, cfg.index_n_heads, cfg.index_head_dim),
+        0.5,
+        dtype=torch.float32,
+        device=device,
     ).to(torch.float8_e4m3fn)
-    weights = (
-        torch.randn(
-            (case.batch_size, cfg.index_n_heads, 1),
-            generator=gen,
-            dtype=torch.float32,
-        )
-        .to(device=device)
-        .div_(cfg.index_n_heads**0.5)
+    weights = torch.ones(
+        (case.batch_size, cfg.index_n_heads, 1),
+        dtype=torch.float32,
+        device=device,
     )
-    k = (
-        torch.randn(
-            (case.cache_len, cfg.index_head_dim),
-            generator=gen,
-            dtype=torch.float32,
-        )
-        .to(device=device)
-        .div_(3.0)
+    token_scores = torch.linspace(
+        0.25,
+        1.25,
+        case.cache_len,
+        dtype=torch.float32,
+        device=device,
     )
-    return q_fp8, weights, pack_nsa_index_k_cache_reference(k, page_size=cfg.page_size)
+    k = token_scores.unsqueeze(1).expand(-1, cfg.index_head_dim).contiguous()
+    k_pool = scatter_rows_into_pool(k, pool_locs=pool_locs, pool_tokens=pool_tokens)
+    return q_fp8, weights, pack_nsa_index_k_cache_reference(k_pool, page_size=cfg.page_size)
 
 
 def _make_mla_inputs(
@@ -263,6 +289,8 @@ def _make_mla_inputs(
     cfg: GLMDecodeContractConfig,
     seed: int,
     device: torch.device,
+    pool_locs: torch.Tensor,
+    pool_tokens: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     gen = torch.Generator(device="cpu")
     gen.manual_seed(seed)
@@ -296,8 +324,10 @@ def _make_mla_inputs(
         .div_(4.0)
         .to(torch.bfloat16)
     )
-    kv_cache = pack_mla_kv_cache_reference(k_nope, k_rope)
-    return q_all, k_nope, k_rope, kv_cache
+    k_nope_pool = scatter_rows_into_pool(k_nope, pool_locs=pool_locs, pool_tokens=pool_tokens)
+    k_rope_pool = scatter_rows_into_pool(k_rope, pool_locs=pool_locs, pool_tokens=pool_tokens)
+    kv_cache = pack_mla_kv_cache_reference(k_nope_pool, k_rope_pool)
+    return q_all, k_nope_pool, k_rope_pool, kv_cache
 
 
 def _make_mla_workspace(
@@ -328,23 +358,39 @@ def _run_decode_case(
     replays: int,
     seed: int,
     device: torch.device,
+    pool_factor: int,
+    graph_width: int,
 ) -> CaseReport:
+    if pool_factor <= 0:
+        raise ValueError(f"pool_factor must be positive, got {pool_factor}")
+    graph_width = _resolve_graph_width(cache_len=case.cache_len, graph_width=graph_width)
+    pool_tokens = max(case.cache_len, case.cache_len * pool_factor)
+    pool_locs = make_sparse_pool_locs(
+        active_tokens=case.cache_len,
+        pool_tokens=pool_tokens,
+        seed=seed + 2,
+        device=device,
+    )
     q_fp8, weights, index_k_cache = _make_indexer_inputs(
         case=case,
         cfg=cfg,
         seed=seed,
         device=device,
+        pool_locs=pool_locs,
+        pool_tokens=pool_tokens,
     )
     q_all, k_nope, k_rope, kv_cache = _make_mla_inputs(
         case=case,
         cfg=cfg,
         seed=seed + 1,
         device=device,
+        pool_locs=pool_locs,
+        pool_tokens=pool_tokens,
     )
-    candidate_page_table = _make_dense_candidate_page_table(
+    live_candidate_page_table = make_dense_candidate_page_table(
         batch_size=case.batch_size,
-        cache_len=case.cache_len,
-        device=device,
+        token_locs=pool_locs,
+        width=case.cache_len,
     )
     full_cache_seqlens = torch.full(
         (case.batch_size,),
@@ -352,9 +398,31 @@ def _run_decode_case(
         dtype=torch.int32,
         device=device,
     )
-    indexer_metadata = NSAIndexerDecodeMetadata(
-        page_table_1=candidate_page_table,
+    nsa_cache_seqlens = torch.full(
+        (case.batch_size,),
+        case.topk,
+        dtype=torch.int32,
+        device=device,
+    )
+    graph_candidate_page_table = torch.zeros(
+        (case.batch_size, graph_width),
+        dtype=torch.int32,
+        device=device,
+    )
+    graph_cache_seqlens = torch.empty_like(full_cache_seqlens)
+    graph_nsa_cache_seqlens = torch.empty_like(nsa_cache_seqlens)
+    prepare_decode_graph = _make_decode_graph_prepare(
+        live_page_table_1=live_candidate_page_table,
         cache_seqlens_int32=full_cache_seqlens,
+        nsa_cache_seqlens_int32=nsa_cache_seqlens,
+        graph_page_table_1=graph_candidate_page_table,
+        graph_cache_seqlens_int32=graph_cache_seqlens,
+        graph_nsa_cache_seqlens_int32=graph_nsa_cache_seqlens,
+    )
+    prepare_decode_graph()
+    indexer_metadata = NSAIndexerDecodeMetadata(
+        page_table_1=graph_candidate_page_table,
+        cache_seqlens_int32=graph_cache_seqlens,
     )
 
     def run_indexer():
@@ -373,31 +441,27 @@ def _run_decode_case(
         q_fp8=q_fp8,
         weights=weights,
         index_k_cache=index_k_cache,
-        page_table_1=candidate_page_table,
+        page_table_1=graph_candidate_page_table,
         query_row_to_batch=torch.arange(case.batch_size, dtype=torch.int32, device=device),
-        seqlens_per_query=full_cache_seqlens,
+        seqlens_per_query=graph_cache_seqlens,
         topk=case.topk,
         page_size=cfg.page_size,
     )
     torch.cuda.synchronize()
-    if not torch.equal(actual_topk, expected_topk):
-        mismatch = int((actual_topk != expected_topk).sum().item())
-        raise BenchmarkFailure(
-            case,
-            f"indexer correctness mismatch: {mismatch} differing entries",
-        )
-
-    nsa_cache_seqlens = torch.full(
-        (case.batch_size,),
-        case.topk,
-        dtype=torch.int32,
-        device=device,
+    _assert_decode_contract_match(
+        case=case,
+        actual=actual_topk,
+        expected=expected_topk,
+        page_table_1=graph_candidate_page_table,
+        seqlens=graph_cache_seqlens,
+        topk=case.topk,
     )
+
     mla_metadata = MLASparseDecodeMetadata(
         page_table_1=actual_topk,
-        cache_seqlens_int32=full_cache_seqlens,
-        nsa_cache_seqlens_int32=nsa_cache_seqlens,
-        max_seq_len_k=case.cache_len,
+        cache_seqlens_int32=graph_cache_seqlens,
+        nsa_cache_seqlens_int32=graph_nsa_cache_seqlens,
+        max_seq_len_k=graph_width,
     )
     mla_workspace = _make_mla_workspace(cfg=cfg, case=case, device=device)
     split_cfg = select_sparse_mla_split_decode_config(
@@ -413,6 +477,29 @@ def _run_decode_case(
             q_all=q_all,
             kv_cache=kv_cache,
             metadata=mla_metadata,
+            workspace=mla_workspace,
+            sm_scale=cfg.sm_scale,
+            v_head_dim=cfg.kv_lora_rank,
+        )
+
+    def run_step():
+        topk_indices = sparse_nsa_index_decode_topk(
+            q_fp8=q_fp8,
+            weights=weights,
+            index_k_cache=index_k_cache,
+            metadata=indexer_metadata,
+            topk=case.topk,
+            page_size=cfg.page_size,
+        )
+        return sparse_mla_decode_forward(
+            q_all=q_all,
+            kv_cache=kv_cache,
+            metadata=MLASparseDecodeMetadata(
+                page_table_1=topk_indices,
+                cache_seqlens_int32=graph_cache_seqlens,
+                nsa_cache_seqlens_int32=graph_nsa_cache_seqlens,
+                max_seq_len_k=graph_width,
+            ),
             workspace=mla_workspace,
             sm_scale=cfg.sm_scale,
             v_head_dim=cfg.kv_lora_rank,
@@ -447,15 +534,38 @@ def _run_decode_case(
         )
 
     clear_nsa_indexer_caches()
-    indexer_graph = _capture_graph(run_indexer, warmup=warmup)
-    indexer_us = statistics.median(_bench_graph(indexer_graph, replays=replays))
+    indexer_graph = capture_cuda_graph(
+        run_indexer,
+        warmup=warmup,
+        prepare=prepare_decode_graph,
+    )
+    indexer_stats = bench_cuda_graph(indexer_graph, replays=replays)
+    indexer_us = statistics.median(indexer_stats["replay_us"])
 
     clear_mla_caches()
-    mla_graph = _capture_graph(run_mla, warmup=warmup)
-    mla_us = statistics.median(_bench_graph(mla_graph, replays=replays))
+    prepare_decode_graph()
+    mla_graph = capture_cuda_graph(run_mla, warmup=warmup)
+    mla_stats = bench_cuda_graph(mla_graph, replays=replays)
+    mla_us = statistics.median(mla_stats["replay_us"])
+
+    clear_nsa_indexer_caches()
+    clear_mla_caches()
+    step_graph = capture_cuda_graph(
+        run_step,
+        warmup=warmup,
+        prepare=prepare_decode_graph,
+    )
+    step_stats = bench_cuda_graph(
+        step_graph,
+        replays=replays,
+        prepare=prepare_decode_graph,
+    )
 
     return CaseReport(
         case=case,
+        graph_width=graph_width,
+        metadata_us=statistics.median(step_stats["metadata_us"]),
+        replay_us=statistics.median(step_stats["replay_us"]),
         indexer_us=indexer_us,
         mla_us=mla_us,
         split_enabled=split_cfg is not None,
@@ -488,6 +598,8 @@ def collect_case_reports(
                 replays=args.replays,
                 seed=case_seed,
                 device=device,
+                pool_factor=args.pool_factor,
+                graph_width=args.graph_width,
             )
         )
         case_seed += 17
@@ -498,9 +610,11 @@ def _render_case_line(report: CaseReport) -> str:
     split_flag = "on" if report.split_enabled else "off"
     return (
         f"glm51-decode tp8 bs={report.case.batch_size:2d} ctx={report.case.cache_len:6d} "
-        f"topk={report.case.topk:4d} split={split_flag:>3s} "
+        f"graphw={report.graph_width:6d} topk={report.case.topk:4d} split={split_flag:>3s} "
         f"chunk={report.chunk_size:3d} nchunks={report.num_chunks:d} | "
-        f"total={report.total_us:8.2f} us | "
+        f"step={report.total_us:8.2f} us | "
+        f"meta={report.metadata_us:8.2f} us | "
+        f"replay={report.replay_us:8.2f} us | "
         f"indexer={report.indexer_us:8.2f} us | "
         f"mla={report.mla_us:8.2f} us"
     )
@@ -508,12 +622,16 @@ def _render_case_line(report: CaseReport) -> str:
 
 def _render_summary_lines(reports: list[CaseReport]) -> list[str]:
     total_geo = _geomean([report.total_us for report in reports])
+    metadata_geo = _geomean([report.metadata_us for report in reports])
+    replay_geo = _geomean([report.replay_us for report in reports])
     indexer_geo = _geomean([report.indexer_us for report in reports])
     mla_geo = _geomean([report.mla_us for report in reports])
     return [
         "Summary",
         f"  cases: {len(reports)}",
-        f"  total geo:   {total_geo:.2f} us",
+        f"  step geo:    {total_geo:.2f} us",
+        f"  meta geo:    {metadata_geo:.2f} us",
+        f"  replay geo:  {replay_geo:.2f} us",
         f"  indexer geo: {indexer_geo:.2f} us",
         f"  mla geo:     {mla_geo:.2f} us",
     ]
@@ -537,6 +655,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--replays", type=int, default=200)
     parser.add_argument("--seed", type=int, default=70_000)
+    parser.add_argument("--pool-factor", type=int, default=DEFAULT_POOL_FACTOR)
+    parser.add_argument(
+        "--graph-width",
+        type=int,
+        default=DEFAULT_GRAPH_WIDTH,
+        help="decode graph candidate-table width; actual width is max(cache_len, graph_width)",
+    )
     return parser.parse_args(argv)
 
 

@@ -23,6 +23,7 @@ from .kernel import (
     _MLA_SCALE_GROUPS,
     _MLA_TOKEN_TILE,
     _MLA_WARP_THREADS,
+    _extract_packed_kv_runtime_views,
     _exp2_approx_ftz_f32,
     _log2_approx_ftz_f32,
     _run_cached_host_launcher,
@@ -117,9 +118,8 @@ class SparseMLASplitDecodeForwardKernel:
     def __call__(
         self,
         q_u32: cute.Tensor,
-        kv_nope_u32: cute.Tensor,
+        kv_rows_u32: cute.Tensor,
         kv_scales: cute.Tensor,
-        kv_rope_u32: cute.Tensor,
         page_table_1: cute.Tensor,
         sm_scale: cute.Tensor,
         kv_chunk_size_ptr: cute.Tensor,
@@ -130,9 +130,8 @@ class SparseMLASplitDecodeForwardKernel:
     ):
         self.kernel(
             q_u32,
-            kv_nope_u32,
+            kv_rows_u32,
             kv_scales,
-            kv_rope_u32,
             page_table_1,
             sm_scale,
             kv_chunk_size_ptr,
@@ -153,9 +152,8 @@ class SparseMLASplitDecodeForwardKernel:
     def kernel(
         self,
         q_u32: cute.Tensor,
-        kv_nope_u32: cute.Tensor,
+        kv_rows_u32: cute.Tensor,
         kv_scales: cute.Tensor,
-        kv_rope_u32: cute.Tensor,
         page_table_1: cute.Tensor,
         sm_scale: cute.Tensor,
         kv_chunk_size_ptr: cute.Tensor,
@@ -194,9 +192,8 @@ class SparseMLASplitDecodeForwardKernel:
 
             _run_two_pass_sparse_mla_tile(
                 q_u32,
-                kv_nope_u32,
+                kv_rows_u32,
                 kv_scales,
-                kv_rope_u32,
                 page_table_1,
                 sTokenIdx,
                 sScale,
@@ -360,15 +357,8 @@ def run_sparse_mla_split_decode_forward(
         )
     head_tiles = (int(tmp_output.shape[1]) + _MLA_HEADS_PER_TILE - 1) // _MLA_HEADS_PER_TILE
 
-    kv_rows_bytes = kv_cache[:, 0, :].view(torch.uint8)
-    kv_nope_q = kv_rows_bytes[:, :_MLA_NOPE_DIM]
-    kv_scales = kv_rows_bytes[
-        :, _MLA_NOPE_DIM : _MLA_SCALE_GROUPS * 4 + _MLA_NOPE_DIM
-    ].view(torch.float32)
-    kv_rope = kv_rows_bytes[:, _MLA_NOPE_DIM + _MLA_SCALE_GROUPS * 4 :].view(torch.bfloat16)
+    kv_rows_u32, kv_scales = _extract_packed_kv_runtime_views(kv_cache)
     q_u32 = _view_last_dim_as_u32(q_all)
-    kv_nope_u32 = _view_last_dim_as_u32(kv_nope_q)
-    kv_rope_u32 = _view_last_dim_as_u32(kv_rope)
     if sm_scale.shape != (1,) or sm_scale.dtype != torch.float32:
         raise ValueError("sm_scale tensor must have shape (1,) and dtype float32")
 
@@ -379,9 +369,8 @@ def run_sparse_mla_split_decode_forward(
     )
     forward_args = (
         _to_kernel_tensor(q_u32, cutlass.Uint32, assumed_align=16),
-        _to_kernel_tensor(kv_nope_u32, cutlass.Uint32, assumed_align=16),
+        _to_kernel_tensor(kv_rows_u32, cutlass.Uint32, assumed_align=16),
         _to_kernel_tensor(kv_scales, cutlass.Float32, assumed_align=4),
-        _to_kernel_tensor(kv_rope_u32, cutlass.Uint32, assumed_align=16),
         _to_kernel_tensor(page_table_1, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(sm_scale, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(kv_chunk_size_ptr, cutlass.Int32, assumed_align=4),
@@ -392,9 +381,8 @@ def run_sparse_mla_split_decode_forward(
     )
     forward_cache_key = (
         _tensor_meta_key(q_u32),
-        _tensor_meta_key(kv_nope_u32),
+        _tensor_meta_key(kv_rows_u32),
         _tensor_meta_key(kv_scales),
-        _tensor_meta_key(kv_rope_u32),
         _tensor_meta_key(page_table_1),
         _tensor_meta_key(kv_chunk_size_ptr),
         _tensor_meta_key(num_chunks_ptr),

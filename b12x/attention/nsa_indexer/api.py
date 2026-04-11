@@ -8,13 +8,24 @@ from functools import lru_cache
 
 import torch
 
+from .fused_decode import (
+    clear_sparse_nsa_fused_decode_kernel_cache,
+    run_sparse_nsa_fused_decode_kernel,
+    supports_sparse_nsa_fused_decode_kernel,
+)
 from .kernel import (
     clear_sparse_nsa_indexer_kernel_cache,
     run_sparse_nsa_index_logits_kernel,
     supports_sparse_nsa_indexer_kernel,
 )
 from .reference import sparse_nsa_index_reference
-from .triton_topk import run_sparse_nsa_topk_kernel, supports_sparse_nsa_topk_kernel
+from .triton_topk import (
+    clear_sparse_nsa_topk_kernel_cache,
+    run_sparse_nsa_dynamic_topk_kernel,
+    run_sparse_nsa_topk_kernel,
+    supports_sparse_nsa_dynamic_topk_kernel,
+    supports_sparse_nsa_topk_kernel,
+)
 
 
 _INDEX_HEAD_DIM = 128
@@ -39,9 +50,12 @@ class NSAIndexerExtendMetadata:
 
 def clear_nsa_indexer_caches() -> None:
     """Clear any cached NSA indexer runtime state."""
+    clear_sparse_nsa_fused_decode_kernel_cache()
     clear_sparse_nsa_indexer_kernel_cache()
+    clear_sparse_nsa_topk_kernel_cache()
     _cached_extend_lengths_tensor.cache_clear()
     _cached_query_row_to_batch.cache_clear()
+    _cached_width_cap_tensor.cache_clear()
 
 
 def _normalize_weights(weights: torch.Tensor, *, q_rows: int, num_heads: int) -> torch.Tensor:
@@ -77,6 +91,15 @@ def _cached_query_row_to_batch(
     for batch_row, length in enumerate(lengths):
         rows.extend([batch_row] * int(length))
     return torch.tensor(rows, dtype=torch.int32, device=torch.device(device_type, device_index))
+
+
+@lru_cache(maxsize=64)
+def _cached_width_cap_tensor(
+    width: int,
+    device_type: str,
+    device_index: int | None,
+) -> torch.Tensor:
+    return torch.tensor([width], dtype=torch.int32, device=torch.device(device_type, device_index))
 
 
 def _validate_sparse_index_inputs(
@@ -165,6 +188,24 @@ def _stable_topk_ids_from_logits(
     )
 
 
+def _make_active_width_tensor(
+    *,
+    seqlens_per_query: torch.Tensor,
+    width: int,
+) -> torch.Tensor:
+    if seqlens_per_query.ndim != 1:
+        raise ValueError(
+            "seqlens_per_query must be rank-1 when computing active width, got "
+            f"{tuple(seqlens_per_query.shape)}"
+        )
+    width_cap = _cached_width_cap_tensor(
+        int(width),
+        seqlens_per_query.device.type,
+        seqlens_per_query.device.index,
+    )
+    return torch.minimum(seqlens_per_query.amax().reshape(1), width_cap)
+
+
 def _sparse_nsa_topk_impl(
     *,
     q_fp8: torch.Tensor,
@@ -175,6 +216,7 @@ def _sparse_nsa_topk_impl(
     seqlens_per_query: torch.Tensor,
     topk: int,
     page_size: int,
+    allow_fused_decode: bool,
 ) -> torch.Tensor:
     weights_f = _validate_sparse_index_inputs(
         q_fp8=q_fp8,
@@ -215,10 +257,14 @@ def _sparse_nsa_topk_impl(
         return output
 
     seqlens_valid = seqlens_per_query[:valid_q_rows].contiguous()
+    active_width = _make_active_width_tensor(seqlens_per_query=seqlens_valid, width=width)
     max_token_capacity = index_k_cache.shape[0] * page_size
     if not _is_cuda_graph_capture_active(q_fp8.device):
-        candidate_tokens = page_table_1.index_select(0, query_row_to_batch[:valid_q_rows].to(torch.long))
-        positions = torch.arange(width, dtype=torch.int32, device=q_fp8.device).unsqueeze(0)
+        active_width_host = min(width, int(active_width.item()))
+        candidate_tokens = page_table_1.index_select(
+            0, query_row_to_batch[:valid_q_rows].to(torch.long)
+        )[:, :active_width_host]
+        positions = torch.arange(active_width_host, dtype=torch.int32, device=q_fp8.device).unsqueeze(0)
         candidate_valid_mask = (positions < seqlens_valid.unsqueeze(1)) & (candidate_tokens >= 0)
         overflow_mask = candidate_valid_mask & (candidate_tokens >= max_token_capacity)
         if torch.any(overflow_mask):
@@ -227,6 +273,34 @@ def _sparse_nsa_topk_impl(
                 f"page_table_1 token id {bad} exceeds index_k_cache capacity {max_token_capacity}"
             )
 
+    gather_k = min(topk, width)
+    if gather_k == 0:
+        return output
+
+    if allow_fused_decode and supports_sparse_nsa_fused_decode_kernel(
+        q_fp8=q_fp8[:valid_q_rows],
+        weights=weights_f[:valid_q_rows],
+        index_k_cache=index_k_cache,
+        page_table_1=page_table_1,
+        query_row_to_batch=query_row_to_batch[:valid_q_rows],
+        seqlens_per_query=seqlens_valid,
+        active_width=active_width,
+        gather_k=gather_k,
+        page_size=page_size,
+    ):
+        run_sparse_nsa_fused_decode_kernel(
+            q_fp8=q_fp8[:valid_q_rows],
+            weights=weights_f[:valid_q_rows],
+            index_k_cache=index_k_cache,
+            page_table_1=page_table_1,
+            query_row_to_batch=query_row_to_batch[:valid_q_rows],
+            seqlens_per_query=seqlens_valid,
+            active_width=active_width,
+            output=output[:valid_q_rows],
+            page_size=page_size,
+        )
+        return output
+
     logits = run_sparse_nsa_index_logits_kernel(
         q_fp8=q_fp8[:valid_q_rows],
         weights=weights_f[:valid_q_rows],
@@ -234,13 +308,29 @@ def _sparse_nsa_topk_impl(
         page_table_1=page_table_1,
         query_row_to_batch=query_row_to_batch[:valid_q_rows],
         seqlens_per_query=seqlens_valid,
+        active_width=active_width,
+        trivial_topk=gather_k if allow_fused_decode else 0,
         page_size=page_size,
     )
-    gather_k = min(topk, width)
-    if gather_k == 0:
-        return output
 
-    if supports_sparse_nsa_topk_kernel(
+    if supports_sparse_nsa_dynamic_topk_kernel(
+        logits=logits,
+        page_table_1=page_table_1,
+        query_row_to_batch=query_row_to_batch[:valid_q_rows],
+        seqlens_per_query=seqlens_valid,
+        active_width=active_width,
+        gather_k=gather_k,
+    ):
+        run_sparse_nsa_dynamic_topk_kernel(
+            logits=logits,
+            page_table_1=page_table_1,
+            query_row_to_batch=query_row_to_batch[:valid_q_rows],
+            seqlens_per_query=seqlens_valid,
+            active_width=active_width,
+            output=output[:valid_q_rows],
+            gather_k=gather_k,
+        )
+    elif supports_sparse_nsa_topk_kernel(
         logits=logits,
         page_table_1=page_table_1,
         query_row_to_batch=query_row_to_batch[:valid_q_rows],
@@ -275,6 +365,9 @@ def sparse_nsa_index_decode_topk(
     topk: int,
     page_size: int = 64,
 ) -> torch.Tensor:
+    # Decode uses a graph-safe trivial-row fast path: when a live row already
+    # fits under `topk`, the CUDA path returns the live page-table prefix
+    # directly instead of score-sorting an identical token set.
     if metadata.cache_seqlens_int32.ndim != 1:
         raise ValueError(
             "cache_seqlens_int32 must be rank-1, got "
@@ -301,6 +394,7 @@ def sparse_nsa_index_decode_topk(
         seqlens_per_query=metadata.cache_seqlens_int32,
         topk=topk,
         page_size=page_size,
+        allow_fused_decode=True,
     )
 
 
@@ -357,4 +451,5 @@ def sparse_nsa_index_extend_topk(
         seqlens_per_query=seqlens_per_query,
         topk=topk,
         page_size=page_size,
+        allow_fused_decode=False,
     )

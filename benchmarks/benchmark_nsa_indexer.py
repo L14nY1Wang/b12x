@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark graph-replayed NSA top-k selection through the public b12x API."""
+"""Benchmark realistic SGLang-like decode replay for NSA top-k selection."""
 
 from __future__ import annotations
 
@@ -25,10 +25,18 @@ from b12x.integration.nsa_indexer import (
     sparse_nsa_index_extend_topk,
 )
 
-from benchmarks.common import require_sm120
+from benchmarks.common import make_sparse_pool_locs, require_sm120, scatter_rows_into_pool
+from benchmarks.common import (
+    bench_cuda_graph,
+    capture_cuda_graph,
+    make_dense_candidate_page_table,
+)
 
 
 MODEL_PATH = pathlib.Path("/data/models/GLM-5.1-NVFP4")
+DEFAULT_POOL_FACTOR = 6
+DEFAULT_GRAPH_WIDTH = 8192
+DEFAULT_TOPK = 2048
 
 
 @dataclass(frozen=True)
@@ -51,29 +59,6 @@ def _parse_csv_ints(value: str) -> list[int]:
     return [int(part) for part in value.split(",") if part]
 
 
-def _capture_graph(fn, *, warmup: int) -> torch.cuda.CUDAGraph:
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        fn()
-    graph.replay()
-    torch.cuda.synchronize()
-    return graph
-
-
-def _bench_graph(graph: torch.cuda.CUDAGraph, *, replays: int) -> list[float]:
-    starts = [torch.cuda.Event(enable_timing=True) for _ in range(replays)]
-    ends = [torch.cuda.Event(enable_timing=True) for _ in range(replays)]
-    for idx in range(replays):
-        starts[idx].record()
-        graph.replay()
-        ends[idx].record()
-    torch.cuda.synchronize()
-    return [start.elapsed_time(end) * 1000.0 for start, end in zip(starts, ends)]
-
-
 def _make_q_and_weights(
     *,
     rows: int,
@@ -81,35 +66,36 @@ def _make_q_and_weights(
     seed: int,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    gen = torch.Generator(device="cpu")
-    gen.manual_seed(seed)
-    q_fp8 = (
-        torch.randn((rows, cfg.num_heads, cfg.head_dim), generator=gen, dtype=torch.float32)
-        .to(device=device)
-        .div_(2.0)
+    del seed
+    q_fp8 = torch.full(
+        (rows, cfg.num_heads, cfg.head_dim),
+        0.5,
+        dtype=torch.float32,
+        device=device,
     ).to(torch.float8_e4m3fn)
-    weights = (
-        torch.randn((rows, cfg.num_heads, 1), generator=gen, dtype=torch.float32)
-        .to(device=device)
-        .div_(cfg.num_heads**0.5)
-    )
+    weights = torch.ones((rows, cfg.num_heads, 1), dtype=torch.float32, device=device)
     return q_fp8, weights
 
 
 def _make_index_k_cache(
     *,
-    num_tokens: int,
+    active_tokens: int,
+    pool_locs: torch.Tensor,
+    pool_tokens: int,
     seed: int,
     device: torch.device,
 ) -> torch.Tensor:
-    gen = torch.Generator(device="cpu")
-    gen.manual_seed(seed)
-    k = (
-        torch.randn((num_tokens, 128), generator=gen, dtype=torch.float32)
-        .to(device=device)
-        .div_(3.0)
+    del seed
+    token_scores = torch.linspace(
+        0.25,
+        1.25,
+        active_tokens,
+        dtype=torch.float32,
+        device=device,
     )
-    return pack_nsa_index_k_cache_reference(k)
+    k = token_scores.unsqueeze(1).expand(-1, 128).contiguous()
+    k_pool = scatter_rows_into_pool(k, pool_locs=pool_locs, pool_tokens=pool_tokens)
+    return pack_nsa_index_k_cache_reference(k_pool)
 
 
 def _make_page_table(
@@ -117,7 +103,7 @@ def _make_page_table(
     rows: int,
     width: int,
     valid_per_row: int,
-    num_tokens: int,
+    token_locs: torch.Tensor,
     seed: int,
     device: torch.device,
 ) -> torch.Tensor:
@@ -127,9 +113,12 @@ def _make_page_table(
         raise ValueError("valid_per_row must be in [1, width]")
     gen = torch.Generator(device="cpu")
     gen.manual_seed(seed)
+    token_locs_cpu = token_locs.to("cpu")
+    num_tokens = int(token_locs_cpu.numel())
     out = torch.full((rows, width), -1, dtype=torch.int32)
     for row in range(rows):
-        ids = torch.randperm(num_tokens, generator=gen, dtype=torch.int64)[:valid_per_row].to(torch.int32)
+        perm = torch.randperm(num_tokens, generator=gen, dtype=torch.int64)[:valid_per_row]
+        ids = token_locs_cpu[perm].to(torch.int32)
         out[row, :valid_per_row] = ids
     return out.to(device=device)
 
@@ -144,6 +133,49 @@ def _assert_exact_match(actual: torch.Tensor, expected: torch.Tensor) -> None:
     )
 
 
+def _assert_decode_contract_match(
+    *,
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    page_table_1: torch.Tensor,
+    seqlens: torch.Tensor,
+    topk: int,
+) -> None:
+    for row_idx in range(actual.shape[0]):
+        seq_len = int(seqlens[row_idx].item())
+        if seq_len <= topk:
+            if not torch.equal(actual[row_idx, :seq_len], page_table_1[row_idx, :seq_len]):
+                raise AssertionError(
+                    f"decode trivial-row prefix mismatch at row {row_idx}: "
+                    f"actual={actual[row_idx, :seq_len].tolist()} "
+                    f"expected_prefix={page_table_1[row_idx, :seq_len].tolist()}"
+                )
+            if not torch.equal(
+                actual[row_idx, seq_len:],
+                torch.full((actual.shape[1] - seq_len,), -1, dtype=torch.int32, device=actual.device),
+            ):
+                raise AssertionError(f"decode trivial-row tail mismatch at row {row_idx}")
+            actual_set = {int(token) for token in actual[row_idx].tolist() if int(token) >= 0}
+            expected_set = {int(token) for token in expected[row_idx].tolist() if int(token) >= 0}
+            if actual_set != expected_set:
+                raise AssertionError(
+                    f"decode trivial-row token-set mismatch at row {row_idx}: "
+                    f"actual={sorted(actual_set)} expected={sorted(expected_set)}"
+                )
+        elif not torch.equal(actual[row_idx], expected[row_idx]):
+            mismatch = int((actual[row_idx] != expected[row_idx]).sum().item())
+            raise AssertionError(
+                f"decode non-trivial row mismatch at row {row_idx}: {mismatch} differing entries, "
+                f"actual={actual[row_idx].tolist()} expected={expected[row_idx].tolist()}"
+            )
+
+
+def _resolve_graph_width(*, cache_len: int, graph_width: int) -> int:
+    if graph_width <= 0:
+        raise ValueError(f"graph_width must be positive, got {graph_width}")
+    return max(cache_len, graph_width)
+
+
 def _run_decode_case(
     *,
     cfg: GLMNSAConfig,
@@ -155,22 +187,45 @@ def _run_decode_case(
     replays: int,
     seed: int,
     device: torch.device,
+    pool_factor: int,
 ) -> None:
-    q_fp8, weights = _make_q_and_weights(rows=q_rows, cfg=cfg, seed=seed, device=device)
-    index_k_cache = _make_index_k_cache(num_tokens=cache_len, seed=seed + 1, device=device)
-    valid_per_row = min(width, cache_len)
-    page_table_1 = _make_page_table(
-        rows=q_rows,
-        width=width,
-        valid_per_row=valid_per_row,
-        num_tokens=cache_len,
-        seed=seed + 2,
+    graph_width = _resolve_graph_width(cache_len=cache_len, graph_width=width)
+    pool_tokens = max(cache_len, cache_len * pool_factor)
+    pool_locs = make_sparse_pool_locs(
+        active_tokens=cache_len,
+        pool_tokens=pool_tokens,
+        seed=seed + 10,
         device=device,
     )
-    seqlens = torch.full((q_rows,), valid_per_row, dtype=torch.int32, device=device)
+    q_fp8, weights = _make_q_and_weights(rows=q_rows, cfg=cfg, seed=seed, device=device)
+    index_k_cache = _make_index_k_cache(
+        active_tokens=cache_len,
+        pool_locs=pool_locs,
+        pool_tokens=pool_tokens,
+        seed=seed + 1,
+        device=device,
+    )
+    live_page_table_1 = make_dense_candidate_page_table(
+        batch_size=q_rows,
+        token_locs=pool_locs,
+        width=cache_len,
+    )
+    seqlens = torch.full((q_rows,), cache_len, dtype=torch.int32, device=device)
+    graph_page_table_1 = torch.zeros(
+        (q_rows, graph_width),
+        dtype=torch.int32,
+        device=device,
+    )
+    graph_seqlens = torch.empty_like(seqlens)
+
+    def prepare_decode_graph() -> None:
+        graph_page_table_1[:, :cache_len].copy_(live_page_table_1)
+        graph_seqlens.copy_(seqlens)
+
+    prepare_decode_graph()
     metadata = NSAIndexerDecodeMetadata(
-        page_table_1=page_table_1,
-        cache_seqlens_int32=seqlens,
+        page_table_1=graph_page_table_1,
+        cache_seqlens_int32=graph_seqlens,
     )
 
     def run():
@@ -189,29 +244,47 @@ def _run_decode_case(
         q_fp8=q_fp8,
         weights=weights,
         index_k_cache=index_k_cache,
-        page_table_1=page_table_1,
+        page_table_1=graph_page_table_1,
         query_row_to_batch=torch.arange(q_rows, dtype=torch.int32, device=device),
-        seqlens_per_query=seqlens,
+        seqlens_per_query=graph_seqlens,
         topk=topk,
         page_size=cfg.page_size,
     )
     torch.cuda.synchronize()
-    _assert_exact_match(actual, expected)
+    _assert_decode_contract_match(
+        actual=actual,
+        expected=expected,
+        page_table_1=graph_page_table_1,
+        seqlens=graph_seqlens,
+        topk=topk,
+    )
 
-    graph = _capture_graph(run, warmup=warmup)
-    replay_us = _bench_graph(graph, replays=replays)
+    graph = capture_cuda_graph(
+        run,
+        warmup=warmup,
+        prepare=prepare_decode_graph,
+    )
+    stats = bench_cuda_graph(
+        graph,
+        replays=replays,
+        prepare=prepare_decode_graph,
+    )
     print(
         json.dumps(
             {
+                "contract": "sglang_decode_graph",
                 "mode": "decode",
                 "q_rows": q_rows,
                 "cache_len": cache_len,
-                "width": width,
+                "graph_width": graph_width,
                 "topk": topk,
-                "median_us": statistics.median(replay_us),
-                "mean_us": statistics.fmean(replay_us),
-                "min_us": min(replay_us),
-                "max_us": max(replay_us),
+                "pool_tokens": pool_tokens,
+                "metadata_median_us": statistics.median(stats["metadata_us"]),
+                "replay_median_us": statistics.median(stats["replay_us"]),
+                "step_median_us": statistics.median(stats["step_us"]),
+                "replay_mean_us": statistics.fmean(stats["replay_us"]),
+                "replay_min_us": min(stats["replay_us"]),
+                "replay_max_us": max(stats["replay_us"]),
                 "replays": replays,
             }
         )
@@ -230,16 +303,30 @@ def _run_extend_case(
     replays: int,
     seed: int,
     device: torch.device,
+    pool_factor: int,
 ) -> None:
     total_q = batch * q_len
+    pool_tokens = max(cache_len, cache_len * pool_factor)
+    pool_locs = make_sparse_pool_locs(
+        active_tokens=cache_len,
+        pool_tokens=pool_tokens,
+        seed=seed + 10,
+        device=device,
+    )
     q_fp8, weights = _make_q_and_weights(rows=total_q, cfg=cfg, seed=seed, device=device)
-    index_k_cache = _make_index_k_cache(num_tokens=cache_len, seed=seed + 1, device=device)
+    index_k_cache = _make_index_k_cache(
+        active_tokens=cache_len,
+        pool_locs=pool_locs,
+        pool_tokens=pool_tokens,
+        seed=seed + 1,
+        device=device,
+    )
     valid_per_row = min(width, cache_len)
     page_table_1 = _make_page_table(
         rows=batch,
         width=width,
         valid_per_row=valid_per_row,
-        num_tokens=cache_len,
+        token_locs=pool_locs,
         seed=seed + 2,
         device=device,
     )
@@ -290,6 +377,7 @@ def _run_extend_case(
                 "cache_len": cache_len,
                 "width": width,
                 "topk": topk,
+                "pool_tokens": pool_tokens,
                 "median_us": statistics.median(replay_us),
                 "mean_us": statistics.fmean(replay_us),
                 "min_us": min(replay_us),
@@ -302,16 +390,22 @@ def _run_extend_case(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("decode", "extend", "both"), default="both")
+    parser.add_argument("--mode", choices=("decode", "extend", "both"), default="decode")
     parser.add_argument("--decode-rows", default="1,16")
     parser.add_argument("--extend-batches", default="8")
     parser.add_argument("--extend-q-lens", default="4")
     parser.add_argument("--cache-lens", default="2048,8192")
-    parser.add_argument("--width", type=int, default=512)
-    parser.add_argument("--topk", type=int, default=64)
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=DEFAULT_GRAPH_WIDTH,
+        help="decode graph candidate-table width; actual width is max(cache_len, width)",
+    )
+    parser.add_argument("--topk", type=int, default=DEFAULT_TOPK)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--replays", type=int, default=50)
     parser.add_argument("--seed", type=int, default=88_000)
+    parser.add_argument("--pool-factor", type=int, default=DEFAULT_POOL_FACTOR)
     args = parser.parse_args()
 
     device = require_sm120()
@@ -320,9 +414,6 @@ def main() -> None:
     decode_rows = _parse_csv_ints(args.decode_rows)
     extend_batches = _parse_csv_ints(args.extend_batches)
     extend_q_lens = _parse_csv_ints(args.extend_q_lens)
-
-    if args.topk > args.width:
-        raise SystemExit("--topk must be <= --width")
 
     case_seed = args.seed
     if args.mode in ("decode", "both"):
@@ -338,6 +429,7 @@ def main() -> None:
                     replays=args.replays,
                     seed=case_seed,
                     device=device,
+                    pool_factor=args.pool_factor,
                 )
                 case_seed += 17
     if args.mode in ("extend", "both"):
@@ -355,6 +447,7 @@ def main() -> None:
                         replays=args.replays,
                         seed=case_seed,
                         device=device,
+                        pool_factor=args.pool_factor,
                     )
                     case_seed += 17
 

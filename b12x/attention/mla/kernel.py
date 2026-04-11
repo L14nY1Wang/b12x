@@ -75,6 +75,10 @@ _MLA_KV_STAGE_BYTES = max(
     _MLA_SCALE_GROUPS * _MLA_KV_NOPE_STAGE_BYTES + _MLA_KV_ROPE_STAGE_BYTES,
 )
 _MLA_SCALE_STAGE_ELEMS = _MLA_TOKEN_TILE * _MLA_SCALE_GROUPS
+_MLA_SCALE_BYTES = _MLA_SCALE_GROUPS * 4
+_MLA_NOPE_U32_OFFSET = 0
+_MLA_SCALE_U32_OFFSET = _MLA_NOPE_DIM // 4
+_MLA_ROPE_U32_OFFSET = _MLA_SCALE_U32_OFFSET + _MLA_SCALE_GROUPS
 _MLA_NUM_MMA_KV = 2
 _MLA_QK_NUM_MMA_D = 4
 _MLA_VO_NUM_MMA_D = _MLA_NOPE_GROUP_ELEMS // 16
@@ -310,6 +314,17 @@ def _stage_all_token_scales(
             else Float32(0.0)
         )
         linear += Int32(_MLA_WARP_THREADS)
+
+
+def _extract_packed_kv_runtime_views(
+    kv_cache: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    kv_rows_bytes = kv_cache[:, 0, :].view(torch.uint8)
+    kv_rows_u32 = _view_last_dim_as_u32(kv_rows_bytes)
+    kv_scales = kv_rows_bytes[:, _MLA_NOPE_DIM : _MLA_NOPE_DIM + _MLA_SCALE_BYTES].view(
+        torch.float32
+    )
+    return kv_rows_u32, kv_scales
 
 
 @cute.jit
@@ -732,9 +747,8 @@ def _accumulate_scaled_score_frag(
 def _compute_score_tile_scaled(
     score_frag: cute.Tensor,
     q_u32: cute.Tensor,
-    kv_nope_u32: cute.Tensor,
+    kv_rows_u32: cute.Tensor,
     kv_scales: cute.Tensor,
-    kv_rope_u32: cute.Tensor,
     page_table_1: cute.Tensor,
     sTokenIdx: cute.Tensor,
     sScale: cute.Tensor,
@@ -750,7 +764,7 @@ def _compute_score_tile_scaled(
     lane_group = lane // Int32(4)
     lane_pair_base = Int32(2) * (lane % Int32(4))
     num_heads = Int32(q_u32.shape[1])
-    num_kv = Int32(kv_nope_u32.shape[0])
+    num_kv = Int32(kv_rows_u32.shape[0])
     tile_tokens = token_end - token_base
 
     _stage_token_indices(page_table_1, sTokenIdx, q_idx, token_base, token_end, lane)
@@ -772,9 +786,9 @@ def _compute_score_tile_scaled(
         )
         _stage_token_scales(kv_scales, sTokenIdx, sScale, Int32(group_idx), num_kv, lane)
         _stage_kv_u32_block(
-            kv_nope_u32,
+            kv_rows_u32,
             sTokenIdx,
-            Int32(group_idx * _MLA_NOPE_GROUP_KV_U32),
+            Int32(_MLA_NOPE_U32_OFFSET + group_idx * _MLA_NOPE_GROUP_KV_U32),
             Int32(_MLA_NOPE_GROUP_KV_VECS),
             Int32(_MLA_NOPE_GROUP_KV_VECS),
             kv_base_addr,
@@ -787,10 +801,10 @@ def _compute_score_tile_scaled(
         _zero_score_frag(frag_tmp)
         if cutlass.const_expr(os.environ.get("B12X_MLA_DEBUG_QK_BF16", "0") == "1"):
             _stage_kv_bf16_block(
-                kv_nope_u32,
+                kv_rows_u32,
                 sTokenIdx,
                 sScale,
-                Int32(group_idx * _MLA_NOPE_GROUP_KV_U32),
+                Int32(_MLA_NOPE_U32_OFFSET + group_idx * _MLA_NOPE_GROUP_KV_U32),
                 Int32(_MLA_NOPE_GROUP_KV_BF16_VECS),
                 Int32(_MLA_NOPE_GROUP_KV_BF16_VECS),
                 kv_base_addr,
@@ -842,9 +856,9 @@ def _compute_score_tile_scaled(
         lane,
     )
     _stage_kv_u32_block(
-        kv_rope_u32,
+        kv_rows_u32,
         sTokenIdx,
-        Int32(0),
+        Int32(_MLA_ROPE_U32_OFFSET),
         Int32(_MLA_ROPE_VECS),
         Int32(_MLA_ROPE_VECS),
         kv_base_addr,
@@ -1330,7 +1344,7 @@ def _accumulate_pv_groups_from_p_frag(
     o_frag2: cute.Tensor,
     o_frag3: cute.Tensor,
     p_frag: cute.Tensor,
-    kv_nope_u32: cute.Tensor,
+    kv_rows_u32: cute.Tensor,
     kv_scales: cute.Tensor,
     sTokenIdx: cute.Tensor,
     sScale: cute.Tensor,
@@ -1344,7 +1358,7 @@ def _accumulate_pv_groups_from_p_frag(
             sTokenIdx,
             sScale,
             group_idx,
-            Int32(kv_nope_u32.shape[0]),
+            Int32(kv_rows_u32.shape[0]),
             lane,
         )
         tile_output_scale = _warp_allreduce_max(Float32(sScale[lane]))
@@ -1354,13 +1368,13 @@ def _accumulate_pv_groups_from_p_frag(
             else cute.arch.rcp_approx(tile_output_scale)
         )
         _stage_kv_u32_block(
-            kv_nope_u32,
+            kv_rows_u32,
             sTokenIdx,
-            group_idx * Int32(_MLA_NOPE_GROUP_KV_U32),
+            Int32(_MLA_NOPE_U32_OFFSET) + group_idx * Int32(_MLA_NOPE_GROUP_KV_U32),
             Int32(_MLA_NOPE_GROUP_KV_VECS),
             Int32(_MLA_NOPE_GROUP_KV_VECS),
             kv_base_addr,
-            Int32(kv_nope_u32.shape[0]),
+            Int32(kv_rows_u32.shape[0]),
             lane,
         )
         cute.arch.sync_threads()
@@ -1408,9 +1422,8 @@ def _accumulate_pv_groups_from_p_frag(
 def _compute_score_tile_scaled_from_staged_nope(
     score_frag: cute.Tensor,
     q_u32: cute.Tensor,
-    kv_nope_u32: cute.Tensor,
+    kv_rows_u32: cute.Tensor,
     kv_scales: cute.Tensor,
-    kv_rope_u32: cute.Tensor,
     page_table_1: cute.Tensor,
     sTokenIdx: cute.Tensor,
     sScale: cute.Tensor,
@@ -1427,7 +1440,7 @@ def _compute_score_tile_scaled_from_staged_nope(
     lane_group = lane // Int32(4)
     lane_pair_base = Int32(2) * (lane % Int32(4))
     num_heads = Int32(q_u32.shape[1])
-    num_kv = Int32(kv_nope_u32.shape[0])
+    num_kv = Int32(kv_rows_u32.shape[0])
     tile_tokens = token_end - token_base
 
     _stage_token_indices(page_table_1, sTokenIdx, q_idx, token_base, token_end, lane)
@@ -1459,9 +1472,9 @@ def _compute_score_tile_scaled_from_staged_nope(
     for block_offset in cutlass.range_constexpr(_MLA_SCALE_GROUPS):
         group_idx = Int32(block_offset)
         _stage_kv_u32_block_async(
-            kv_nope_u32,
+            kv_rows_u32,
             sTokenIdx,
-            group_idx * Int32(_MLA_NOPE_GROUP_KV_U32),
+            Int32(_MLA_NOPE_U32_OFFSET) + group_idx * Int32(_MLA_NOPE_GROUP_KV_U32),
             Int32(_MLA_NOPE_GROUP_KV_VECS),
             Int32(_MLA_NOPE_GROUP_KV_VECS),
             kv_nope_base_addr + group_idx * Int32(_MLA_KV_NOPE_STAGE_BYTES),
@@ -1470,9 +1483,9 @@ def _compute_score_tile_scaled_from_staged_nope(
         )
         cute.arch.cp_async_commit_group()
     _stage_kv_u32_block_async(
-        kv_rope_u32,
+        kv_rows_u32,
         sTokenIdx,
-        Int32(0),
+        Int32(_MLA_ROPE_U32_OFFSET),
         Int32(_MLA_ROPE_VECS),
         Int32(_MLA_ROPE_VECS),
         kv_rope_base_addr,
@@ -1665,9 +1678,8 @@ def _store_output_groups(
 @cute.jit
 def _run_two_pass_sparse_mla_tile(
     q_u32: cute.Tensor,
-    kv_nope_u32: cute.Tensor,
+    kv_rows_u32: cute.Tensor,
     kv_scales: cute.Tensor,
-    kv_rope_u32: cute.Tensor,
     page_table_1: cute.Tensor,
     sTokenIdx: cute.Tensor,
     sScale: cute.Tensor,
@@ -1708,9 +1720,8 @@ def _run_two_pass_sparse_mla_tile(
             _compute_score_tile_scaled(
                 score_frag,
                 q_u32,
-                kv_nope_u32,
+                kv_rows_u32,
                 kv_scales,
-                kv_rope_u32,
                 page_table_1,
                 sTokenIdx,
                 sScale,
@@ -1727,9 +1738,8 @@ def _run_two_pass_sparse_mla_tile(
             _compute_score_tile_scaled_from_staged_nope(
                 score_frag,
                 q_u32,
-                kv_nope_u32,
+                kv_rows_u32,
                 kv_scales,
-                kv_rope_u32,
                 page_table_1,
                 sTokenIdx,
                 sScale,
@@ -1753,7 +1763,7 @@ def _run_two_pass_sparse_mla_tile(
                 o_frag2,
                 o_frag3,
                 p_frag,
-                kv_nope_u32,
+                kv_rows_u32,
                 kv_scales,
                 sTokenIdx,
                 sScale,
@@ -1783,9 +1793,8 @@ def _run_two_pass_sparse_mla_tile(
             _compute_score_tile_scaled(
                 score_frag,
                 q_u32,
-                kv_nope_u32,
+                kv_rows_u32,
                 kv_scales,
-                kv_rope_u32,
                 page_table_1,
                 sTokenIdx,
                 sScale,
@@ -1812,9 +1821,8 @@ def _run_two_pass_sparse_mla_tile(
             _compute_score_tile_scaled(
                 score_frag,
                 q_u32,
-                kv_nope_u32,
+                kv_rows_u32,
                 kv_scales,
-                kv_rope_u32,
                 page_table_1,
                 sTokenIdx,
                 sScale,
@@ -1835,7 +1843,7 @@ def _run_two_pass_sparse_mla_tile(
                 o_frag2,
                 o_frag3,
                 p_frag,
-                kv_nope_u32,
+                kv_rows_u32,
                 kv_scales,
                 sTokenIdx,
                 sScale,
@@ -1895,9 +1903,8 @@ class SparseMLAKernel:
     def __call__(
         self,
         q_u32: cute.Tensor,
-        kv_nope_u32: cute.Tensor,
+        kv_rows_u32: cute.Tensor,
         kv_scales: cute.Tensor,
-        kv_rope_u32: cute.Tensor,
         page_table_1: cute.Tensor,
         sm_scale: cute.Tensor,
         output: cute.Tensor,
@@ -1905,9 +1912,8 @@ class SparseMLAKernel:
     ):
         self.kernel(
             q_u32,
-            kv_nope_u32,
+            kv_rows_u32,
             kv_scales,
-            kv_rope_u32,
             page_table_1,
             sm_scale,
             output,
@@ -1921,9 +1927,8 @@ class SparseMLAKernel:
     def kernel(
         self,
         q_u32: cute.Tensor,
-        kv_nope_u32: cute.Tensor,
+        kv_rows_u32: cute.Tensor,
         kv_scales: cute.Tensor,
-        kv_rope_u32: cute.Tensor,
         page_table_1: cute.Tensor,
         sm_scale: cute.Tensor,
         output: cute.Tensor,
@@ -1945,9 +1950,8 @@ class SparseMLAKernel:
 
         _run_two_pass_sparse_mla_tile(
             q_u32,
-            kv_nope_u32,
+            kv_rows_u32,
             kv_scales,
-            kv_rope_u32,
             page_table_1,
             sTokenIdx,
             sScale,
@@ -2026,15 +2030,8 @@ def run_sparse_mla_kernel(
     if traits is None:
         raise ValueError("sparse MLA kernel only supports the exact CUDA GLM-5.1 contract")
 
-    kv_rows_bytes = kv_cache[:, 0, :].view(torch.uint8)
-    kv_nope_q = kv_rows_bytes[:, :_MLA_NOPE_DIM]
-    kv_scales = kv_rows_bytes[
-        :, _MLA_NOPE_DIM : _MLA_NOPE_DIM + _MLA_SCALE_GROUPS * 4
-    ].view(torch.float32)
-    kv_rope = kv_rows_bytes[:, _MLA_NOPE_DIM + _MLA_SCALE_GROUPS * 4 :].view(torch.bfloat16)
+    kv_rows_u32, kv_scales = _extract_packed_kv_runtime_views(kv_cache)
     q_u32 = _view_last_dim_as_u32(q_all)
-    kv_nope_u32 = _view_last_dim_as_u32(kv_nope_q)
-    kv_rope_u32 = _view_last_dim_as_u32(kv_rope)
     if isinstance(sm_scale, torch.Tensor):
         sm_scale_tensor = sm_scale
     else:
@@ -2048,9 +2045,8 @@ def run_sparse_mla_kernel(
     kernel = _build_sparse_mla_kernel_for_shape(traits, head_tiles)
     args = (
         _to_kernel_tensor(q_u32, cutlass.Uint32, assumed_align=16),
-        _to_kernel_tensor(kv_nope_u32, cutlass.Uint32, assumed_align=16),
+        _to_kernel_tensor(kv_rows_u32, cutlass.Uint32, assumed_align=16),
         _to_kernel_tensor(kv_scales, cutlass.Float32, assumed_align=4),
-        _to_kernel_tensor(kv_rope_u32, cutlass.Uint32, assumed_align=16),
         _to_kernel_tensor(page_table_1, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(sm_scale_tensor, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(output, _torch_to_cutlass_dtype(output.dtype)),
@@ -2058,9 +2054,8 @@ def run_sparse_mla_kernel(
     )
     cache_key = (
         _tensor_meta_key(q_u32),
-        _tensor_meta_key(kv_nope_u32),
+        _tensor_meta_key(kv_rows_u32),
         _tensor_meta_key(kv_scales),
-        _tensor_meta_key(kv_rope_u32),
         _tensor_meta_key(page_table_1),
         _tensor_meta_key(output),
         traits,

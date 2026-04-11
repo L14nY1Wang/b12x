@@ -25,6 +25,7 @@ _SCALE_BYTES = 4
 _WARP_THREADS = 32
 _TOKENS_PER_CTA = 4
 _THREADS_PER_CTA = _WARP_THREADS * _TOKENS_PER_CTA
+_SCORE_CTAS_PER_ROW = 32
 _MAX_Q_HEADS = 64
 _EAGER_HOST_LAUNCHER_CACHE_SIZE = 32
 
@@ -138,6 +139,8 @@ class SparseNSAIndexerLogitsKernel:
         page_table_1: cute.Tensor,
         query_row_to_batch: cute.Tensor,
         seqlens_per_query: cute.Tensor,
+        active_width: cute.Tensor,
+        trivial_topk: cute.Tensor,
         logits_out: cute.Tensor,
         stream: cuda.CUstream,
     ):
@@ -149,11 +152,13 @@ class SparseNSAIndexerLogitsKernel:
             page_table_1,
             query_row_to_batch,
             seqlens_per_query,
+            active_width,
+            trivial_topk,
             logits_out,
         ).launch(
             grid=(
                 q_bytes.shape[0],
-                (page_table_1.shape[1] + _TOKENS_PER_CTA - 1) // _TOKENS_PER_CTA,
+                _SCORE_CTAS_PER_ROW,
                 1,
             ),
             block=[_THREADS_PER_CTA, 1, 1],
@@ -170,10 +175,12 @@ class SparseNSAIndexerLogitsKernel:
         page_table_1: cute.Tensor,
         query_row_to_batch: cute.Tensor,
         seqlens_per_query: cute.Tensor,
+        active_width: cute.Tensor,
+        trivial_topk: cute.Tensor,
         logits_out: cute.Tensor,
     ):
         tx, _, _ = cute.arch.thread_idx()
-        q_idx, token_tile_idx, _ = cute.arch.block_idx()
+        q_idx, cta_idx, _ = cute.arch.block_idx()
         lane = tx % Int32(_WARP_THREADS)
         warp_idx = tx // Int32(_WARP_THREADS)
 
@@ -211,35 +218,48 @@ class SparseNSAIndexerLogitsKernel:
             w_linear += Int32(_THREADS_PER_CTA)
         cute.arch.sync_threads()
 
-        token_pos = token_tile_idx * Int32(_TOKENS_PER_CTA) + warp_idx
         width = Int32(page_table_1.shape[1])
-        if token_pos < width and lane == 0:
-            logits_out[q_idx, token_pos] = Float32(-Float32.inf)
-
         seq_len = Int32(seqlens_per_query[q_idx])
+        live_width = Int32(active_width[Int32(0)])
+        skip_topk = Int32(trivial_topk[Int32(0)])
+        if live_width > width:
+            live_width = width
         batch_row = Int32(query_row_to_batch[q_idx])
-        token_id = Int32(-1)
-        if token_pos < seq_len and token_pos < width:
-            token_id = Int32(page_table_1[batch_row, token_pos])
-
-        if token_pos < width and token_pos < seq_len and token_id >= Int32(0):
-            page_idx = token_id // Int32(_PAGE_SIZE)
-            slot_idx = token_id - page_idx * Int32(_PAGE_SIZE)
-            base = lane * Int32(4)
-
-            logit = Float32(0.0)
-            head_idx = Int32(0)
-            while head_idx < num_heads:
-                q0, q1, q2, q3 = _load_fp8x4_2d(sQ, head_idx, base)
-                k0, k1, k2, k3 = _load_fp8x4(k_quant_bytes, page_idx, slot_idx, base)
-                dot = Float32(q0 * k0 + q1 * k1 + q2 * k2 + q3 * k3)
-                dot = _warp_allreduce_sum(dot)
+        token_pos = cta_idx * Int32(_TOKENS_PER_CTA) + warp_idx
+        token_stride = Int32(_SCORE_CTAS_PER_ROW * _TOKENS_PER_CTA)
+        if seq_len > skip_topk:
+            while token_pos < live_width:
                 if lane == 0:
-                    logit = Float32(logit + attention_utils.fmax(dot, Float32(0.0)) * sW[head_idx])
-                head_idx += Int32(1)
+                    logits_out[q_idx, token_pos] = Float32(-Float32.inf)
 
-            if lane == 0:
-                logits_out[q_idx, token_pos] = Float32(logit * Float32(k_scales[page_idx, slot_idx]))
+                token_id = Int32(-1)
+                if token_pos < seq_len:
+                    token_id = Int32(page_table_1[batch_row, token_pos])
+
+                if token_pos < seq_len and token_id >= Int32(0):
+                    page_idx = token_id // Int32(_PAGE_SIZE)
+                    slot_idx = token_id - page_idx * Int32(_PAGE_SIZE)
+                    base = lane * Int32(4)
+
+                    logit = Float32(0.0)
+                    head_idx = Int32(0)
+                    while head_idx < num_heads:
+                        q0, q1, q2, q3 = _load_fp8x4_2d(sQ, head_idx, base)
+                        k0, k1, k2, k3 = _load_fp8x4(k_quant_bytes, page_idx, slot_idx, base)
+                        dot = Float32(q0 * k0 + q1 * k1 + q2 * k2 + q3 * k3)
+                        dot = _warp_allreduce_sum(dot)
+                        if lane == 0:
+                            logit = Float32(
+                                logit + attention_utils.fmax(dot, Float32(0.0)) * sW[head_idx]
+                            )
+                        head_idx += Int32(1)
+
+                    if lane == 0:
+                        logits_out[q_idx, token_pos] = Float32(
+                            logit * Float32(k_scales[page_idx, slot_idx])
+                        )
+
+                token_pos += token_stride
 
 
 @lru_cache(maxsize=8)
@@ -247,8 +267,35 @@ def _build_sparse_nsa_indexer_kernel() -> SparseNSAIndexerLogitsKernel:
     return SparseNSAIndexerLogitsKernel()
 
 
+@lru_cache(maxsize=64)
+def _cached_trivial_topk_tensor(
+    topk: int,
+    device_type: str,
+    device_index: int | None,
+) -> torch.Tensor:
+    return torch.tensor([topk], dtype=torch.int32, device=torch.device(device_type, device_index))
+
+
 def clear_sparse_nsa_indexer_kernel_cache() -> None:
     _build_sparse_nsa_indexer_kernel.cache_clear()
+    _cached_trivial_topk_tensor.cache_clear()
+
+
+def _split_index_k_cache_runtime_views(index_k_cache: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    if index_k_cache.stride(-1) != 1:
+        raise ValueError(
+            f"index_k_cache must have a contiguous last dimension, got stride={index_k_cache.stride()}"
+        )
+    num_pages = index_k_cache.shape[0]
+    data_bytes = _PAGE_SIZE * _INDEX_HEAD_DIM
+    k_quant_bytes = index_k_cache[:, :data_bytes].view(num_pages, _PAGE_SIZE, _INDEX_HEAD_DIM)
+    k_scales = (
+        index_k_cache[:, data_bytes : data_bytes + _PAGE_SIZE * _SCALE_BYTES]
+        .view(num_pages, _PAGE_SIZE, _SCALE_BYTES)
+        .view(torch.float32)
+        .squeeze(-1)
+    )
+    return k_quant_bytes, k_scales
 
 
 def supports_sparse_nsa_indexer_kernel(
@@ -296,6 +343,8 @@ def supports_sparse_nsa_indexer_kernel(
         return False
     if index_k_cache.dtype != torch.uint8:
         return False
+    if index_k_cache.stride(-1) != 1:
+        return False
     if (
         page_table_1.dtype != torch.int32
         or query_row_to_batch.dtype != torch.int32
@@ -313,6 +362,8 @@ def run_sparse_nsa_index_logits_kernel(
     page_table_1: torch.Tensor,
     query_row_to_batch: torch.Tensor,
     seqlens_per_query: torch.Tensor,
+    active_width: torch.Tensor | None = None,
+    trivial_topk: int | None = None,
     page_size: int = _PAGE_SIZE,
 ) -> torch.Tensor:
     if not supports_sparse_nsa_indexer_kernel(
@@ -330,17 +381,26 @@ def run_sparse_nsa_index_logits_kernel(
     width = page_table_1.shape[1]
     if rows == 0 or width == 0:
         return torch.empty((rows, width), dtype=torch.float32, device=q_fp8.device)
-
-    cache = index_k_cache.contiguous()
-    q_bytes = q_fp8.contiguous().view(torch.uint8)
-    data_bytes = _PAGE_SIZE * _INDEX_HEAD_DIM
-    k_quant_bytes = cache[:, :data_bytes].contiguous().view(cache.shape[0], _PAGE_SIZE, _INDEX_HEAD_DIM)
-    k_scales = (
-        cache[:, data_bytes : data_bytes + _PAGE_SIZE * _SCALE_BYTES]
-        .contiguous()
-        .view(torch.float32)
-        .view(cache.shape[0], _PAGE_SIZE)
+    if active_width is None:
+        active_width = torch.tensor([width], dtype=torch.int32, device=q_fp8.device)
+    if active_width.shape != (1,):
+        raise ValueError(f"active_width must have shape (1,), got {tuple(active_width.shape)}")
+    if active_width.dtype != torch.int32:
+        raise ValueError(f"active_width must have dtype torch.int32, got {active_width.dtype}")
+    if active_width.device != q_fp8.device:
+        raise ValueError(
+            f"active_width device {active_width.device} does not match q_fp8 device {q_fp8.device}"
+        )
+    if trivial_topk is None:
+        trivial_topk = 0
+    trivial_topk_tensor = _cached_trivial_topk_tensor(
+        int(trivial_topk),
+        q_fp8.device.type,
+        q_fp8.device.index,
     )
+
+    k_quant_bytes, k_scales = _split_index_k_cache_runtime_views(index_k_cache)
+    q_bytes = q_fp8.contiguous().view(torch.uint8)
     logits = torch.empty((rows, width), dtype=torch.float32, device=q_fp8.device)
 
     kernel = _build_sparse_nsa_indexer_kernel()
@@ -352,6 +412,8 @@ def run_sparse_nsa_index_logits_kernel(
         _to_kernel_tensor(page_table_1.contiguous(), cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(query_row_to_batch.contiguous(), cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(seqlens_per_query.contiguous(), cutlass.Int32, assumed_align=4),
+        _to_kernel_tensor(active_width.contiguous(), cutlass.Int32, assumed_align=4),
+        _to_kernel_tensor(trivial_topk_tensor, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(logits, cutlass.Float32, assumed_align=4),
         current_cuda_stream(),
     )
@@ -363,6 +425,8 @@ def run_sparse_nsa_index_logits_kernel(
         _tensor_meta_key(page_table_1),
         _tensor_meta_key(query_row_to_batch),
         _tensor_meta_key(seqlens_per_query),
+        _tensor_meta_key(active_width),
+        _tensor_meta_key(trivial_topk_tensor),
         _tensor_meta_key(logits),
     )
     _run_cached_host_launcher(kernel, cache_key, args)

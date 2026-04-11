@@ -235,6 +235,47 @@ def _make_workspace(
     )
 
 
+def _make_sparse_pool_locs(
+    *,
+    active_tokens: int,
+    pool_tokens: int,
+    seed: int,
+    device: torch.device,
+) -> torch.Tensor:
+    if pool_tokens < active_tokens:
+        raise ValueError(
+            f"pool_tokens {pool_tokens} must be at least active_tokens {active_tokens}"
+        )
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(seed)
+    locs = torch.randperm(pool_tokens, generator=gen)[:active_tokens]
+    return locs.to(device=device, dtype=torch.int32)
+
+
+def _embed_mla_cache_in_pool(
+    *,
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+    pool_locs: torch.Tensor,
+    pool_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    k_nope_pool = torch.zeros(
+        (pool_tokens, *k_nope.shape[1:]),
+        dtype=k_nope.dtype,
+        device=k_nope.device,
+    )
+    k_rope_pool = torch.zeros(
+        (pool_tokens, *k_rope.shape[1:]),
+        dtype=k_rope.dtype,
+        device=k_rope.device,
+    )
+    pool_indices = pool_locs.to(torch.long)
+    k_nope_pool[pool_indices] = k_nope
+    k_rope_pool[pool_indices] = k_rope
+    packed_pool = pack_mla_kv_cache_reference(k_nope_pool, k_rope_pool)
+    return k_nope_pool, k_rope_pool, packed_pool
+
+
 @pytest.mark.parametrize("cache_len", [63, 64, 65, 127, 128, 129])
 def test_glm51_layer0_mla_pack_roundtrip_matches_unquantized_cache(cache_len: int) -> None:
     device = require_sm120()
@@ -762,6 +803,7 @@ def test_glm51_layer0_decode_api_matches_dense_oracle_for_local_tp_heads() -> No
     _require_glm_weights()
 
     cache_len = 2050
+    topk = 2048
     local_heads = 8
     cfg, q_all, k_nope, k_rope = _make_glm_case(
         cache_len=cache_len,
@@ -769,14 +811,26 @@ def test_glm51_layer0_decode_api_matches_dense_oracle_for_local_tp_heads() -> No
         seed=49_901,
         device=device,
     )
-    packed = pack_mla_kv_cache_reference(k_nope, k_rope)
+    pool_locs = _make_sparse_pool_locs(
+        active_tokens=cache_len,
+        pool_tokens=cache_len * 2,
+        seed=49_911,
+        device=device,
+    )
+    k_nope_pool, k_rope_pool, packed = _embed_mla_cache_in_pool(
+        k_nope=k_nope,
+        k_rope=k_rope,
+        pool_locs=pool_locs,
+        pool_tokens=cache_len * 2,
+    )
     q_local = q_all[:, :local_heads, :].contiguous()
-    page_table_1 = torch.arange(2048, dtype=torch.int32, device=device).unsqueeze(0)
+    page_table_1 = pool_locs[:topk].unsqueeze(0)
     cache_seqlens = torch.tensor([cache_len], dtype=torch.int32, device=device)
+    nsa_cache_seqlens = torch.tensor([topk], dtype=torch.int32, device=device)
     metadata = MLASparseDecodeMetadata(
         page_table_1=page_table_1,
         cache_seqlens_int32=cache_seqlens,
-        nsa_cache_seqlens_int32=cache_seqlens,
+        nsa_cache_seqlens_int32=nsa_cache_seqlens,
         max_seq_len_k=cache_len,
     )
     workspace = MLAWorkspace.for_fixed_capacity(
@@ -787,7 +841,7 @@ def test_glm51_layer0_decode_api_matches_dense_oracle_for_local_tp_heads() -> No
         num_q_heads=local_heads,
         head_dim=cfg.kv_lora_rank + cfg.qk_rope_head_dim,
         v_head_dim=cfg.kv_lora_rank,
-        topk=2048,
+        topk=topk,
         max_total_q=1,
         max_batch=1,
     )
@@ -802,8 +856,8 @@ def test_glm51_layer0_decode_api_matches_dense_oracle_for_local_tp_heads() -> No
     )
     expected = dense_mla_reference(
         q_all=q_local,
-        k_nope=k_nope,
-        k_rope=k_rope,
+        k_nope=k_nope_pool,
+        k_rope=k_rope_pool,
         page_table_1=page_table_1,
         sm_scale=cfg.sm_scale,
         v_head_dim=cfg.kv_lora_rank,
@@ -821,6 +875,7 @@ def test_glm51_layer0_decode_api_matches_dense_oracle_for_local_tp_heads_fp8_vie
     _require_glm_weights()
 
     cache_len = 2050
+    topk = 2048
     local_heads = 8
     cfg, q_all, k_nope, k_rope = _make_glm_case(
         cache_len=cache_len,
@@ -828,14 +883,27 @@ def test_glm51_layer0_decode_api_matches_dense_oracle_for_local_tp_heads_fp8_vie
         seed=49_902,
         device=device,
     )
-    packed = pack_mla_kv_cache_reference(k_nope, k_rope).view(torch.float8_e4m3fn)
+    pool_locs = _make_sparse_pool_locs(
+        active_tokens=cache_len,
+        pool_tokens=cache_len * 2,
+        seed=49_912,
+        device=device,
+    )
+    k_nope_pool, k_rope_pool, packed_pool = _embed_mla_cache_in_pool(
+        k_nope=k_nope,
+        k_rope=k_rope,
+        pool_locs=pool_locs,
+        pool_tokens=cache_len * 2,
+    )
+    packed = packed_pool.view(torch.float8_e4m3fn)
     q_local = q_all[:, :local_heads, :].contiguous()
-    page_table_1 = torch.arange(2048, dtype=torch.int32, device=device).unsqueeze(0)
+    page_table_1 = pool_locs[:topk].unsqueeze(0)
     cache_seqlens = torch.tensor([cache_len], dtype=torch.int32, device=device)
+    nsa_cache_seqlens = torch.tensor([topk], dtype=torch.int32, device=device)
     metadata = MLASparseDecodeMetadata(
         page_table_1=page_table_1,
         cache_seqlens_int32=cache_seqlens,
-        nsa_cache_seqlens_int32=cache_seqlens,
+        nsa_cache_seqlens_int32=nsa_cache_seqlens,
         max_seq_len_k=cache_len,
     )
     workspace = MLAWorkspace.for_fixed_capacity(
@@ -846,7 +914,7 @@ def test_glm51_layer0_decode_api_matches_dense_oracle_for_local_tp_heads_fp8_vie
         num_q_heads=local_heads,
         head_dim=cfg.kv_lora_rank + cfg.qk_rope_head_dim,
         v_head_dim=cfg.kv_lora_rank,
-        topk=2048,
+        topk=topk,
         max_total_q=1,
         max_batch=1,
     )
@@ -861,8 +929,8 @@ def test_glm51_layer0_decode_api_matches_dense_oracle_for_local_tp_heads_fp8_vie
     )
     expected = dense_mla_reference(
         q_all=q_local,
-        k_nope=k_nope,
-        k_rope=k_rope,
+        k_nope=k_nope_pool,
+        k_rope=k_rope_pool,
         page_table_1=page_table_1,
         sm_scale=cfg.sm_scale,
         v_head_dim=cfg.kv_lora_rank,
