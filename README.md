@@ -13,7 +13,7 @@ Currently supported kernels:
 - Sparse MLA attention (for DSA/NSA only).
 
 ```bash
-python -m pip install b12x
+pip install b12x
 ```
 
 Ask your friendly neighborhood AI agent for further information on how to use this library.
