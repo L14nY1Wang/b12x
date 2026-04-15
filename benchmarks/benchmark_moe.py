@@ -1448,6 +1448,11 @@ def bench_e2e() -> None:
         for batch_size, result in batch_results.items()
         if result.ratio_stats is not None
     }
+    backend_us_results = [
+        result.backend_stats.median_us
+        for result in batch_results.values()
+        if result.ref_stats is None
+    ]
     if batch_results:
         print(f"\n{'=' * 70}")
         print("  Summary")
@@ -1467,6 +1472,8 @@ def bench_e2e() -> None:
             for ratio in ratio_results.values():
                 geo *= ratio
             print(f"  geo mean: {geo ** (1.0 / len(ratio_results)):.2f}x")
+        elif backend_us_results:
+            print(f"  geo mean: {statistics.geometric_mean(backend_us_results):.1f} us")
 
     if accuracy_failures:
         print(f"\n\033[1;31m{'=' * 70}")
