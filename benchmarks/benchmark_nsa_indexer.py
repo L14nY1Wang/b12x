@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark realistic SGLang-like NSA logits plus top-k transform."""
+"""Benchmark realistic SGLang-like NSA decode plus eager-prefill chunks."""
 
 from __future__ import annotations
 
@@ -43,6 +43,7 @@ MODEL_PATH = pathlib.Path("/data/models/GLM-5.1-NVFP4")
 DEFAULT_POOL_FACTOR = 6
 DEFAULT_GRAPH_WIDTH = 8192
 DEFAULT_TOPK = 2048
+DEFAULT_EXTEND_Q_LENS = (16384,)
 
 
 @dataclass(frozen=True)
@@ -480,6 +481,7 @@ def _run_extend_case(
                 "mode": "extend",
                 "batch": batch,
                 "q_len": q_len,
+                "shape": "eager_prefill_chunk",
                 "cache_len": cache_len,
                 "width": width,
                 "topk": topk,
@@ -499,7 +501,11 @@ def main() -> None:
     parser.add_argument("--mode", choices=("decode", "extend", "both"), default="decode")
     parser.add_argument("--decode-rows", default="1,16")
     parser.add_argument("--extend-batches", default="8")
-    parser.add_argument("--extend-q-lens", default="4")
+    parser.add_argument(
+        "--extend-q-lens",
+        default="16384",
+        help=f"eager-prefill chunk q lengths, default {','.join(str(v) for v in DEFAULT_EXTEND_Q_LENS)}",
+    )
     parser.add_argument("--cache-lens", default="1024,32768,131072")
     parser.add_argument(
         "--width",
@@ -542,6 +548,13 @@ def main() -> None:
         for cache_len in cache_lens:
             for batch in extend_batches:
                 for q_len in extend_q_lens:
+                    if q_len > cache_len:
+                        print(
+                            f"skip extend batch={batch} q_len={q_len} cache_len={cache_len}: "
+                            "one eager prefill chunk cannot exceed the active KV span",
+                            file=sys.stderr,
+                        )
+                        continue
                     _run_extend_case(
                         cfg=cfg,
                         batch=batch,

@@ -570,105 +570,120 @@ class SparseNSAExtendLogitsKernel:
             row_linear += Int32(_THREADS_PER_CTA)
         cute.arch.sync_threads()
 
-        producer_state = pipeline.PipelineStateSimple(1, Int32(0))
-        consumer_state = pipeline.PipelineStateSimple(1, Int32(0))
-        if warp_idx == Int32(0):
-            full_mbar_ptr = mbar_ptr_k + producer_state.index
-            with cute.arch.elect_one():
-                cute.arch.mbarrier_arrive_and_expect_tx(
-                    full_mbar_ptr,
-                    Int32(_BLOCK_K * _INDEX_HEAD_DIM),
-                )
-                _cp_async_bulk_tensor_2d(
-                    shared_ptr_to_u32(s_k_linear_bytes.iterator),
-                    Int64(k_tma_desc_ptrs[Int32(0)]),
-                    Int32(0),
-                    k_tile_base,
-                    shared_ptr_to_u32(full_mbar_ptr),
-                )
-        cute.arch.mbarrier_wait(
-            mbar_ptr_k + consumer_state.index,
-            phase=consumer_state.phase,
-        )
+        if tx == 0:
+            tile_k_end = k_tile_base + Int32(_BLOCK_K)
+            if tile_k_end > k_total_rows:
+                tile_k_end = k_total_rows
+            tile_live = Int32(0)
+            if k_tile_base < tile_k_end:
+                for row_idx in cutlass.range_constexpr(_BLOCK_Q):
+                    row_start = Int32(s_k_start[row_idx])
+                    row_end = Int32(s_k_end[row_idx])
+                    row_live = cutlass.select_(row_end > k_tile_base, Int32(1), Int32(0))
+                    row_live = cutlass.select_(row_start < tile_k_end, row_live, Int32(0))
+                    tile_live = cutlass.select_(row_live != Int32(0), Int32(1), tile_live)
+            s_q_bytes[Int32(0), Int32(0)] = cutlass.Int8(tile_live)
         cute.arch.sync_threads()
-
-        _repack_k_tile_to_permuted(k_linear_base_addr, k_perm_base_addr, tx)
-        scale_linear = tx
-        while scale_linear < Int32(_BLOCK_K):
-            s_scales[scale_linear] = Float32(k_scales[k_tile_base + scale_linear])
-            scale_linear += Int32(_THREADS_PER_CTA)
-        cute.arch.sync_threads()
-
-        frag_layout = cute.make_layout((1, 1, 8), stride=(8, 8, 1))
-        acc_frag = cute.make_rmem_tensor(frag_layout, Float32)
-        _zero_score_frag(acc_frag)
-
-        head_idx = Int32(0)
-        while head_idx < num_heads:
-            _stage_q_tile_raw(q_u32, head_idx, q_tile_base, q_base_addr, valid_q_rows, tx)
-
-            weight_linear = tx
-            while weight_linear < Int32(_BLOCK_Q):
-                q_row = q_tile_base + weight_linear
-                s_weights[weight_linear] = (
-                    Float32(weights[q_row, head_idx]) if q_row < valid_q_rows else Float32(0.0)
-                )
-                weight_linear += Int32(_THREADS_PER_CTA)
+        if Int32(s_q_bytes[Int32(0), Int32(0)]) != Int32(0):
+            producer_state = pipeline.PipelineStateSimple(1, Int32(0))
+            consumer_state = pipeline.PipelineStateSimple(1, Int32(0))
+            if warp_idx == Int32(0):
+                full_mbar_ptr = mbar_ptr_k + producer_state.index
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(
+                        full_mbar_ptr,
+                        Int32(_BLOCK_K * _INDEX_HEAD_DIM),
+                    )
+                    _cp_async_bulk_tensor_2d(
+                        shared_ptr_to_u32(s_k_linear_bytes.iterator),
+                        Int64(k_tma_desc_ptrs[Int32(0)]),
+                        Int32(0),
+                        k_tile_base,
+                        shared_ptr_to_u32(full_mbar_ptr),
+                    )
+            cute.arch.mbarrier_wait(
+                mbar_ptr_k + consumer_state.index,
+                phase=consumer_state.phase,
+            )
             cute.arch.sync_threads()
 
-            score_frag = cute.make_rmem_tensor(frag_layout, Float32)
-            _zero_score_frag(score_frag)
-            _literal_qk_mma_into_sfrag_mxfp8_raw(
-                score_frag,
-                s_q_bytes,
-                k_perm_base_addr,
-                lane,
-                warp_q_idx,
-                warp_k_idx,
-                Int32(0),
-                Int32(1),
-                Int32(1),
-                Int32(_INDEX_HEAD_DIM // 16),
-                Int32(0),
-                Int32(_FP8_ROW_VECS),
-            )
+            _repack_k_tile_to_permuted(k_linear_base_addr, k_perm_base_addr, tx)
+            scale_linear = tx
+            while scale_linear < Int32(_BLOCK_K):
+                s_scales[scale_linear] = Float32(k_scales[k_tile_base + scale_linear])
+                scale_linear += Int32(_THREADS_PER_CTA)
+            cute.arch.sync_threads()
+
+            frag_layout = cute.make_layout((1, 1, 8), stride=(8, 8, 1))
+            acc_frag = cute.make_rmem_tensor(frag_layout, Float32)
+            _zero_score_frag(acc_frag)
+
+            head_idx = Int32(0)
+            while head_idx < num_heads:
+                _stage_q_tile_raw(q_u32, head_idx, q_tile_base, q_base_addr, valid_q_rows, tx)
+
+                weight_linear = tx
+                while weight_linear < Int32(_BLOCK_Q):
+                    q_row = q_tile_base + weight_linear
+                    s_weights[weight_linear] = (
+                        Float32(weights[q_row, head_idx]) if q_row < valid_q_rows else Float32(0.0)
+                    )
+                    weight_linear += Int32(_THREADS_PER_CTA)
+                cute.arch.sync_threads()
+
+                score_frag = cute.make_rmem_tensor(frag_layout, Float32)
+                _zero_score_frag(score_frag)
+                _literal_qk_mma_into_sfrag_mxfp8_raw(
+                    score_frag,
+                    s_q_bytes,
+                    k_perm_base_addr,
+                    lane,
+                    warp_q_idx,
+                    warp_k_idx,
+                    Int32(0),
+                    Int32(1),
+                    Int32(1),
+                    Int32(_INDEX_HEAD_DIM // 16),
+                    Int32(0),
+                    Int32(_FP8_ROW_VECS),
+                )
+                lane_group = lane // Int32(4)
+                for reg_id in cutlass.range_constexpr(8):
+                    row_slot = (reg_id % 4) // 2
+                    q_local = warp_q_idx * Int32(16) + lane_group + Int32(8 * row_slot)
+                    if q_local < Int32(_BLOCK_Q):
+                        acc_frag[0, 0, reg_id] = Float32(
+                            acc_frag[0, 0, reg_id]
+                            + attention_utils.fmax(score_frag[0, 0, reg_id], Float32(0.0))
+                            * s_weights[q_local]
+                        )
+                cute.arch.sync_threads()
+                head_idx += Int32(1)
+
             lane_group = lane // Int32(4)
+            lane_pair_base = Int32(2) * (lane % Int32(4))
             for reg_id in cutlass.range_constexpr(8):
                 row_slot = (reg_id % 4) // 2
                 q_local = warp_q_idx * Int32(16) + lane_group + Int32(8 * row_slot)
-                if q_local < Int32(_BLOCK_Q):
-                    acc_frag[0, 0, reg_id] = Float32(
-                        acc_frag[0, 0, reg_id]
-                        + attention_utils.fmax(score_frag[0, 0, reg_id], Float32(0.0))
-                        * s_weights[q_local]
-                    )
-            cute.arch.sync_threads()
-            head_idx += Int32(1)
-
-        lane_group = lane // Int32(4)
-        lane_pair_base = Int32(2) * (lane % Int32(4))
-        for reg_id in cutlass.range_constexpr(8):
-            row_slot = (reg_id % 4) // 2
-            q_local = warp_q_idx * Int32(16) + lane_group + Int32(8 * row_slot)
-            k_local = (
-                warp_k_idx * Int32(16)
-                + lane_pair_base
-                + Int32(8 * (reg_id // 4))
-                + Int32(reg_id % 2)
-            )
-            q_row = q_tile_base + q_local
-            k_row = k_tile_base + k_local
-            if (
-                q_local < Int32(_BLOCK_Q)
-                and k_local < Int32(_BLOCK_K)
-                and q_row < valid_q_rows
-                and q_row < q_total_rows
-                and k_row < k_total_rows
-            ):
-                row_start = Int32(s_k_start[q_local])
-                row_end = Int32(s_k_end[q_local])
-                if k_row >= row_start and k_row < row_end:
-                    logits_out[q_row, k_row] = Float32(acc_frag[0, 0, reg_id] * s_scales[k_local])
+                k_local = (
+                    warp_k_idx * Int32(16)
+                    + lane_pair_base
+                    + Int32(8 * (reg_id // 4))
+                    + Int32(reg_id % 2)
+                )
+                q_row = q_tile_base + q_local
+                k_row = k_tile_base + k_local
+                if (
+                    q_local < Int32(_BLOCK_Q)
+                    and k_local < Int32(_BLOCK_K)
+                    and q_row < valid_q_rows
+                    and q_row < q_total_rows
+                    and k_row < k_total_rows
+                ):
+                    row_start = Int32(s_k_start[q_local])
+                    row_end = Int32(s_k_end[q_local])
+                    if k_row >= row_start and k_row < row_end:
+                        logits_out[q_row, k_row] = Float32(acc_frag[0, 0, reg_id] * s_scales[k_local])
 
 
 @lru_cache(maxsize=16)
@@ -688,9 +703,6 @@ def supports_sparse_nsa_extend_logits_kernel(
     if os.environ.get("B12X_NSA_INDEXER_FORCE_REFERENCE", "0") == "1":
         return False
     if q_fp8.device.type != "cuda":
-        return False
-    major, _minor = torch.cuda.get_device_capability(q_fp8.device)
-    if major < 9:
         return False
     if q_fp8.ndim != 3 or q_fp8.shape[2] != _INDEX_HEAD_DIM:
         return False
