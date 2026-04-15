@@ -32,7 +32,7 @@ class MLASparseDecodeMetadata:
 
 @dataclass(frozen=True)
 class MLASparseExtendMetadata:
-    page_table_1: torch.Tensor
+    selected_token_offsets: torch.Tensor
     cache_seqlens_int32: torch.Tensor
     nsa_cache_seqlens_int32: torch.Tensor
     nsa_cu_seqlens_q: torch.Tensor
@@ -40,6 +40,11 @@ class MLASparseExtendMetadata:
     max_seq_len_q: int
     max_seq_len_k: int
     mode: Literal["extend", "verify", "target_verify", "draft_extend"] = "extend"
+
+    @property
+    def page_table_1(self) -> torch.Tensor:
+        # Compatibility alias for existing internal callers/tests during migration.
+        return self.selected_token_offsets
 
 
 def clear_mla_caches() -> None:
@@ -85,7 +90,7 @@ def sparse_mla_extend_forward(
     v_head_dim: int,
 ) -> torch.Tensor:
     workspace.prepare_extend(
-        metadata.page_table_1,
+        metadata.selected_token_offsets,
         metadata.cache_seqlens_int32,
         metadata.nsa_cache_seqlens_int32,
     )
@@ -106,10 +111,10 @@ def _run_sparse_mla(
     sm_scale: float,
     v_head_dim: int,
 ) -> torch.Tensor:
-    page_table_1 = workspace.page_table_1
+    selected_indices = workspace.page_table_1
     active_token_counts = workspace.nsa_cache_seqlens_int32
-    if page_table_1 is None:
-        raise RuntimeError("workspace metadata is not prepared")
+    if selected_indices is None:
+        raise RuntimeError("workspace selected-index metadata is not prepared")
     if active_token_counts is None:
         raise RuntimeError("workspace active token counts are not prepared")
     if q_all.ndim != 3:
@@ -124,9 +129,10 @@ def _run_sparse_mla(
         raise ValueError(
             f"kv_cache device {kv_cache.device} does not match workspace device {workspace.device}"
         )
-    if page_table_1.device != workspace.device:
+    if selected_indices.device != workspace.device:
         raise ValueError(
-            f"page_table_1 device {page_table_1.device} does not match workspace device {workspace.device}"
+            "selected indices device "
+            f"{selected_indices.device} does not match workspace device {workspace.device}"
         )
     if q_all.dtype != workspace.dtype:
         raise ValueError(f"q_all dtype {q_all.dtype} does not match workspace dtype {workspace.dtype}")
@@ -134,8 +140,10 @@ def _run_sparse_mla(
         raise ValueError(
             f"kv_cache dtype {kv_cache.dtype} does not match workspace kv_dtype {workspace.kv_dtype}"
         )
-    if page_table_1.dtype != torch.int32:
-        raise ValueError(f"page_table_1 must have dtype torch.int32, got {page_table_1.dtype}")
+    if selected_indices.dtype != torch.int32:
+        raise ValueError(
+            f"selected indices must have dtype torch.int32, got {selected_indices.dtype}"
+        )
     if int(v_head_dim) != workspace.v_head_dim:
         raise ValueError(
             f"v_head_dim {v_head_dim} does not match workspace v_head_dim {workspace.v_head_dim}"
@@ -144,13 +152,13 @@ def _run_sparse_mla(
         raise ValueError(
             f"q_all rows {q_all.shape[0]} exceed workspace capacity {workspace.max_total_q}"
         )
-    if q_all.shape[0] != page_table_1.shape[0]:
+    if q_all.shape[0] != selected_indices.shape[0]:
         raise ValueError(
-            f"page_table_1 rows {page_table_1.shape[0]} do not match q_all rows {q_all.shape[0]}"
+            f"selected-index rows {selected_indices.shape[0]} do not match q_all rows {q_all.shape[0]}"
         )
-    if page_table_1.shape[1] > workspace.topk:
+    if selected_indices.shape[1] > workspace.topk:
         raise ValueError(
-            f"page_table_1 width {page_table_1.shape[1]} exceeds workspace topk {workspace.topk}"
+            f"selected-index width {selected_indices.shape[1]} exceeds workspace topk {workspace.topk}"
         )
     if q_all.shape[1] != workspace.num_q_heads:
         raise ValueError(
@@ -168,7 +176,7 @@ def _run_sparse_mla(
         split_cfg = select_sparse_mla_split_decode_config(
             q_all=q_all,
             kv_cache=kv_cache,
-            page_table_1=page_table_1,
+            page_table_1=selected_indices,
             active_token_counts=active_token_counts,
             output_dtype=q_all.dtype,
             v_head_dim=v_head_dim,
@@ -193,7 +201,7 @@ def _run_sparse_mla(
         run_sparse_mla_split_decode(
             q_all=q_all,
             kv_cache=kv_cache,
-            page_table_1=page_table_1,
+            page_table_1=selected_indices,
             active_token_counts=active_token_counts,
             sm_scale=sm_scale_tensor,
             kv_chunk_size_ptr=workspace.kv_chunk_size_ptr,
@@ -207,7 +215,7 @@ def _run_sparse_mla(
     elif not use_reference and supports_sparse_mla_kernel(
         q_all=q_all,
         kv_cache=kv_cache,
-        page_table_1=page_table_1,
+        page_table_1=selected_indices,
         v_head_dim=v_head_dim,
     ):
         output = torch.empty(
@@ -218,7 +226,7 @@ def _run_sparse_mla(
         run_sparse_mla_kernel(
             q_all=q_all,
             kv_cache=kv_cache,
-            page_table_1=page_table_1,
+            page_table_1=selected_indices,
             active_token_counts=active_token_counts,
             sm_scale=sm_scale_tensor,
             output=output,
@@ -233,7 +241,8 @@ def _run_sparse_mla(
         output = sparse_mla_reference(
             q_all=q_all,
             kv_cache=kv_cache,
-            page_table_1=page_table_1,
+            page_table_1=selected_indices,
+            active_token_counts=active_token_counts,
             sm_scale=sm_scale,
             v_head_dim=v_head_dim,
         )

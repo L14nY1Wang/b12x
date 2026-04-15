@@ -512,7 +512,7 @@ def test_glm51_layer0_extend_api_handles_sparse_indices_and_padding() -> None:
     cache_seqlens = torch.full((q_len,), cache_len, dtype=torch.int32, device=device)
     cu_seqlens = torch.arange(0, q_len + 1, dtype=torch.int32, device=device)
     metadata = MLASparseExtendMetadata(
-        page_table_1=page_table_1,
+        selected_token_offsets=page_table_1,
         cache_seqlens_int32=cache_seqlens,
         nsa_cache_seqlens_int32=cache_seqlens,
         nsa_cu_seqlens_q=cu_seqlens,
@@ -1014,7 +1014,7 @@ def test_glm51_layer0_extend_api_matches_dense_oracle(cache_len: int) -> None:
     cache_seqlens = torch.full((q_len,), cache_len, dtype=torch.int32, device=device)
     cu_seqlens = torch.arange(0, q_len + 1, dtype=torch.int32, device=device)
     metadata = MLASparseExtendMetadata(
-        page_table_1=page_table_1,
+        selected_token_offsets=page_table_1,
         cache_seqlens_int32=cache_seqlens,
         nsa_cache_seqlens_int32=cache_seqlens,
         nsa_cu_seqlens_q=cu_seqlens,
@@ -1085,7 +1085,7 @@ def test_glm51_layer0_extend_api_respects_active_token_counts() -> None:
     cache_seqlens = torch.full((1,), cache_len, dtype=torch.int32, device=device)
     cu_seqlens = torch.arange(0, q_len + 1, dtype=torch.int32, device=device)
     metadata = MLASparseExtendMetadata(
-        page_table_1=page_table_actual,
+        selected_token_offsets=page_table_actual,
         cache_seqlens_int32=cache_seqlens,
         nsa_cache_seqlens_int32=active_counts,
         nsa_cu_seqlens_q=cu_seqlens,

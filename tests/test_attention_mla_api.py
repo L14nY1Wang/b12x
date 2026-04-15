@@ -30,9 +30,18 @@ def test_sparse_mla_decode_keeps_query_head_shape(monkeypatch) -> None:
     workspace = _make_workspace(mode="decode")
     captured: dict[str, torch.Tensor | float | int] = {}
 
-    def fake_sparse_mla_reference(*, q_all, kv_cache, page_table_1, sm_scale, v_head_dim):
+    def fake_sparse_mla_reference(
+        *,
+        q_all,
+        kv_cache,
+        page_table_1,
+        active_token_counts=None,
+        sm_scale,
+        v_head_dim,
+    ):
         captured["q"] = q_all
         captured["page_table_1"] = page_table_1
+        captured["active_token_counts"] = active_token_counts
         captured["kv_cache"] = kv_cache
         captured["sm_scale"] = sm_scale
         captured["d_v"] = v_head_dim
@@ -75,8 +84,16 @@ def test_sparse_mla_decode_keeps_query_head_shape(monkeypatch) -> None:
 def test_sparse_mla_extend_uses_bound_metadata(monkeypatch) -> None:
     workspace = _make_workspace(mode="extend", topk=6)
 
-    def fake_sparse_mla_reference(*, q_all, kv_cache, page_table_1, sm_scale, v_head_dim):
-        del kv_cache, page_table_1, sm_scale, v_head_dim
+    def fake_sparse_mla_reference(
+        *,
+        q_all,
+        kv_cache,
+        page_table_1,
+        active_token_counts=None,
+        sm_scale,
+        v_head_dim,
+    ):
+        del kv_cache, page_table_1, active_token_counts, sm_scale, v_head_dim
         return q_all[:, :8, :].clone()
 
     monkeypatch.setattr(
@@ -97,7 +114,7 @@ def test_sparse_mla_extend_uses_bound_metadata(monkeypatch) -> None:
     cache_seqlens = torch.tensor([12, 12, 12], dtype=torch.int32)
     nsa_cu = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
     metadata = MLASparseExtendMetadata(
-        page_table_1=page_table_1,
+        selected_token_offsets=page_table_1,
         cache_seqlens_int32=cache_seqlens,
         nsa_cache_seqlens_int32=cache_seqlens,
         nsa_cu_seqlens_q=nsa_cu,
@@ -169,7 +186,7 @@ def test_sparse_mla_verify_prefers_split_path(monkeypatch) -> None:
     nsa_cache_seqlens = torch.full((5,), 12, dtype=torch.int32)
     nsa_cu = torch.tensor([0, 5], dtype=torch.int32)
     metadata = MLASparseExtendMetadata(
-        page_table_1=page_table_1,
+        selected_token_offsets=page_table_1,
         cache_seqlens_int32=cache_seqlens,
         nsa_cache_seqlens_int32=nsa_cache_seqlens,
         nsa_cu_seqlens_q=nsa_cu,
@@ -230,7 +247,7 @@ def test_sparse_mla_extend_prefers_split_path(monkeypatch) -> None:
     nsa_cache_seqlens = torch.tensor([1537, 1024, 257, 64, 0], dtype=torch.int32)
     nsa_cu = torch.tensor([0, 5], dtype=torch.int32)
     metadata = MLASparseExtendMetadata(
-        page_table_1=page_table_1,
+        selected_token_offsets=page_table_1,
         cache_seqlens_int32=cache_seqlens,
         nsa_cache_seqlens_int32=nsa_cache_seqlens,
         nsa_cu_seqlens_q=nsa_cu,
@@ -289,7 +306,7 @@ def test_sparse_mla_extend_passes_active_token_counts_to_kernel(monkeypatch) -> 
     nsa_cache_seqlens = torch.tensor([6, 4, 2], dtype=torch.int32)
     nsa_cu = torch.tensor([0, 3], dtype=torch.int32)
     metadata = MLASparseExtendMetadata(
-        page_table_1=page_table_1,
+        selected_token_offsets=page_table_1,
         cache_seqlens_int32=cache_seqlens,
         nsa_cache_seqlens_int32=nsa_cache_seqlens,
         nsa_cu_seqlens_q=nsa_cu,

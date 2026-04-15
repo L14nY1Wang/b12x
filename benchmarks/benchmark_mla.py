@@ -420,6 +420,19 @@ def _make_mla_workspace(
     )
 
 
+def _remap_selected_indices_to_local_offsets(
+    *,
+    selected_indices: torch.Tensor,
+    physical_to_local: torch.Tensor,
+) -> torch.Tensor:
+    local_offsets = physical_to_local.index_select(
+        0,
+        selected_indices.clamp_min(0).reshape(-1).to(torch.long),
+    ).view_as(selected_indices)
+    local_offsets.masked_fill_(selected_indices < 0, -1)
+    return local_offsets
+
+
 def _run_decode_case(
     *,
     case: DecodeCase,
@@ -573,8 +586,8 @@ def _run_decode_case(
     )
     split_cfg = select_sparse_mla_split_decode_config(
         q_all=q_all,
-        kv_cache=kv_cache,
-        page_table_1=actual_topk,
+        kv_cache=mla_kv_cache,
+        page_table_1=mla_selected_indices,
         output_dtype=q_all.dtype,
         v_head_dim=cfg.kv_lora_rank,
     )
@@ -856,18 +869,44 @@ def _run_verify_case(
         topk=case.topk,
     )
 
+    extend_k_nope = k_nope[pool_locs.to(torch.long)]
+    extend_k_rope = k_rope[pool_locs.to(torch.long)]
+    extend_kv_cache = pack_mla_kv_cache_reference(extend_k_nope, extend_k_rope)
+    physical_to_local = torch.full(
+        (pool_tokens,),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
+    physical_to_local[pool_locs.to(torch.long)] = torch.arange(
+        pool_locs.shape[0],
+        dtype=torch.int32,
+        device=device,
+    )
+    extend_topk = _remap_selected_indices_to_local_offsets(
+        selected_indices=actual_topk,
+        physical_to_local=physical_to_local,
+    )
+
+    mla_selected_indices = actual_topk if case.mode == "verify" else extend_topk
+    mla_kv_cache = kv_cache if case.mode == "verify" else extend_kv_cache
+    mla_k_nope = k_nope if case.mode == "verify" else extend_k_nope
+    mla_k_rope = k_rope if case.mode == "verify" else extend_k_rope
+    mla_metadata_mode = "target_verify" if case.mode == "verify" else "extend"
+    mla_workspace_mode = "verify" if case.mode == "verify" else "extend"
+
     mla_metadata = MLASparseExtendMetadata(
-        page_table_1=actual_topk,
+        selected_token_offsets=mla_selected_indices,
         cache_seqlens_int32=graph_batch_cache_seqlens,
         nsa_cache_seqlens_int32=graph_nsa_cache_seqlens,
         nsa_cu_seqlens_q=cu_seqlens_q,
         nsa_cu_seqlens_k=cu_seqlens_k,
         max_seq_len_q=case.q_len,
         max_seq_len_k=aligned_graph_width,
-        mode="target_verify",
+        mode=mla_metadata_mode,
     )
     mla_workspace = _make_mla_workspace(
-        mode="verify",
+        mode=mla_workspace_mode,
         cfg=cfg,
         device=device,
         topk=case.topk,
@@ -876,8 +915,8 @@ def _run_verify_case(
     )
     split_cfg = select_sparse_mla_split_decode_config(
         q_all=q_all,
-        kv_cache=kv_cache,
-        page_table_1=actual_topk,
+        kv_cache=mla_kv_cache,
+        page_table_1=mla_selected_indices,
         output_dtype=q_all.dtype,
         v_head_dim=cfg.kv_lora_rank,
     )
@@ -885,7 +924,7 @@ def _run_verify_case(
     def run_mla():
         return sparse_mla_extend_forward(
             q_all=q_all,
-            kv_cache=kv_cache,
+            kv_cache=mla_kv_cache,
             metadata=mla_metadata,
             workspace=mla_workspace,
             sm_scale=cfg.sm_scale,
@@ -905,18 +944,26 @@ def _run_verify_case(
             seqlens=graph_expanded_cache_seqlens,
             topk=case.topk,
         )
+        mla_step_selected_indices = (
+            topk_indices
+            if case.mode == "verify"
+            else _remap_selected_indices_to_local_offsets(
+                selected_indices=topk_indices,
+                physical_to_local=physical_to_local,
+            )
+        )
         return sparse_mla_extend_forward(
             q_all=q_all,
-            kv_cache=kv_cache,
+            kv_cache=mla_kv_cache,
             metadata=MLASparseExtendMetadata(
-                page_table_1=topk_indices,
+                selected_token_offsets=mla_step_selected_indices,
                 cache_seqlens_int32=graph_batch_cache_seqlens,
                 nsa_cache_seqlens_int32=graph_nsa_cache_seqlens,
                 nsa_cu_seqlens_q=cu_seqlens_q,
                 nsa_cu_seqlens_k=cu_seqlens_k,
                 max_seq_len_q=case.q_len,
                 max_seq_len_k=aligned_graph_width,
-                mode="target_verify",
+                mode=mla_metadata_mode,
             ),
             workspace=mla_workspace,
             sm_scale=cfg.sm_scale,
@@ -927,9 +974,9 @@ def _run_verify_case(
     actual_output = run_mla()
     expected_output = dense_mla_reference(
         q_all=q_all,
-        k_nope=k_nope,
-        k_rope=k_rope,
-        page_table_1=actual_topk,
+        k_nope=mla_k_nope,
+        k_rope=mla_k_rope,
+        page_table_1=mla_selected_indices,
         sm_scale=cfg.sm_scale,
         v_head_dim=cfg.kv_lora_rank,
     )

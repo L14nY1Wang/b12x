@@ -234,12 +234,12 @@ class MLAWorkspace:
 
     def prepare_extend(
         self,
-        page_table_1: torch.Tensor,
+        selected_token_offsets: torch.Tensor,
         cache_seqlens_int32: torch.Tensor,
         nsa_cache_seqlens_int32: torch.Tensor,
     ) -> None:
         self._prepare_sparse(
-            page_table_1=page_table_1,
+            page_table_1=selected_token_offsets,
             cache_seqlens_int32=cache_seqlens_int32,
             nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
         )

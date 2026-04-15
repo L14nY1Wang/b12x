@@ -114,6 +114,7 @@ def sparse_mla_reference(
     q_all: torch.Tensor,
     kv_cache: torch.Tensor,
     page_table_1: torch.Tensor,
+    active_token_counts: torch.Tensor | None = None,
     sm_scale: float,
     v_head_dim: int,
 ) -> torch.Tensor:
@@ -125,6 +126,7 @@ def sparse_mla_reference(
         k_all=kv,
         v_all=kv[:, :v_head_dim],
         page_table_1=page_table_1,
+        active_token_counts=active_token_counts,
         sm_scale=sm_scale,
     )
 
@@ -135,6 +137,7 @@ def _sparse_attention_reference(
     k_all: torch.Tensor,
     v_all: torch.Tensor,
     page_table_1: torch.Tensor,
+    active_token_counts: torch.Tensor | None = None,
     sm_scale: float,
 ) -> torch.Tensor:
     if q_all.ndim != 3:
@@ -145,6 +148,12 @@ def _sparse_attention_reference(
         raise ValueError(
             f"page_table_1 rows {page_table_1.shape[0]} do not match q rows {q_all.shape[0]}"
         )
+    if active_token_counts is not None:
+        if active_token_counts.ndim != 1 or active_token_counts.shape[0] != q_all.shape[0]:
+            raise ValueError(
+                "active_token_counts must be rank-1 with one entry per query row, "
+                f"got {tuple(active_token_counts.shape)}"
+            )
 
     out = torch.zeros(
         (q_all.shape[0], q_all.shape[1], v_all.shape[1]),
@@ -156,6 +165,10 @@ def _sparse_attention_reference(
 
     for row in range(q_all.shape[0]):
         valid = page_table_1[row]
+        if active_token_counts is not None:
+            token_end = int(active_token_counts[row].item())
+            token_end = max(0, min(token_end, valid.shape[0]))
+            valid = valid[:token_end]
         valid = valid[(valid >= 0) & (valid < num_kv)]
         if valid.numel() == 0:
             continue
