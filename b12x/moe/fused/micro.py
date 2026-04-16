@@ -879,7 +879,14 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
             row = Int32(0)
             if all_rows_unique > Int32(0):
                 local_expert_id = pair_idx
-                expert_id = topk_ids[local_expert_id].to(Int32)
+                if cutlass.const_expr(self.is_gated):
+                    # Gated activations still run the Triton compaction prepass,
+                    # so weight_expert_ids is populated and can be read directly.
+                    expert_id = weight_expert_ids[local_expert_id].to(Int32)
+                else:
+                    # Ungated m==1 fast path skips the prepass; topk_ids holds
+                    # the raw global expert ids (one per top-k pair).
+                    expert_id = topk_ids[local_expert_id].to(Int32)
             else:
                 if is_cta_leader > Int32(0):
                     local_expert_id = topk_ids[pair_idx].to(Int32)
@@ -1120,7 +1127,8 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                 weight_expert_idx = weight_expert_ids[local_expert_idx]
                 valid_rows = row_counts[local_expert_idx]
                 if all_rows_unique > Int32(0):
-                    weight_expert_idx = topk_ids[local_expert_idx].to(Int32)
+                    if cutlass.const_expr(not self.is_gated):
+                        weight_expert_idx = topk_ids[local_expert_idx].to(Int32)
                     valid_rows = Int32(1)
                 alpha_value = alpha[weight_expert_idx].to(cutlass.Float32)
                 tile_m_base = tile_coord[0] * Int32(self.tile_shape_mnk[0])
@@ -1733,7 +1741,7 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                 intermediate_slice = tc[1]
                 local_expert_idx = tc[2]
                 weight_expert_idx = weight_expert_ids[local_expert_idx]
-                if all_rows_unique > Int32(0):
+                if all_rows_unique > Int32(0) and cutlass.const_expr(not self.is_gated):
                     weight_expert_idx = topk_ids[local_expert_idx].to(Int32)
 
                 sa_tile_coord_m = tc[0] // self.sa_tiles_per_block
