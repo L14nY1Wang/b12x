@@ -32,10 +32,6 @@ from b12x.moe.fused.reference import (
 from b12x.cute.fp4 import as_grouped_scale_view, swizzle_block_scale
 
 
-DEFAULT_MODEL_PATH = pathlib.Path(
-    os.environ.get("B12X_MODEL_PATH", "/data/models/Qwen3.5-397B-A17B-NVFP4")
-)
-
 LEGACY_BATCH_SIZES = [1, 2, 4, 8]
 # Observed in the live single-request sglang probe:
 # - prefill m=23 for the prompt itself
@@ -198,6 +194,7 @@ class ModelProfile:
     checkpoint_family: str
     default_layer_idx: int
     tp_size: int
+    hf_repo_id: str
 
 
 MODEL_PROFILES = {
@@ -206,14 +203,30 @@ MODEL_PROFILES = {
         checkpoint_family="qwen",
         default_layer_idx=0,
         tp_size=TP_SIZE,
+        hf_repo_id="nvidia/Qwen3.5-397B-A17B-NVFP4",
     ),
     "nemotron-backbone": ModelProfile(
         label="NVIDIA Nemotron Backbone",
         checkpoint_family="nemotron",
         default_layer_idx=1,
         tp_size=1,
+        hf_repo_id="nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
     ),
 }
+
+
+def resolve_model_path(
+    profile: ModelProfile,
+    override: pathlib.Path | None,
+) -> pathlib.Path:
+    if override is not None:
+        return override
+    env_path = os.environ.get("B12X_MODEL_PATH")
+    if env_path:
+        return pathlib.Path(env_path)
+    from huggingface_hub import snapshot_download
+
+    return pathlib.Path(snapshot_download(repo_id=profile.hf_repo_id))
 
 
 @dataclass
@@ -1111,7 +1124,7 @@ def bench_e2e() -> None:
         else BATCH_SIZE_PROFILES[args.batch_size_profile]
     )
     model_profile = MODEL_PROFILES[args.model_profile]
-    model_path = args.model_path if args.model_path is not None else DEFAULT_MODEL_PATH
+    model_path = resolve_model_path(model_profile, args.model_path)
     layer_idx = model_profile.default_layer_idx if args.layer_idx is None else args.layer_idx
 
     if args.scale_contract == "per-expert" and args.reference == "flashinfer":
