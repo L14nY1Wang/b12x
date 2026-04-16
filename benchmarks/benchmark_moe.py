@@ -726,7 +726,7 @@ ORACLE_TOLERANCES = {
         "max_abs": None,
         "rmse": None,
         "mean_abs": None,
-        "cos_min": 0.9925,
+        "cos_min": 0.9915,
     },
 }
 

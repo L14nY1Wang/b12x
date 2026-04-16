@@ -1830,7 +1830,6 @@ def _launch_compact_static(
     if (
         micro_cutover_pairs == _MICRO_COMPACT_CUTOVER_PAIRS_DEFAULT
         and num_topk > 1
-        and not (activation == "relu2" and m == 1)
     ):
         micro_cutover_pairs = _MICRO_COMPACT_CUTOVER_PAIRS_MULTI_TOPK_DEFAULT
     use_micro = routed_rows <= micro_cutover_pairs
@@ -2106,6 +2105,7 @@ def b12x_moe_fp4(
                 activation == "relu2"
                 and m == 1
                 and a1_gscale.numel() == 1
+                and os.environ.get("B12X_MICRO_SHARE_INPUT_ACROSS_EXPERTS", "1") != "0"
             ),
             activation=activation,
         )
