@@ -97,8 +97,9 @@ class _FakeExtendMode:
 
 
 class _FakeAttnBackend:
-    nsa_decode_impl = "b12x_mla"
-    nsa_prefill_impl = "b12x_mla"
+    def __init__(self, *, impl_name: str) -> None:
+        self.nsa_decode_impl = impl_name
+        self.nsa_prefill_impl = impl_name
 
 
 class _FakePagedMetadata:
@@ -231,12 +232,27 @@ class _FakeRaggedMetadata:
         return output
 
 
-def _make_fake_indexer(module, *, topk: int):
+def _get_b12x_impl_name(module) -> str:
+    return "b12x" if hasattr(module.Indexer, "_use_b12x_indexer") else "b12x_mla"
+
+
+def _get_use_b12x_indexer_method(module):
+    method = getattr(module.Indexer, "_use_b12x_indexer", None)
+    if method is None:
+        method = getattr(module.Indexer, "_use_b12x_mla_indexer")
+    return method
+
+
+def _make_fake_indexer(module, *, topk: int, num_heads: int):
     class _FakeIndexer:
         index_topk = topk
-        _use_b12x_mla_indexer = staticmethod(module.Indexer._use_b12x_mla_indexer)
+        layer_id = 0
+        n_heads = num_heads
+        _b12x_indexer_phantoms = None
+        _use_b12x_indexer = staticmethod(_get_use_b12x_indexer_method(module))
         _get_b12x_paged_topk = module.Indexer._get_b12x_paged_topk
         _get_b12x_ragged_topk = module.Indexer._get_b12x_ragged_topk
+        _get_b12x_indexer_phantoms = module.Indexer._get_b12x_indexer_phantoms
 
         @staticmethod
         def _should_chunk_mqa_logits(num_q: int, num_k: int, device: torch.device):
@@ -303,14 +319,15 @@ def test_sglang_b12x_nsa_indexer_paged_boundary_matches_b12x_reference() -> None
         device=torch.device("cpu"),
     )
 
-    fake_indexer = _make_fake_indexer(module, topk=topk)
+    fake_indexer = _make_fake_indexer(module, topk=topk, num_heads=num_heads)
     fake_forward_batch = type(
         "_FakeForwardBatch",
         (),
         {
             "forward_mode": _FakeDecodeMode(),
             "token_to_kv_pool": _FakePool(index_k_cache),
-            "attn_backend": _FakeAttnBackend(),
+            "attn_backend": _FakeAttnBackend(impl_name=_get_b12x_impl_name(module)),
+            "seq_lens": seqlens,
         },
     )()
     metadata = _FakePagedMetadata(
@@ -371,14 +388,15 @@ def test_sglang_b12x_nsa_indexer_paged_boundary_respects_active_decode_rows() ->
         device=torch.device("cpu"),
     )
 
-    fake_indexer = _make_fake_indexer(module, topk=topk)
+    fake_indexer = _make_fake_indexer(module, topk=topk, num_heads=num_heads)
     fake_forward_batch = type(
         "_FakeForwardBatch",
         (),
         {
             "forward_mode": _FakeDecodeMode(),
             "token_to_kv_pool": _FakePool(index_k_cache),
-            "attn_backend": _FakeAttnBackend(),
+            "attn_backend": _FakeAttnBackend(impl_name=_get_b12x_impl_name(module)),
+            "seq_lens": seqlens,
         },
     )()
     metadata = _FakePagedMetadata(
@@ -424,7 +442,7 @@ def test_sglang_b12x_nsa_indexer_ragged_boundary_matches_b12x_reference() -> Non
     token_to_batch_idx = torch.tensor([0, 0, 1, 1, 1], dtype=torch.int32)
     k_start = torch.tensor([0, 0, 70, 70, 70], dtype=torch.int32)
     k_end = torch.tensor([70, 70, 200, 200, 200], dtype=torch.int32)
-    num_tokens = 256
+    num_tokens = (2 + 3) * 64
     num_heads = 2
 
     index_k_cache = pack_nsa_index_k_cache_reference(
@@ -441,14 +459,15 @@ def test_sglang_b12x_nsa_indexer_ragged_boundary_matches_b12x_reference() -> Non
         device=torch.device("cpu"),
     )
 
-    fake_indexer = _make_fake_indexer(module, topk=topk)
+    fake_indexer = _make_fake_indexer(module, topk=topk, num_heads=num_heads)
     fake_forward_batch = type(
         "_FakeForwardBatch",
         (),
         {
             "forward_mode": _FakeExtendMode(),
             "token_to_kv_pool": _FakePool(index_k_cache),
-            "attn_backend": _FakeAttnBackend(),
+            "attn_backend": _FakeAttnBackend(impl_name=_get_b12x_impl_name(module)),
+            "seq_lens": seq_lens,
         },
     )()
     metadata = _FakeRaggedMetadata(
@@ -528,14 +547,15 @@ def test_sglang_b12x_nsa_indexer_paged_boundary_cuda_graph_capture() -> None:
         device=device,
     )
 
-    fake_indexer = _make_fake_indexer(module, topk=topk)
+    fake_indexer = _make_fake_indexer(module, topk=topk, num_heads=num_heads)
     fake_forward_batch = type(
         "_FakeForwardBatch",
         (),
         {
             "forward_mode": _FakeDecodeMode(),
             "token_to_kv_pool": _FakePool(index_k_cache),
-            "attn_backend": _FakeAttnBackend(),
+            "attn_backend": _FakeAttnBackend(impl_name=_get_b12x_impl_name(module)),
+            "seq_lens": seqlens,
         },
     )()
     metadata = _FakePagedMetadata(

@@ -841,6 +841,7 @@ class TinyMlaPvProbeKernel:
                 p_frag,
                 kv_base_addr,
                 sScale,
+                Int32(0),
                 lane,
             )
 
@@ -922,9 +923,8 @@ class LiveMlaPvProbeKernel:
     def __call__(
         self,
         q_u32: cute.Tensor,
-        kv_nope_u32: cute.Tensor,
+        kv_rows_u32: cute.Tensor,
         kv_scales: cute.Tensor,
-        kv_rope_u32: cute.Tensor,
         page_table_1: cute.Tensor,
         sm_scale: cute.Tensor,
         mOut: cute.Tensor,
@@ -932,9 +932,8 @@ class LiveMlaPvProbeKernel:
     ):
         self.kernel(
             q_u32,
-            kv_nope_u32,
+            kv_rows_u32,
             kv_scales,
-            kv_rope_u32,
             page_table_1,
             sm_scale,
             mOut,
@@ -948,9 +947,8 @@ class LiveMlaPvProbeKernel:
     def kernel(
         self,
         q_u32: cute.Tensor,
-        kv_nope_u32: cute.Tensor,
+        kv_rows_u32: cute.Tensor,
         kv_scales: cute.Tensor,
-        kv_rope_u32: cute.Tensor,
         page_table_1: cute.Tensor,
         sm_scale: cute.Tensor,
         mOut: cute.Tensor,
@@ -973,9 +971,8 @@ class LiveMlaPvProbeKernel:
         _compute_score_tile_scaled(
             score_frag,
             q_u32,
-            kv_nope_u32,
+            kv_rows_u32,
             kv_scales,
-            kv_rope_u32,
             page_table_1,
             sTokenIdx,
             sScale,
@@ -999,15 +996,15 @@ class LiveMlaPvProbeKernel:
         p_frag = cute.make_rmem_tensor(p_layout, Uint32)
         _fill_normalized_p_frag_from_scores(p_frag, score_frag, m_frag, d_frag)
 
-        _stage_token_scales(kv_scales, sTokenIdx, sScale, Int32(0), Int32(kv_nope_u32.shape[0]), lane)
+        _stage_token_scales(kv_scales, sTokenIdx, sScale, Int32(0), Int32(kv_rows_u32.shape[0]), lane)
         _stage_kv_u32_block(
-            kv_nope_u32,
+            kv_rows_u32,
             sTokenIdx,
             Int32(0),
             Int32(_MLA_NOPE_GROUP_KV_VECS),
             Int32(_MLA_NOPE_GROUP_KV_VECS),
             kv_base_addr,
-            Int32(kv_nope_u32.shape[0]),
+            Int32(kv_rows_u32.shape[0]),
             lane,
         )
         cute.arch.sync_threads()
@@ -1029,6 +1026,7 @@ class LiveMlaPvProbeKernel:
                 p_frag,
                 kv_base_addr,
                 sScale,
+                Int32(0),
                 lane,
             )
         _store_output_group(
@@ -1051,12 +1049,9 @@ def _run_live_fragment_probe(
     use_mxfp8: bool,
 ) -> torch.Tensor:
     kv_rows_bytes = kv_cache[:, 0, :].view(torch.uint8)
-    kv_nope_q = kv_rows_bytes[:, :512]
     kv_scales = kv_rows_bytes[:, 512 : 512 + 16].view(torch.float32)
-    kv_rope = kv_rows_bytes[:, 512 + 16 :].view(torch.bfloat16)
     q_u32 = _view_last_dim_as_u32(q_all)
-    kv_nope_u32 = _view_last_dim_as_u32(kv_nope_q)
-    kv_rope_u32 = _view_last_dim_as_u32(kv_rope)
+    kv_rows_u32 = _view_last_dim_as_u32(kv_rows_bytes)
     sm_scale_tensor = torch.tensor([sm_scale], device=q_all.device, dtype=torch.float32)
     out = torch.empty((1, 16, _MLA_GROUP_SIZE), device=q_all.device, dtype=torch.float32)
 
@@ -1065,9 +1060,8 @@ def _run_live_fragment_probe(
     compiled = cute.compile(
         kernel,
         _to_cute_tensor(q_u32, cutlass.Uint32),
-        _to_cute_tensor(kv_nope_u32, cutlass.Uint32),
+        _to_cute_tensor(kv_rows_u32, cutlass.Uint32),
         _to_cute_tensor(kv_scales, cutlass.Float32),
-        _to_cute_tensor(kv_rope_u32, cutlass.Uint32),
         _to_cute_tensor(page_table_1, cutlass.Int32),
         _to_cute_tensor(sm_scale_tensor, cutlass.Float32),
         _to_cute_tensor(out, cutlass.Float32),
@@ -1075,9 +1069,8 @@ def _run_live_fragment_probe(
     )
     compiled(
         _to_cute_tensor(q_u32, cutlass.Uint32),
-        _to_cute_tensor(kv_nope_u32, cutlass.Uint32),
+        _to_cute_tensor(kv_rows_u32, cutlass.Uint32),
         _to_cute_tensor(kv_scales, cutlass.Float32),
-        _to_cute_tensor(kv_rope_u32, cutlass.Uint32),
         _to_cute_tensor(page_table_1, cutlass.Int32),
         _to_cute_tensor(sm_scale_tensor, cutlass.Float32),
         _to_cute_tensor(out, cutlass.Float32),
@@ -1168,9 +1161,8 @@ class LiveMlaPvRegisterDumpKernel:
     def __call__(
         self,
         q_u32: cute.Tensor,
-        kv_nope_u32: cute.Tensor,
+        kv_rows_u32: cute.Tensor,
         kv_scales: cute.Tensor,
-        kv_rope_u32: cute.Tensor,
         page_table_1: cute.Tensor,
         sm_scale: cute.Tensor,
         p_dump: cute.Tensor,
@@ -1183,9 +1175,8 @@ class LiveMlaPvRegisterDumpKernel:
     ):
         self.kernel(
             q_u32,
-            kv_nope_u32,
+            kv_rows_u32,
             kv_scales,
-            kv_rope_u32,
             page_table_1,
             sm_scale,
             p_dump,
@@ -1204,9 +1195,8 @@ class LiveMlaPvRegisterDumpKernel:
     def kernel(
         self,
         q_u32: cute.Tensor,
-        kv_nope_u32: cute.Tensor,
+        kv_rows_u32: cute.Tensor,
         kv_scales: cute.Tensor,
-        kv_rope_u32: cute.Tensor,
         page_table_1: cute.Tensor,
         sm_scale: cute.Tensor,
         p_dump: cute.Tensor,
@@ -1233,9 +1223,8 @@ class LiveMlaPvRegisterDumpKernel:
         _compute_score_tile_scaled(
             score_frag,
             q_u32,
-            kv_nope_u32,
+            kv_rows_u32,
             kv_scales,
-            kv_rope_u32,
             page_table_1,
             sTokenIdx,
             sScale,
@@ -1262,7 +1251,7 @@ class LiveMlaPvRegisterDumpKernel:
             for reg_id in cutlass.range_constexpr(4):
                 p_dump[lane, mma_kv, reg_id] = p_frag[0, mma_kv, reg_id]
 
-        _stage_token_scales(kv_scales, sTokenIdx, sScale, Int32(0), Int32(kv_nope_u32.shape[0]), lane)
+        _stage_token_scales(kv_scales, sTokenIdx, sScale, Int32(0), Int32(kv_rows_u32.shape[0]), lane)
         token_local = lane
         while token_local < Int32(_MLA_TOKEN_TILE):
             scale_dump[token_local] = Float32(sScale[token_local])
@@ -1270,13 +1259,13 @@ class LiveMlaPvRegisterDumpKernel:
             token_local += Int32(self.num_threads)
 
         _stage_kv_u32_block(
-            kv_nope_u32,
+            kv_rows_u32,
             sTokenIdx,
             Int32(0),
             Int32(_MLA_NOPE_GROUP_KV_VECS),
             Int32(_MLA_NOPE_GROUP_KV_VECS),
             kv_base_addr,
-            Int32(kv_nope_u32.shape[0]),
+            Int32(kv_rows_u32.shape[0]),
             lane,
         )
         cute.arch.sync_threads()
@@ -1292,12 +1281,9 @@ def _run_live_fragment_register_dump(
     sm_scale: float,
 ) -> dict[str, torch.Tensor]:
     kv_rows_bytes = kv_cache[:, 0, :].view(torch.uint8)
-    kv_nope_q = kv_rows_bytes[:, :512]
     kv_scales = kv_rows_bytes[:, 512 : 512 + 16].view(torch.float32)
-    kv_rope = kv_rows_bytes[:, 512 + 16 :].view(torch.bfloat16)
     q_u32 = _view_last_dim_as_u32(q_all)
-    kv_nope_u32 = _view_last_dim_as_u32(kv_nope_q)
-    kv_rope_u32 = _view_last_dim_as_u32(kv_rope)
+    kv_rows_u32 = _view_last_dim_as_u32(kv_rows_bytes)
     sm_scale_tensor = torch.tensor([sm_scale], device=q_all.device, dtype=torch.float32)
     p_dump = torch.empty((32, _MLA_NUM_MMA_KV, 4), device=q_all.device, dtype=torch.uint32)
     a_dump = torch.empty((32, 4), device=q_all.device, dtype=torch.uint32)
@@ -1311,9 +1297,8 @@ def _run_live_fragment_register_dump(
     compiled = cute.compile(
         kernel,
         _to_cute_tensor(q_u32, cutlass.Uint32),
-        _to_cute_tensor(kv_nope_u32, cutlass.Uint32),
+        _to_cute_tensor(kv_rows_u32, cutlass.Uint32),
         _to_cute_tensor(kv_scales, cutlass.Float32),
-        _to_cute_tensor(kv_rope_u32, cutlass.Uint32),
         _to_cute_tensor(page_table_1, cutlass.Int32),
         _to_cute_tensor(sm_scale_tensor, cutlass.Float32),
         _to_cute_tensor(p_dump, cutlass.Uint32),
@@ -1326,9 +1311,8 @@ def _run_live_fragment_register_dump(
     )
     compiled(
         _to_cute_tensor(q_u32, cutlass.Uint32),
-        _to_cute_tensor(kv_nope_u32, cutlass.Uint32),
+        _to_cute_tensor(kv_rows_u32, cutlass.Uint32),
         _to_cute_tensor(kv_scales, cutlass.Float32),
-        _to_cute_tensor(kv_rope_u32, cutlass.Uint32),
         _to_cute_tensor(page_table_1, cutlass.Int32),
         _to_cute_tensor(sm_scale_tensor, cutlass.Float32),
         _to_cute_tensor(p_dump, cutlass.Uint32),
@@ -2124,9 +2108,8 @@ class ScoreTileProbeKernel:
     def __call__(
         self,
         q_u32: cute.Tensor,
-        kv_nope_u32: cute.Tensor,
+        kv_rows_u32: cute.Tensor,
         kv_scales: cute.Tensor,
-        kv_rope_u32: cute.Tensor,
         page_table_1: cute.Tensor,
         sm_scale: cute.Tensor,
         token_base: cute.Tensor,
@@ -2136,9 +2119,8 @@ class ScoreTileProbeKernel:
     ):
         self.kernel(
             q_u32,
-            kv_nope_u32,
+            kv_rows_u32,
             kv_scales,
-            kv_rope_u32,
             page_table_1,
             sm_scale,
             token_base,
@@ -2154,9 +2136,8 @@ class ScoreTileProbeKernel:
     def kernel(
         self,
         q_u32: cute.Tensor,
-        kv_nope_u32: cute.Tensor,
+        kv_rows_u32: cute.Tensor,
         kv_scales: cute.Tensor,
-        kv_rope_u32: cute.Tensor,
         page_table_1: cute.Tensor,
         sm_scale: cute.Tensor,
         token_base: cute.Tensor,
@@ -2177,9 +2158,8 @@ class ScoreTileProbeKernel:
         _compute_score_tile_scaled(
             score_frag,
             q_u32,
-            kv_nope_u32,
+            kv_rows_u32,
             kv_scales,
-            kv_rope_u32,
             page_table_1,
             sTokenIdx,
             sScale,
@@ -2207,12 +2187,9 @@ def _run_score_tile_probe(
     token_end: int,
 ) -> torch.Tensor:
     kv_rows_bytes = kv_cache[:, 0, :].view(torch.uint8)
-    kv_nope_q = kv_rows_bytes[:, :512]
     kv_scales = kv_rows_bytes[:, 512 : 512 + 16].view(torch.float32)
-    kv_rope = kv_rows_bytes[:, 512 + 16 :].view(torch.bfloat16)
     q_u32 = _view_last_dim_as_u32(q_all)
-    kv_nope_u32 = _view_last_dim_as_u32(kv_nope_q)
-    kv_rope_u32 = _view_last_dim_as_u32(kv_rope)
+    kv_rows_u32 = _view_last_dim_as_u32(kv_rows_bytes)
     sm_scale_tensor = torch.tensor([sm_scale], device=q_all.device, dtype=torch.float32)
     token_base_tensor = torch.tensor([token_base], device=q_all.device, dtype=torch.int32)
     token_end_tensor = torch.tensor([token_end], device=q_all.device, dtype=torch.int32)
@@ -2223,9 +2200,8 @@ def _run_score_tile_probe(
     compiled = cute.compile(
         kernel,
         _to_cute_tensor(q_u32, cutlass.Uint32),
-        _to_cute_tensor(kv_nope_u32, cutlass.Uint32),
+        _to_cute_tensor(kv_rows_u32, cutlass.Uint32),
         _to_cute_tensor(kv_scales, cutlass.Float32),
-        _to_cute_tensor(kv_rope_u32, cutlass.Uint32),
         _to_cute_tensor(page_table_1, cutlass.Int32),
         _to_cute_tensor(sm_scale_tensor, cutlass.Float32),
         _to_cute_tensor(token_base_tensor, cutlass.Int32),
@@ -2235,9 +2211,8 @@ def _run_score_tile_probe(
     )
     compiled(
         _to_cute_tensor(q_u32, cutlass.Uint32),
-        _to_cute_tensor(kv_nope_u32, cutlass.Uint32),
+        _to_cute_tensor(kv_rows_u32, cutlass.Uint32),
         _to_cute_tensor(kv_scales, cutlass.Float32),
-        _to_cute_tensor(kv_rope_u32, cutlass.Uint32),
         _to_cute_tensor(page_table_1, cutlass.Int32),
         _to_cute_tensor(sm_scale_tensor, cutlass.Float32),
         _to_cute_tensor(token_base_tensor, cutlass.Int32),

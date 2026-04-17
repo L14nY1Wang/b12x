@@ -30,6 +30,26 @@ def _import_sglang_nsa_backend():
     return module
 
 
+def _get_b12x_workspace_method(nsa_backend_module):
+    backend_cls = nsa_backend_module.NativeSparseAttnBackend
+    method = getattr(backend_cls, "_get_b12x_workspace", None)
+    if method is None:
+        method = getattr(backend_cls, "_get_b12x_mla_workspace")
+    return method
+
+
+def _get_b12x_forward_method(nsa_backend_module):
+    backend_cls = nsa_backend_module.NativeSparseAttnBackend
+    method = getattr(backend_cls, "_forward_b12x", None)
+    if method is None:
+        method = getattr(backend_cls, "_forward_b12x_mla")
+    return method
+
+
+def _get_b12x_decode_kv_reshape_method(nsa_backend_module):
+    return nsa_backend_module.NativeSparseAttnBackend._reshape_b12x_decode_kv_rows
+
+
 def _full_prefix_page_table(*, cache_len: int, rows: int, width: int, device: torch.device) -> torch.Tensor:
     page_table_1 = torch.full((rows, width), -1, dtype=torch.int32, device=device)
     valid = min(cache_len, width)
@@ -67,7 +87,8 @@ def _make_fake_backend(
     num_q_heads: int | None = None,
 ):
     class _FakeBackend:
-        _get_b12x_mla_workspace = nsa_backend_module.NativeSparseAttnBackend._get_b12x_mla_workspace
+        _get_b12x_workspace = _get_b12x_workspace_method(nsa_backend_module)
+        _reshape_b12x_decode_kv_rows = _get_b12x_decode_kv_reshape_method(nsa_backend_module)
 
         def __init__(self):
             self.device = device
@@ -78,9 +99,35 @@ def _make_fake_backend(
             self.qk_rope_head_dim = cfg.qk_rope_head_dim
             self.nsa_index_topk = topk
             self.real_page_size = 64
-            self.b12x_mla_workspaces: dict[str, object] = {}
+            self.b12x_workspaces: dict[str, object] = {}
+            self.b12x_mla_workspaces = self.b12x_workspaces
 
     return _FakeBackend()
+
+
+def _forward_b12x_mla(
+    nsa_backend_module,
+    backend,
+    *,
+    q_all: torch.Tensor,
+    kv_cache: torch.Tensor,
+    page_table_1: torch.Tensor,
+    metadata: object,
+    sm_scale: float,
+    v_head_dim: int,
+    mode: str,
+) -> torch.Tensor:
+    forward_b12x = _get_b12x_forward_method(nsa_backend_module)
+    return forward_b12x(
+        backend,
+        q_all=q_all,
+        kv_cache=kv_cache,
+        page_table_1=page_table_1,
+        metadata=metadata,
+        sm_scale=sm_scale,
+        v_head_dim=v_head_dim,
+        mode=mode,
+    )
 
 
 def _make_decode_metadata(*, nsa_backend_module, cache_len: int, page_table_1: torch.Tensor) -> object:
@@ -167,7 +214,8 @@ def test_sglang_b12x_mla_decode_boundary_matches_dense_oracle() -> None:
     )
     backend = _make_fake_backend(cfg, device=device, topk=topk, nsa_backend_module=nsa_backend_module)
 
-    actual = nsa_backend_module.NativeSparseAttnBackend._forward_b12x_mla(
+    actual = _forward_b12x_mla(
+        nsa_backend_module,
         backend,
         q_all=q_all,
         kv_cache=packed,
@@ -223,7 +271,8 @@ def test_sglang_b12x_mla_decode_boundary_matches_dense_oracle_for_local_tp_heads
         num_q_heads=local_heads,
     )
 
-    actual = nsa_backend_module.NativeSparseAttnBackend._forward_b12x_mla(
+    actual = _forward_b12x_mla(
+        nsa_backend_module,
         backend,
         q_all=q_local,
         kv_cache=packed,
@@ -280,7 +329,8 @@ def test_sglang_b12x_mla_decode_boundary_matches_dense_oracle_for_local_tp_heads
     )
     backend.kv_cache_dtype = torch.float8_e4m3fn
 
-    actual = nsa_backend_module.NativeSparseAttnBackend._forward_b12x_mla(
+    actual = _forward_b12x_mla(
+        nsa_backend_module,
         backend,
         q_all=q_local,
         kv_cache=packed,
@@ -336,7 +386,8 @@ def test_sglang_b12x_mla_extend_boundary_matches_dense_oracle() -> None:
     )
     backend = _make_fake_backend(cfg, device=device, topk=topk, nsa_backend_module=nsa_backend_module)
 
-    actual = nsa_backend_module.NativeSparseAttnBackend._forward_b12x_mla(
+    actual = _forward_b12x_mla(
+        nsa_backend_module,
         backend,
         q_all=q_all,
         kv_cache=packed,
