@@ -188,11 +188,89 @@ def _structural_dim_key(dim: Any, visited: set[int]) -> Any:
         return int(dim)
     except (TypeError, ValueError):
         pass
+    label = None
+    for attr in ("symbol", "_symbol", "name", "_name"):
+        value = getattr(dim, attr, None)
+        if isinstance(value, str) and value:
+            label = value
+            break
+    if label is None:
+        node = getattr(dim, "node", None)
+        expr = getattr(node, "expr", getattr(node, "_expr", None))
+        if expr is not None:
+            label = str(expr)
+    if label is None:
+        text = str(dim)
+        if text and not text.startswith("?{"):
+            label = text
+    if label is not None:
+        return (
+            "symbolic_dim",
+            type(dim).__module__,
+            type(dim).__qualname__,
+            label,
+        )
     return (
         "symbolic_dim",
         type(dim).__module__,
         type(dim).__qualname__,
-        str(dim),
+        id(getattr(dim, "node", dim)),
+    )
+
+
+def _maybe_call_zero_arg(value: Any) -> Any:
+    if callable(value):
+        try:
+            return value()
+        except TypeError:
+            return None
+    return value
+
+
+def _first_present_attr(value: Any, *names: str) -> Any:
+    for name in names:
+        try:
+            attr = getattr(value, name)
+        except Exception:
+            continue
+        attr = _maybe_call_zero_arg(attr)
+        if attr is not None:
+            return attr
+    return None
+
+
+def _tensor_like_cache_key(value: Any, visited: set[int]) -> Any | None:
+    shape = _first_present_attr(value, "_shape", "shape")
+    if shape is None:
+        return None
+    stride = _first_present_attr(value, "_stride", "stride")
+    stride_order = _first_present_attr(value, "_stride_order", "stride_order")
+    dtype = _first_present_attr(value, "_dtype", "dtype", "element_type")
+    device = _first_present_attr(value, "fake_device", "device")
+    layout = _first_present_attr(value, "layout")
+    memspace = _first_present_attr(value, "memspace", "_memspace")
+    assumed_align = _first_present_attr(value, "_assumed_align")
+    use_32bit_stride = _first_present_attr(value, "_use_32bit_stride")
+    shape_key = tuple(_structural_dim_key(dim, visited) for dim in shape)
+    stride_key = None if stride is None else tuple(_structural_dim_key(dim, visited) for dim in stride)
+    stride_order_key = (
+        None
+        if stride_order is None
+        else tuple(_structural_dim_key(dim, visited) for dim in stride_order)
+    )
+    return (
+        "fake_tensor",
+        type(value).__module__,
+        type(value).__qualname__,
+        _structural_cache_key(dtype, visited),
+        shape_key,
+        stride_key,
+        stride_order_key,
+        _structural_cache_key(device, visited),
+        _structural_cache_key(layout, visited),
+        _structural_cache_key(memspace, visited),
+        assumed_align,
+        use_32bit_stride,
     )
 
 
@@ -269,6 +347,10 @@ def _structural_cache_key(value: Any, visited: set[int] | None = None) -> Any:
             assumed_align,
             use_32bit_stride,
         )
+    if "FakeTensor" in type_name:
+        fake_tensor_key = _tensor_like_cache_key(value, visited)
+        if fake_tensor_key is not None:
+            return fake_tensor_key
 
     cache_key_attr = getattr(value, "__cache_key__", None)
     if cache_key_attr is not None:

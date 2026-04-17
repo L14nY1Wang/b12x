@@ -138,3 +138,62 @@ def test_structural_cache_key_handles_symbolic_fake_compact_tensor_dims() -> Non
 
     assert key[0] == "fake_compact_tensor"
     assert key[2][0] == ("symbolic_dim", FakeSymInt.__module__, FakeSymInt.__qualname__, "s0")
+
+
+def test_structural_cache_key_distinguishes_unnamed_cutlass_symbolic_dims() -> None:
+    FakeTensor = type("_FakeTensor", (), {})
+    FakeTensor.__module__ = "cutlass.cute.runtime"
+
+    fake_a = FakeTensor()
+    fake_a._dtype = cutlass.Int32
+    fake_a._shape = (cute.sym_int32(divisibility=8), 8)
+    fake_a._stride = (8, 1)
+    fake_a._memspace = cute.AddressSpace.gmem
+    fake_a._assumed_align = 4
+
+    fake_b = FakeTensor()
+    fake_b._dtype = cutlass.Int32
+    fake_b._shape = (cute.sym_int32(divisibility=8), 8)
+    fake_b._stride = (8, 1)
+    fake_b._memspace = cute.AddressSpace.gmem
+    fake_b._assumed_align = 4
+
+    assert _structural_cache_key(fake_a) != _structural_cache_key(fake_b)
+
+
+def test_structural_cache_key_skips_warninging_fake_tensor_cache_key() -> None:
+    class FakeSymInt:
+        def __int__(self) -> int:
+            raise TypeError("symbolic dim")
+
+        def __str__(self) -> str:
+            return "?{i32 div=8}"
+
+    class FakeTensor:
+        __module__ = "some.fake.runtime"
+
+        def __init__(self) -> None:
+            self.dtype = cutlass.Int32
+            self.shape = (FakeSymInt(), 8)
+            self._stride = (8, 1)
+
+        def stride(self):
+            return self._stride
+
+        @property
+        def __cache_key__(self):
+            warnings.warn(
+                "FakeTensor cache_key contains unnamed symbolic dimensions. "
+                "Different variables with the same shape/stride pattern will have identical cache keys, "
+                "which may cause incorrect cache hits.",
+                UserWarning,
+                stacklevel=2,
+            )
+            return ("should_not_be_used",)
+
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always")
+        key = _structural_cache_key(FakeTensor())
+
+    assert captured == []
+    assert key[0] == "fake_tensor"
