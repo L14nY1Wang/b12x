@@ -23,7 +23,7 @@ from b12x.attention.nsa_indexer.reference import (
 from b12x.integration.mla import (
     MLASparseDecodeMetadata,
     MLASparseExtendMetadata,
-    MLAWorkspace,
+    B12XAttentionWorkspace,
     clear_mla_caches,
     dense_mla_reference,
     pack_mla_kv_cache_reference,
@@ -667,8 +667,8 @@ def _make_mla_workspace(
     topk: int,
     max_total_q: int,
     max_batch: int,
-) -> MLAWorkspace:
-    return MLAWorkspace.for_fixed_capacity(
+) -> B12XAttentionWorkspace:
+    return B12XAttentionWorkspace.for_fixed_capacity(
         mode=mode,
         device=device,
         dtype=torch.bfloat16,

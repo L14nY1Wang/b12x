@@ -458,10 +458,10 @@ class SparseNSAExtendLogitsKernel:
         k_start: cute.Tensor,
         k_end: cute.Tensor,
         logits_out: cute.Tensor,
+        valid_q_rows: Int32,
+        valid_k_rows: Int32,
         stream: cuda.CUstream,
     ):
-        valid_q_rows = k_start.shape[0]
-        k_tiles = k_quant_bytes.shape[0] // _BLOCK_K
         self.kernel(
             q_u32,
             weights,
@@ -471,10 +471,12 @@ class SparseNSAExtendLogitsKernel:
             k_start,
             k_end,
             logits_out,
+            valid_q_rows,
+            valid_k_rows,
         ).launch(
             grid=(
                 (valid_q_rows + _BLOCK_Q - 1) // _BLOCK_Q,
-                k_tiles,
+                (valid_k_rows + _BLOCK_K - 1) // _BLOCK_K,
                 1,
             ),
             block=[_THREADS_PER_CTA, 1, 1],
@@ -492,6 +494,8 @@ class SparseNSAExtendLogitsKernel:
         k_start: cute.Tensor,
         k_end: cute.Tensor,
         logits_out: cute.Tensor,
+        valid_q_rows: Int32,
+        valid_k_rows: Int32,
     ):
         tx, _, _ = cute.arch.thread_idx()
         q_tile_idx, k_tile_idx, _ = cute.arch.block_idx()
@@ -502,9 +506,8 @@ class SparseNSAExtendLogitsKernel:
 
         q_tile_base = q_tile_idx * Int32(_BLOCK_Q)
         k_tile_base = k_tile_idx * Int32(_BLOCK_K)
-        valid_q_rows = Int32(k_start.shape[0])
-        q_total_rows = Int32(logits_out.shape[0])
-        k_total_rows = Int32(logits_out.shape[1])
+        valid_q_rows = Int32(valid_q_rows)
+        k_total_rows = Int32(valid_k_rows)
         num_heads = Int32(q_u32.shape[1])
 
         smem = cutlass.utils.SmemAllocator()
@@ -674,7 +677,6 @@ class SparseNSAExtendLogitsKernel:
                     q_local < Int32(_BLOCK_Q)
                     and k_local < Int32(_BLOCK_K)
                     and q_row < valid_q_rows
-                    and q_row < q_total_rows
                     and k_row < k_total_rows
                 ):
                     row_start = Int32(s_k_start[q_local])
@@ -746,6 +748,7 @@ def run_sparse_nsa_extend_logits_kernel(
     k_start: torch.Tensor,
     k_end: torch.Tensor,
     contract_phantoms: dict[str, torch.Tensor] | None = None,
+    workspace=None,
 ) -> torch.Tensor:
     if not supports_sparse_nsa_extend_logits_kernel(
         q_fp8=q_fp8,
@@ -757,45 +760,77 @@ def run_sparse_nsa_extend_logits_kernel(
     ):
         raise ValueError("sparse NSA extend logits kernel only supports the exact CUDA FP8 contract")
 
-    q_rows_total = q_fp8.shape[0]
-    valid_q_rows = k_start.shape[0]
-    k_rows = k_quant.shape[0]
-    out = torch.full(
-        (q_rows_total, k_rows),
-        float("-inf"),
-        dtype=torch.float32,
-        device=q_fp8.device,
-    )
-    if valid_q_rows == 0 or k_rows == 0:
-        return out
+    q_rows_total = int(q_fp8.shape[0])
+    valid_q_rows = int(k_start.shape[0])
+    k_rows = int(k_quant.shape[0])
 
-    q_bytes = q_fp8.contiguous().view(torch.uint8)
-    k_quant_padded, k_scale_padded = _pad_kv_rows(k_quant=k_quant, k_scale=k_scale)
-    k_quant_bytes = k_quant_padded.contiguous().view(torch.uint8)
+    if workspace is not None:
+        staged = workspace.stage_nsa_indexer_extend(
+            q_fp8=q_fp8,
+            weights=weights,
+            k_quant=k_quant,
+            k_scale=k_scale,
+            k_start=k_start,
+            k_end=k_end,
+        )
+        q_u32 = staged["q_u32"]
+        weights_kernel = staged["weights"]
+        k_quant_bytes = staged["k_quant_bytes"]
+        k_scale_kernel = staged["k_scales"]
+        k_start_kernel = staged["k_start"]
+        k_end_kernel = staged["k_end"]
+        out_kernel = staged["logits"]
+        out_view = staged["logits_view"]
+        if contract_phantoms is None:
+            contract_phantoms = workspace.get_indexer_contract_phantoms()
+    else:
+        out_kernel = torch.full(
+            (q_rows_total, k_rows),
+            float("-inf"),
+            dtype=torch.float32,
+            device=q_fp8.device,
+        )
+        out_view = out_kernel
+        if valid_q_rows == 0 or k_rows == 0:
+            return out_view
+
+        q_bytes = q_fp8.contiguous().view(torch.uint8)
+        k_quant_padded, k_scale_padded = _pad_kv_rows(k_quant=k_quant, k_scale=k_scale)
+        k_quant_bytes = k_quant_padded.contiguous().view(torch.uint8)
+        q_u32 = _view_last_dim_as_u32(q_bytes)
+        weights_kernel = weights.contiguous()
+        k_scale_kernel = k_scale_padded.contiguous()
+        k_start_kernel = k_start.contiguous()
+        k_end_kernel = k_end.contiguous()
+
+    if valid_q_rows == 0 or k_rows == 0:
+        return out_view
+
     _, k_tma_desc_ptrs = _get_cached_extend_k_tma_descriptor(k_quant_bytes)
-    q_u32 = _view_last_dim_as_u32(q_bytes)
     kernel = _build_sparse_nsa_extend_kernel()
     args = (
         _to_kernel_tensor(q_u32, cutlass.Uint32),
-        _to_kernel_tensor(weights.contiguous(), cutlass.Float32, assumed_align=4),
+        _to_kernel_tensor(weights_kernel, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(k_quant_bytes, cutlass.Uint8),
         _to_kernel_tensor(k_tma_desc_ptrs, cutlass.Int64, assumed_align=8),
-        _to_kernel_tensor(k_scale_padded.contiguous(), cutlass.Float32, assumed_align=4),
-        _to_kernel_tensor(k_start.contiguous(), cutlass.Int32, assumed_align=4),
-        _to_kernel_tensor(k_end.contiguous(), cutlass.Int32, assumed_align=4),
-        _to_kernel_tensor(out, cutlass.Float32, assumed_align=4),
+        _to_kernel_tensor(k_scale_kernel, cutlass.Float32, assumed_align=4),
+        _to_kernel_tensor(k_start_kernel, cutlass.Int32, assumed_align=4),
+        _to_kernel_tensor(k_end_kernel, cutlass.Int32, assumed_align=4),
+        _to_kernel_tensor(out_kernel, cutlass.Float32, assumed_align=4),
+        valid_q_rows,
+        k_rows,
         current_cuda_stream(),
     )
     _cp = contract_phantoms or {}
     cache_key = (
         _tensor_meta_key(_cp.get("extend_q_u32", q_u32)),
-        _tensor_meta_key(_cp.get("extend_weights", weights)),
+        _tensor_meta_key(_cp.get("extend_weights", weights_kernel)),
         _tensor_meta_key(_cp.get("extend_k_quant", k_quant_bytes)),
         _tensor_meta_key(k_tma_desc_ptrs),
-        _tensor_meta_key(_cp.get("extend_k_scale", k_scale_padded)),
-        _tensor_meta_key(_cp.get("extend_k_start", k_start)),
-        _tensor_meta_key(_cp.get("extend_k_end", k_end)),
-        _tensor_meta_key(_cp.get("extend_logits", out)),
+        _tensor_meta_key(_cp.get("extend_k_scale", k_scale_kernel)),
+        _tensor_meta_key(_cp.get("extend_k_start", k_start_kernel)),
+        _tensor_meta_key(_cp.get("extend_k_end", k_end_kernel)),
+        _tensor_meta_key(_cp.get("extend_logits", out_kernel)),
     )
     _run_cached_host_launcher(kernel, cache_key, args)
-    return out
+    return out_view

@@ -20,7 +20,7 @@ from .split import (
     run_sparse_mla_split_decode,
     select_sparse_mla_split_decode_config,
 )
-from .workspace import MLAWorkspace
+from .workspace import B12XAttentionWorkspace
 
 
 @dataclass(frozen=True)
@@ -63,7 +63,7 @@ def sparse_mla_decode_forward(
     q_all: torch.Tensor,
     kv_cache: torch.Tensor,
     metadata: MLASparseDecodeMetadata,
-    workspace: MLAWorkspace,
+    workspace: B12XAttentionWorkspace,
     sm_scale: float,
     v_head_dim: int,
 ) -> torch.Tensor:
@@ -86,7 +86,7 @@ def sparse_mla_extend_forward(
     q_all: torch.Tensor,
     kv_cache: torch.Tensor,
     metadata: MLASparseExtendMetadata,
-    workspace: MLAWorkspace,
+    workspace: B12XAttentionWorkspace,
     sm_scale: float,
     v_head_dim: int,
 ) -> torch.Tensor:
@@ -108,7 +108,7 @@ def _run_sparse_mla(
     *,
     q_all: torch.Tensor,
     kv_cache: torch.Tensor,
-    workspace: MLAWorkspace,
+    workspace: B12XAttentionWorkspace,
     sm_scale: float,
     v_head_dim: int,
 ) -> torch.Tensor:
@@ -276,7 +276,7 @@ def _run_sparse_mla(
 
 def _get_sm_scale_tensor(
     *,
-    workspace: MLAWorkspace,
+    workspace: B12XAttentionWorkspace,
     device: torch.device,
     sm_scale: float,
 ) -> torch.Tensor:

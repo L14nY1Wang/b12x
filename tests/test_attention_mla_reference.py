@@ -20,7 +20,7 @@ from b12x.attention.mla.reference import (
 from b12x.integration.mla import (
     MLASparseDecodeMetadata,
     MLASparseExtendMetadata,
-    MLAWorkspace,
+    B12XAttentionWorkspace,
     clear_mla_caches,
     sparse_mla_decode_forward,
     sparse_mla_extend_forward,
@@ -219,8 +219,8 @@ def _make_workspace(
     topk: int,
     cfg: GLMMLAConfig,
     use_cuda_graph: bool = False,
-) -> MLAWorkspace:
-    return MLAWorkspace.for_fixed_capacity(
+) -> B12XAttentionWorkspace:
+    return B12XAttentionWorkspace.for_fixed_capacity(
         mode=mode,
         device=device,
         dtype=torch.bfloat16,
@@ -834,7 +834,7 @@ def test_glm51_layer0_decode_api_matches_dense_oracle_for_local_tp_heads() -> No
         nsa_cache_seqlens_int32=nsa_cache_seqlens,
         max_seq_len_k=cache_len,
     )
-    workspace = MLAWorkspace.for_fixed_capacity(
+    workspace = B12XAttentionWorkspace.for_fixed_capacity(
         mode="decode",
         device=device,
         dtype=torch.bfloat16,
@@ -907,7 +907,7 @@ def test_glm51_layer0_decode_api_matches_dense_oracle_for_local_tp_heads_fp8_vie
         nsa_cache_seqlens_int32=nsa_cache_seqlens,
         max_seq_len_k=cache_len,
     )
-    workspace = MLAWorkspace.for_fixed_capacity(
+    workspace = B12XAttentionWorkspace.for_fixed_capacity(
         mode="decode",
         device=device,
         dtype=torch.bfloat16,

@@ -1515,6 +1515,7 @@ def run_sparse_nsa_paged_logits_kernel(
     active_width_hint: int | None = None,
     page_size: int = _PAGE_SIZE,
     contract_phantoms: dict[str, torch.Tensor] | None = None,
+    workspace=None,
 ) -> torch.Tensor:
     if not supports_sparse_nsa_paged_logits_kernel(
         q_fp8=q_fp8,
@@ -1557,38 +1558,73 @@ def run_sparse_nsa_paged_logits_kernel(
         int(use_patched_k_tma_desc),
         device_index,
     )
-    q_bytes = q_fp8.contiguous().view(torch.uint8)
-    logits = torch.full(
-        (rows, width_tokens),
-        float("-inf"),
-        dtype=torch.float32,
-        device=q_fp8.device,
-    )
+    if workspace is not None:
+        staged = workspace.stage_nsa_indexer_paged_decode(
+            q_fp8=q_fp8,
+            weights=weights,
+            real_page_table=real_page_table,
+            seqlens_per_query=seqlens_per_query,
+            active_width=active_width,
+            width_tokens=width_tokens,
+        )
+        q_bytes = staged["q_bytes"]
+        weights_kernel = staged["weights"]
+        real_page_table_kernel = staged["real_page_table"]
+        seqlens_per_query_kernel = staged["seqlens_per_query"]
+        active_width_kernel = staged["active_width"]
+        logits = staged["logits"]
+        logits_view = staged["logits_view"]
+        if contract_phantoms is None:
+            contract_phantoms = workspace.get_paged_indexer_contract_phantoms()
+    else:
+        q_bytes = q_fp8.contiguous().view(torch.uint8)
+        weights_kernel = weights.contiguous()
+        real_page_table_kernel = real_page_table.contiguous()
+        seqlens_per_query_kernel = seqlens_per_query.contiguous()
+        active_width_kernel = active_width.contiguous()
+        logits = torch.full(
+            (rows, width_tokens),
+            float("-inf"),
+            dtype=torch.float32,
+            device=q_fp8.device,
+        )
+        logits_view = logits
     _cp = contract_phantoms or {}
     common_args = (
         _to_kernel_tensor(q_bytes, cutlass.Uint8),
-        _to_kernel_tensor(weights.contiguous(), cutlass.Float32, assumed_align=4),
+        _to_kernel_tensor(weights_kernel, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(k_quant_bytes, cutlass.Uint8),
         _to_kernel_tensor(k_tma_desc_ptrs, cutlass.Int64, assumed_align=8),
         _to_kernel_tensor(use_patched_k_tma_desc_tensor, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(k_scales, cutlass.Float32, assumed_align=4),
-        _to_kernel_tensor(real_page_table.contiguous(), cutlass.Int32, assumed_align=4),
-        _to_kernel_tensor(seqlens_per_query.contiguous(), cutlass.Int32, assumed_align=4),
+        _to_kernel_tensor(real_page_table_kernel, cutlass.Int32, assumed_align=4),
+        _to_kernel_tensor(seqlens_per_query_kernel, cutlass.Int32, assumed_align=4),
     )
     common_cache_key = (
         q_fp8.shape[1],
         _tensor_meta_key(_cp.get("q_bytes", q_bytes)),
-        _tensor_meta_key(_cp.get("weights", weights)),
+        _tensor_meta_key(_cp.get("weights", weights_kernel)),
         _tensor_meta_key(k_quant_bytes),
         _tensor_meta_key(k_tma_desc_ptrs),
         _tensor_meta_key(use_patched_k_tma_desc_tensor),
         _tensor_meta_key(k_scales),
-        _tensor_meta_key(_cp.get("real_page_table", real_page_table)),
-        _tensor_meta_key(_cp.get("seqlens_per_query", seqlens_per_query)),
-        _tensor_meta_key(active_width),
+        _tensor_meta_key(_cp.get("real_page_table", real_page_table_kernel)),
+        _tensor_meta_key(_cp.get("seqlens_per_query", seqlens_per_query_kernel)),
+        _tensor_meta_key(active_width_kernel),
         _tensor_meta_key(_cp.get("logits", logits)),
     )
     max_pages = int(real_page_table.shape[1])
+    schedule_metadata_kernel = None
+    if schedule_metadata is not None:
+        if workspace is not None and not schedule_metadata.is_contiguous():
+            raise ValueError(
+                "workspace-backed paged decode requires contiguous schedule_metadata"
+            )
+        schedule_metadata_kernel = (
+            schedule_metadata
+            if schedule_metadata.is_contiguous()
+            else schedule_metadata.contiguous()
+        )
     if _should_use_schedule_single_row_kernel(q_rows=rows, max_pages=max_pages):
         if schedule_metadata is None:
             raise ValueError("schedule_metadata is required for the scheduled single-row decode path")
@@ -1598,8 +1634,8 @@ def run_sparse_nsa_paged_logits_kernel(
         )
         args = (
             *common_args,
-            _to_kernel_tensor(schedule_metadata.contiguous(), cutlass.Int32, assumed_align=4),
-            _to_kernel_tensor(active_width.contiguous(), cutlass.Int32, assumed_align=4),
+            _to_kernel_tensor(schedule_metadata_kernel, cutlass.Int32, assumed_align=4),
+            _to_kernel_tensor(active_width_kernel, cutlass.Int32, assumed_align=4),
             _to_kernel_tensor(logits, cutlass.Float32, assumed_align=4),
             current_cuda_stream(),
         )
@@ -1607,7 +1643,7 @@ def run_sparse_nsa_paged_logits_kernel(
             "schedule_single_row",
             _SCHEDULE_SINGLE_ROW_PARALLEL_CTAS,
             *common_cache_key,
-            _tensor_meta_key(schedule_metadata),
+            _tensor_meta_key(schedule_metadata_kernel),
         )
     elif _should_use_schedule_multi_row_kernel(q_rows=rows, max_pages=max_pages):
         if schedule_metadata is None:
@@ -1618,8 +1654,8 @@ def run_sparse_nsa_paged_logits_kernel(
         )
         args = (
             *common_args,
-            _to_kernel_tensor(schedule_metadata.contiguous(), cutlass.Int32, assumed_align=4),
-            _to_kernel_tensor(active_width.contiguous(), cutlass.Int32, assumed_align=4),
+            _to_kernel_tensor(schedule_metadata_kernel, cutlass.Int32, assumed_align=4),
+            _to_kernel_tensor(active_width_kernel, cutlass.Int32, assumed_align=4),
             _to_kernel_tensor(logits, cutlass.Float32, assumed_align=4),
             current_cuda_stream(),
         )
@@ -1627,7 +1663,7 @@ def run_sparse_nsa_paged_logits_kernel(
             "schedule_multi_row",
             _SCHEDULE_MULTI_ROW_PARALLEL_CTAS,
             *common_cache_key,
-            _tensor_meta_key(schedule_metadata),
+            _tensor_meta_key(schedule_metadata_kernel),
         )
     else:
         persistent_ctas = _resolve_sparse_nsa_persistent_ctas(
@@ -1640,7 +1676,7 @@ def run_sparse_nsa_paged_logits_kernel(
         kernel = _build_sparse_nsa_paged_kernel(persistent_ctas, q_fp8.shape[1])
         args = (
             *common_args,
-            _to_kernel_tensor(active_width.contiguous(), cutlass.Int32, assumed_align=4),
+            _to_kernel_tensor(active_width_kernel, cutlass.Int32, assumed_align=4),
             _to_kernel_tensor(logits, cutlass.Float32, assumed_align=4),
             current_cuda_stream(),
         )
@@ -1650,4 +1686,4 @@ def run_sparse_nsa_paged_logits_kernel(
             *common_cache_key,
         )
     _run_cached_host_launcher(kernel, cache_key, args)
-    return logits
+    return logits_view

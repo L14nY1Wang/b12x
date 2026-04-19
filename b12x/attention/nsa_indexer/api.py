@@ -314,6 +314,7 @@ def sparse_nsa_index_decode_logits_paged(
     metadata: NSAIndexerPagedDecodeMetadata,
     page_size: int = 64,
     contract_phantoms: dict[str, torch.Tensor] | None = None,
+    workspace=None,
 ) -> torch.Tensor:
     weights_f = _validate_paged_decode_inputs(
         q_fp8=q_fp8,
@@ -334,7 +335,19 @@ def sparse_nsa_index_decode_logits_paged(
             device=q_fp8.device,
         )
 
-    seqlens_valid = metadata.cache_seqlens_int32.contiguous()
+    if workspace is not None:
+        if not metadata.cache_seqlens_int32.is_contiguous():
+            raise ValueError(
+                "workspace-backed paged decode requires contiguous cache_seqlens_int32"
+            )
+        if valid_q_rows != full_q_rows:
+            raise ValueError(
+                "workspace-backed paged decode requires q_fp8 rows to match "
+                f"real_page_table rows, got q_rows={full_q_rows} vs valid_q_rows={valid_q_rows}"
+            )
+        seqlens_valid = metadata.cache_seqlens_int32
+    else:
+        seqlens_valid = metadata.cache_seqlens_int32.contiguous()
     active_width = _make_active_width_tensor(seqlens_per_query=seqlens_valid, width=width_tokens)
     max_page_capacity = index_k_cache.shape[0]
 
@@ -401,6 +414,7 @@ def sparse_nsa_index_decode_logits_paged(
         active_width_hint=metadata.active_width_hint,
         page_size=page_size,
         contract_phantoms=contract_phantoms,
+        workspace=workspace,
     )
     if valid_q_rows == full_q_rows:
         return logits_valid
@@ -422,6 +436,7 @@ def sparse_nsa_index_extend_logits(
     kv_fp8: tuple[torch.Tensor, torch.Tensor],
     metadata: NSAIndexerExtendLogitsMetadata,
     contract_phantoms: dict[str, torch.Tensor] | None = None,
+    workspace=None,
 ) -> torch.Tensor:
     k_start = metadata.k_start
     k_end = metadata.k_end
@@ -459,6 +474,7 @@ def sparse_nsa_index_extend_logits(
             k_start=k_start,
             k_end=k_end,
             contract_phantoms=contract_phantoms,
+            workspace=workspace,
         )
 
     return sparse_nsa_extend_logits_reference(

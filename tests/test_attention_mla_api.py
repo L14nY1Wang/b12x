@@ -6,7 +6,7 @@ import torch
 from b12x.integration.mla import (
     MLASparseDecodeMetadata,
     MLASparseExtendMetadata,
-    MLAWorkspace,
+    B12XAttentionWorkspace,
     sparse_mla_decode_forward,
     sparse_mla_extend_forward,
 )
@@ -14,8 +14,8 @@ from b12x.attention.mla import kernel as mla_kernel
 from b12x.attention.mla import split as mla_split
 
 
-def _make_workspace(*, mode: str, topk: int = 4) -> MLAWorkspace:
-    return MLAWorkspace.for_fixed_capacity(
+def _make_workspace(*, mode: str, topk: int = 4) -> B12XAttentionWorkspace:
+    return B12XAttentionWorkspace.for_fixed_capacity(
         mode=mode,
         device="cpu",
         dtype=torch.bfloat16,
@@ -152,7 +152,7 @@ def test_mla_verify_workspace_allocates_split_buffers() -> None:
 
 
 def test_workspace_ragged_kv_gather_reuses_fixed_capacity_buffer() -> None:
-    workspace = MLAWorkspace.for_fixed_capacity(
+    workspace = B12XAttentionWorkspace.for_fixed_capacity(
         mode="extend",
         device="cpu",
         dtype=torch.bfloat16,
@@ -188,7 +188,7 @@ def test_workspace_ragged_kv_gather_reuses_fixed_capacity_buffer() -> None:
 
 
 def test_workspace_ragged_kv_contracts_do_not_leak_to_paged_cache() -> None:
-    workspace = MLAWorkspace.for_fixed_capacity(
+    workspace = B12XAttentionWorkspace.for_fixed_capacity(
         mode="extend",
         device="cpu",
         dtype=torch.bfloat16,
@@ -460,7 +460,7 @@ def test_sparse_mla_extend_passes_active_token_counts_to_kernel(monkeypatch) -> 
 
 
 def test_mla_workspace_graph_mode_copies_runtime_metadata() -> None:
-    workspace = MLAWorkspace.for_contract(
+    workspace = B12XAttentionWorkspace.for_contract(
         mode="decode",
         device="cpu",
         dtype=torch.bfloat16,
@@ -488,7 +488,7 @@ def test_mla_workspace_graph_mode_copies_runtime_metadata() -> None:
 
 
 def test_mla_decode_workspace_allocates_split_buffers_and_chunk_scalars() -> None:
-    workspace = MLAWorkspace.for_fixed_capacity(
+    workspace = B12XAttentionWorkspace.for_fixed_capacity(
         mode="decode",
         device="cpu",
         dtype=torch.bfloat16,

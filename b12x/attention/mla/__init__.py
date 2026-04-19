@@ -11,10 +11,18 @@ from .reference import (
     sparse_mla_reference,
     unpack_mla_kv_cache_reference,
 )
-from .workspace import MLAWorkspace
+from .workspace import (
+    B12XAttentionArena,
+    B12XAttentionArenaCaps,
+    B12XAttentionWorkspace,
+    B12XAttentionWorkspaceContract,
+)
 
 __all__ = [
-    "MLAWorkspace",
+    "B12XAttentionArena",
+    "B12XAttentionArenaCaps",
+    "B12XAttentionWorkspace",
+    "B12XAttentionWorkspaceContract",
     "MLASparseDecodeMetadata",
     "MLASparseExtendMetadata",
     "clear_mla_caches",
