@@ -11,10 +11,10 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import Boolean, Float32, Int32, Uint32
+from cutlass import Boolean, Float32, Int32, Uint8, Uint32
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import from_dlpack
-from cutlass.cutlass_dsl import Int64, dsl_user_op
+from cutlass.cutlass_dsl import Int64, T, dsl_user_op
 
 from b12x.attention import pipeline
 from b12x.attention import utils as attention_utils
@@ -55,9 +55,8 @@ _PREFILL_THREADS_PER_CTA = _PREFILL_WARPS_PER_CTA * _WARP_THREADS  # 256
 _PREFILL_NUM_MMA_Q = 1  # same as decode
 _PREFILL_NUM_MMA_KV = 2  # each K-warp covers 32 K-rows (2x16)
 
-_PREFILL_Q_STAGE_ROWS = _PREFILL_BLOCK_Q
-_PREFILL_Q_STAGE_COLS = _INDEX_HEAD_DIM
-_PREFILL_W_STAGE_ROWS = _PREFILL_BLOCK_Q
+_PREFILL_Q_STAGE_ROWS = _PREFILL_BLOCK_Q   # 32 Q rows per tile
+_PREFILL_Q_STAGE_COLS = _INDEX_HEAD_DIM    # 128 bytes per Q row
 
 
 def _to_kernel_tensor(
@@ -498,7 +497,6 @@ class SparseNSAExtendLogitsKernel:
     def __call__(
         self,
         q_u32: cute.Tensor,
-        q_bytes: cute.Tensor,
         weights: cute.Tensor,
         k_quant_bytes: cute.Tensor,
         k_tma_desc_ptrs: cute.Tensor,
@@ -512,7 +510,6 @@ class SparseNSAExtendLogitsKernel:
     ):
         self.kernel(
             q_u32,
-            q_bytes,
             weights,
             k_quant_bytes,
             k_tma_desc_ptrs,
@@ -536,7 +533,6 @@ class SparseNSAExtendLogitsKernel:
     def kernel(
         self,
         q_u32: cute.Tensor,
-        q_bytes: cute.Tensor,
         weights: cute.Tensor,
         k_quant_bytes: cute.Tensor,
         k_tma_desc_ptrs: cute.Tensor,
@@ -718,23 +714,50 @@ class SparseNSAExtendLogitsKernel:
 
 
 
+
+def ld_shared_u32(smem_addr: Int32, *, loc=None, ip=None) -> Uint32:
+    """Load 32 bits from shared memory."""
+    result = llvm.inline_asm(
+        T.i32(),
+        [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
+        "ld.shared.u32 {$0}, [$1];",
+        "=r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Uint32(result)
+
+
 @cute.jit
-def _pack_q_mxfp8_reg(
-    s_q_bytes: cute.Tensor,
-    row: Int32,
+def _pack_q_mxfp8_reg_smem_ptr(
+    q_smem_base: Int32,
+    row_local: Int32,
     col_pair_base: Int32,
 ) -> Uint32:
-    b0 = Uint32(s_q_bytes[row, col_pair_base + Int32(0)])
-    b1 = Uint32(s_q_bytes[row, col_pair_base + Int32(1)])
-    b2 = Uint32(s_q_bytes[row, col_pair_base + Int32(8)])
-    b3 = Uint32(s_q_bytes[row, col_pair_base + Int32(9)])
-    return b0 | (b1 << Int32(8)) | (b2 << Int32(16)) | (b3 << Int32(24))
+    """Pack 4 FP8 bytes from smem into one MMA register word.
+
+    Reads bytes at [row_local, col_pair_base+0], [row_local, col_pair_base+1],
+    [row_local, col_pair_base+8], [row_local, col_pair_base+9].
+    """
+    u32_idx_lo = col_pair_base // Int32(4)
+    u32_idx_hi = u32_idx_lo + Int32(2)
+    byte_shift = (col_pair_base % Int32(4)) * Int32(8)
+    addr_lo = q_smem_base + row_local * Int32(_PREFILL_Q_STAGE_COLS) + u32_idx_lo * Int32(4)
+    addr_hi = q_smem_base + row_local * Int32(_PREFILL_Q_STAGE_COLS) + u32_idx_hi * Int32(4)
+    lo = ld_shared_u32(addr_lo)
+    hi = ld_shared_u32(addr_hi)
+    lo_half = (lo >> byte_shift) & Uint32(0xFFFF)
+    hi_half = ((hi >> byte_shift) & Uint32(0xFFFF)) << Int32(16)
+    return lo_half | hi_half
 
 
 @cute.jit
 def _prefill_qk_mma_from_smem_q(
     s_frag: cute.Tensor,
-    s_q_bytes: cute.Tensor,
+    q_smem_base: Int32,
     k_base_addr: Int32,
     lane,
     warp_q_idx,
@@ -744,7 +767,8 @@ def _prefill_qk_mma_from_smem_q(
     num_mma_kv,
     num_mma_d_qk,
     upcast_stride_k,
-):
+) -> None:
+    """QK MMA using Q from smem (via raw pointer) instead of global memory."""
     unit_scale = Uint32(0x7F7F7F7F)
     k_offset = _permuted_offset_128b(
         row_base + warp_kv_idx * num_mma_kv * Int32(16) + Int32(8) * (lane // Int32(16)) + lane % Int32(8),
@@ -761,10 +785,12 @@ def _prefill_qk_mma_from_smem_q(
         col_base = Int32(mma_pair * 32) + thread_id_in_group * Int32(2)
         for mma_q in cutlass.range_constexpr(num_mma_q):
             row_base_q = warp_q_idx * Int32(16) + mma_q * Int32(16)
-            q_regs[mma_q, 0] = _pack_q_mxfp8_reg(s_q_bytes, row_base_q + group_id, col_base)
-            q_regs[mma_q, 1] = _pack_q_mxfp8_reg(s_q_bytes, row_base_q + group_id + Int32(8), col_base)
-            q_regs[mma_q, 2] = _pack_q_mxfp8_reg(s_q_bytes, row_base_q + group_id, col_base + Int32(16))
-            q_regs[mma_q, 3] = _pack_q_mxfp8_reg(s_q_bytes, row_base_q + group_id + Int32(8), col_base + Int32(16))
+            row_local_0 = row_base_q + group_id
+            row_local_8 = row_local_0 + Int32(8)
+            q_regs[mma_q, 0] = _pack_q_mxfp8_reg_smem_ptr(q_smem_base, row_local_0, col_base)
+            q_regs[mma_q, 1] = _pack_q_mxfp8_reg_smem_ptr(q_smem_base, row_local_8, col_base)
+            q_regs[mma_q, 2] = _pack_q_mxfp8_reg_smem_ptr(q_smem_base, row_local_0, col_base + Int32(16))
+            q_regs[mma_q, 3] = _pack_q_mxfp8_reg_smem_ptr(q_smem_base, row_local_8, col_base + Int32(16))
 
         k_offset_cur = k_offset
         for mma_kv in cutlass.range_constexpr(num_mma_kv):
@@ -782,32 +808,18 @@ def _prefill_qk_mma_from_smem_q(
 
             for mma_q in cutlass.range_constexpr(num_mma_q):
                 d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
-                    s_frag[mma_q, mma_kv, 0],
-                    s_frag[mma_q, mma_kv, 1],
-                    s_frag[mma_q, mma_kv, 2],
-                    s_frag[mma_q, mma_kv, 3],
-                    q_regs[mma_q, 0],
-                    q_regs[mma_q, 1],
-                    q_regs[mma_q, 2],
-                    q_regs[mma_q, 3],
-                    b0_k0,
-                    b0_k1,
-                    unit_scale,
-                    unit_scale,
+                    s_frag[mma_q, mma_kv, 0], s_frag[mma_q, mma_kv, 1],
+                    s_frag[mma_q, mma_kv, 2], s_frag[mma_q, mma_kv, 3],
+                    q_regs[mma_q, 0], q_regs[mma_q, 1],
+                    q_regs[mma_q, 2], q_regs[mma_q, 3],
+                    b0_k0, b0_k1, unit_scale, unit_scale,
                 )
                 d4, d5, d6, d7 = mxfp8_mma_m16n8k32_f32_e4m3(
-                    s_frag[mma_q, mma_kv, 4],
-                    s_frag[mma_q, mma_kv, 5],
-                    s_frag[mma_q, mma_kv, 6],
-                    s_frag[mma_q, mma_kv, 7],
-                    q_regs[mma_q, 0],
-                    q_regs[mma_q, 1],
-                    q_regs[mma_q, 2],
-                    q_regs[mma_q, 3],
-                    b1_k0,
-                    b1_k1,
-                    unit_scale,
-                    unit_scale,
+                    s_frag[mma_q, mma_kv, 4], s_frag[mma_q, mma_kv, 5],
+                    s_frag[mma_q, mma_kv, 6], s_frag[mma_q, mma_kv, 7],
+                    q_regs[mma_q, 0], q_regs[mma_q, 1],
+                    q_regs[mma_q, 2], q_regs[mma_q, 3],
+                    b1_k0, b1_k1, unit_scale, unit_scale,
                 )
                 s_frag[mma_q, mma_kv, 0] = d0
                 s_frag[mma_q, mma_kv, 1] = d1
@@ -822,67 +834,19 @@ def _prefill_qk_mma_from_smem_q(
             num_mma_kv * Int32(16) * upcast_stride_k
         )
 
-
-@cute.jit
-def _stage_prefill_q_head_to_smem(
-    q_bytes: cute.Tensor,
-    s_q_bytes: cute.Tensor,
-    q_tile_base: Int32,
-    head_idx: Int32,
-    valid_q_rows: Int32,
-    tx: Int32,
-    threads_per_cta: Int32,
-):
-    q_linear = tx
-    total = Int32(_PREFILL_Q_STAGE_ROWS * _PREFILL_Q_STAGE_COLS)
-    while q_linear < total:
-        row_local = q_linear // Int32(_PREFILL_Q_STAGE_COLS)
-        col_idx = q_linear - row_local * Int32(_PREFILL_Q_STAGE_COLS)
-        q_row = q_tile_base + row_local
-        s_q_bytes[row_local, col_idx] = (
-            cutlass.Uint8(q_bytes[q_row, head_idx, col_idx])
-            if q_row < valid_q_rows
-            else cutlass.Uint8(0)
-        )
-        q_linear += threads_per_cta
-
-
-@cute.jit
-def _stage_prefill_w_head_to_smem(
-    weights: cute.Tensor,
-    s_w: cute.Tensor,
-    q_tile_base: Int32,
-    head_idx: Int32,
-    valid_q_rows: Int32,
-    tx: Int32,
-    threads_per_cta: Int32,
-):
-    w_linear = tx
-    while w_linear < Int32(_PREFILL_W_STAGE_ROWS):
-        q_row = q_tile_base + w_linear
-        s_w[w_linear] = (
-            Float32(weights[q_row, head_idx])
-            if q_row < valid_q_rows
-            else Float32(0.0)
-        )
-        w_linear += threads_per_cta
-
-
 class SparseNSAExtendLogitsPrefillKernel:
     """Prefill-specialized extend logits kernel with _PREFILL_BLOCK_K=128.
 
     Uses 2 Q-warps x 4 K-warps = 256 threads. Each K-warp covers 32 K-rows
     (num_mma_kv=2), so the CTA processes 128 K rows per tile. This halves the
     number of K-CTAs, which halves redundant Q reads from global memory —
-    the dominant cost for large prefill. Q is staged into shared memory
-    per head to avoid redundant scattered global reads.
+    the dominant cost for large prefill. Q is staged into shared memory\n    per head to avoid redundant scattered global reads.
     """
 
     @cute.jit
     def __call__(
         self,
         q_u32: cute.Tensor,
-        q_bytes: cute.Tensor,
         weights: cute.Tensor,
         k_quant_bytes: cute.Tensor,
         k_tma_desc_ptrs: cute.Tensor,
@@ -896,7 +860,6 @@ class SparseNSAExtendLogitsPrefillKernel:
     ):
         self.kernel(
             q_u32,
-            q_bytes,
             weights,
             k_quant_bytes,
             k_tma_desc_ptrs,
@@ -920,7 +883,6 @@ class SparseNSAExtendLogitsPrefillKernel:
     def kernel(
         self,
         q_u32: cute.Tensor,
-        q_bytes: cute.Tensor,
         weights: cute.Tensor,
         k_quant_bytes: cute.Tensor,
         k_tma_desc_ptrs: cute.Tensor,
@@ -961,10 +923,6 @@ class SparseNSAExtendLogitsPrefillKernel:
                 cute.struct.MemRange[cutlass.Uint8, _PREFILL_Q_STAGE_ROWS * _PREFILL_Q_STAGE_COLS],
                 1024,
             ]
-            w_smem: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, _PREFILL_W_STAGE_ROWS],
-                16,
-            ]
             scales: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Float32, _PREFILL_BLOCK_K],
                 16,
@@ -984,10 +942,6 @@ class SparseNSAExtendLogitsPrefillKernel:
         s_k_perm_bytes = storage.k_perm.get_tensor(
             cute.make_layout((_PREFILL_BLOCK_K * _INDEX_HEAD_DIM,), stride=(1,))
         )
-        s_q_bytes = storage.q_bytes_smem.get_tensor(
-            cute.make_layout((_PREFILL_Q_STAGE_ROWS, _PREFILL_Q_STAGE_COLS), stride=(_PREFILL_Q_STAGE_COLS, 1))
-        )
-        s_w = storage.w_smem.get_tensor(cute.make_layout((_PREFILL_W_STAGE_ROWS,), stride=(1,)))
         s_scales = storage.scales.get_tensor(cute.make_layout((_PREFILL_BLOCK_K,), stride=(1,)))
         s_k_start = storage.k_start.get_tensor(cute.make_layout((_PREFILL_BLOCK_Q,), stride=(1,)))
         s_k_end = storage.k_end.get_tensor(cute.make_layout((_PREFILL_BLOCK_Q,), stride=(1,)))
@@ -1017,6 +971,8 @@ class SparseNSAExtendLogitsPrefillKernel:
         cute.arch.sync_threads()
 
         if s_tile_live[Int32(0)] != Int32(0):
+            # Derive q_smem_base from k_perm_base_addr (same SharedStorage struct)
+            q_smem_base = k_perm_base_addr + Int32(_PREFILL_BLOCK_K * _INDEX_HEAD_DIM)
             # TMA load K-tile (128 rows x 128 bytes = 16 KB)
             producer_state = pipeline.PipelineStateSimple(1, Int32(0))
             consumer_state = pipeline.PipelineStateSimple(1, Int32(0))
@@ -1056,18 +1012,24 @@ class SparseNSAExtendLogitsPrefillKernel:
                 for reg_id in cutlass.range_constexpr(8):
                     acc_frag[Int32(0), mma_kv, reg_id] = Float32(0.0)
 
+            # Cooperative v4 Q staging: 8 threads per row, each writes 4 consecutive
+            # u32 words via a single v4 store. Stage current head at start of each
+            # iter to avoid aliasing a concurrent MMA read in another warp.
+            threads_per_row = Int32(8)
+            row_local = tx // threads_per_row
+            col_group = tx % threads_per_row
+            u32_col_base = col_group * Int32(4)
+            q_row = q_tile_base + row_local
+            in_bounds = row_local < Int32(_PREFILL_Q_STAGE_ROWS) and q_row < valid_q_rows
+            q_smem_stage_addr = q_smem_base + row_local * Int32(_PREFILL_Q_STAGE_COLS) + u32_col_base * Int32(4)
+
             head_idx = Int32(0)
             while head_idx < num_heads:
-                # Stage Q bytes for current head into smem
-                _stage_prefill_q_head_to_smem(
-                    q_bytes, s_q_bytes, q_tile_base, head_idx,
-                    valid_q_rows, tx, Int32(_PREFILL_THREADS_PER_CTA),
-                )
-                # Stage weights for current head into smem
-                _stage_prefill_w_head_to_smem(
-                    weights, s_w, q_tile_base, head_idx,
-                    valid_q_rows, tx, Int32(_PREFILL_THREADS_PER_CTA),
-                )
+                v0 = Uint32(q_u32[q_row, head_idx, u32_col_base]) if in_bounds else Uint32(0)
+                v1 = Uint32(q_u32[q_row, head_idx, u32_col_base + Int32(1)]) if in_bounds else Uint32(0)
+                v2 = Uint32(q_u32[q_row, head_idx, u32_col_base + Int32(2)]) if in_bounds else Uint32(0)
+                v3 = Uint32(q_u32[q_row, head_idx, u32_col_base + Int32(3)]) if in_bounds else Uint32(0)
+                st_shared_v4_u32(q_smem_stage_addr, v0, v1, v2, v3)
                 cute.arch.sync_threads()
 
                 score_frag = cute.make_rmem_tensor(acc_layout, Float32)
@@ -1076,7 +1038,7 @@ class SparseNSAExtendLogitsPrefillKernel:
                         score_frag[Int32(0), mma_kv, reg_id] = Float32(0.0)
                 _prefill_qk_mma_from_smem_q(
                     score_frag,
-                    s_q_bytes,
+                    q_smem_base,
                     k_perm_base_addr,
                     lane,
                     warp_q_idx,
@@ -1087,7 +1049,7 @@ class SparseNSAExtendLogitsPrefillKernel:
                     Int32(_INDEX_HEAD_DIM // 16),
                     Int32(_FP8_ROW_VECS),
                 )
-                # Accumulate per K-sub-tile — read weights from smem
+                # Accumulate per K-sub-tile
                 lane_group = lane // Int32(4)
                 for mma_kv in cutlass.range_constexpr(_PREFILL_NUM_MMA_KV):
                     for reg_id in cutlass.range_constexpr(8):
@@ -1100,7 +1062,11 @@ class SparseNSAExtendLogitsPrefillKernel:
                                     score_frag[Int32(0), mma_kv, reg_id],
                                     Float32(0.0),
                                 )
-                                * Float32(s_w[q_local])
+                                * (
+                                    Float32(weights[q_tile_base + q_local, head_idx])
+                                    if q_tile_base + q_local < valid_q_rows
+                                    else Float32(0.0)
+                                )
                             )
                 cute.arch.sync_threads()
                 head_idx += Int32(1)
@@ -1238,7 +1204,7 @@ def run_sparse_nsa_extend_logits_kernel(
             k_end=k_end,
         )
         q_u32 = staged["q_u32"]
-        q_bytes_kernel = staged["q_bytes"]
+        q_bytes_kernel = q_fp8.contiguous().view(torch.uint8)
         weights_kernel = staged["weights"]
         k_quant_bytes = staged["k_quant_bytes"]
         k_scale_kernel = staged["k_scales"]
@@ -1260,11 +1226,11 @@ def run_sparse_nsa_extend_logits_kernel(
             return out_view
 
         q_bytes = q_fp8.contiguous().view(torch.uint8)
+        q_bytes_kernel = q_bytes
         _pad_k = _PREFILL_BLOCK_K if _use_prefill else _BLOCK_K
         k_quant_padded, k_scale_padded = _pad_kv_rows(k_quant=k_quant, k_scale=k_scale, pad_block_k=_pad_k)
         k_quant_bytes = k_quant_padded.contiguous().view(torch.uint8)
         q_u32 = _view_last_dim_as_u32(q_bytes)
-        q_bytes_kernel = q_bytes
         weights_kernel = weights.contiguous()
         k_scale_kernel = k_scale_padded.contiguous()
         k_start_kernel = k_start.contiguous()
@@ -1280,9 +1246,12 @@ def run_sparse_nsa_extend_logits_kernel(
 
     if _use_prefill:
         kernel = _build_sparse_nsa_extend_prefill_kernel()
+    else:
+        kernel = _build_sparse_nsa_extend_kernel()
+
+    if _use_prefill:
         args = (
             _to_kernel_tensor(q_u32, cutlass.Uint32),
-            _to_kernel_tensor(q_bytes_kernel, cutlass.Uint8),
             _to_kernel_tensor(weights_kernel, cutlass.Float32, assumed_align=4),
             _to_kernel_tensor(k_quant_bytes, cutlass.Uint8),
             _to_kernel_tensor(k_tma_desc_ptrs, cutlass.Int64, assumed_align=8),
@@ -1295,7 +1264,6 @@ def run_sparse_nsa_extend_logits_kernel(
             current_cuda_stream(),
         )
     else:
-        kernel = _build_sparse_nsa_extend_kernel()
         args = (
             _to_kernel_tensor(q_u32, cutlass.Uint32),
             _to_kernel_tensor(weights_kernel, cutlass.Float32, assumed_align=4),
@@ -1309,7 +1277,6 @@ def run_sparse_nsa_extend_logits_kernel(
             k_rows,
             current_cuda_stream(),
         )
-
     _cp = contract_phantoms or {}
     if _use_prefill:
         cache_key = (
