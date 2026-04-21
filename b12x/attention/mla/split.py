@@ -19,9 +19,12 @@ from b12x.cute.utils import current_cuda_stream
 from .kernel import (
     _MLA_GROUP_SIZE,
     _MLA_HEADS_PER_TILE,
+    _MLA_KV_STAGE_BYTES,
     _MLA_NOPE_DIM,
     _MLA_OUTPUT_FRAGMENTS_PER_LANE,
+    _MLA_Q_STAGE_BYTES,
     _MLA_SCALE_GROUPS,
+    _MLA_SCALE_STAGE_ELEMS,
     _MLA_TOKEN_TILE,
     _MLA_WARP_THREADS,
     _extract_packed_kv_runtime_views,
@@ -47,6 +50,32 @@ _SPLIT_MAX_WIDTH = 2048
 
 def _ceil_div(x: int, y: int) -> int:
     return (x + y - 1) // y
+
+
+def get_sparse_mla_split_shared_storage_cls():
+    """SharedStorage for split kernel: no kv_stage_b (single-tile path only)."""
+    class SharedStorage:
+        pass
+
+    SharedStorage.__annotations__ = {
+        "q_stage": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Uint8, int(_MLA_Q_STAGE_BYTES)],
+            128,
+        ],
+        "kv_stage_a": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Uint8, int(_MLA_KV_STAGE_BYTES)],
+            128,
+        ],
+        "token_idx": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Int32, _MLA_TOKEN_TILE],
+            16,
+        ],
+        "token_scale_a": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float32, _MLA_SCALE_STAGE_ELEMS],
+            16,
+        ],
+    }
+    return cute.struct(SharedStorage)
 
 
 @dataclass(frozen=True)
@@ -256,18 +285,15 @@ class SparseMLASplitDecodeForwardKernel:
                 token_end = row_token_end
 
             smem = cutlass.utils.SmemAllocator()
-            SharedStorage = get_sparse_mla_shared_storage_cls()
+            SharedStorage = get_sparse_mla_split_shared_storage_cls()
             storage = smem.allocate(SharedStorage)
             sTokenIdx = storage.token_idx.get_tensor(cute.make_layout((_MLA_TOKEN_TILE,), stride=(1,)))
             sScale = storage.token_scale_a.get_tensor(
                 cute.make_layout((_MLA_TOKEN_TILE * _MLA_SCALE_GROUPS,), stride=(1,))
             )
-            sScale_b = storage.token_scale_b.get_tensor(
-                cute.make_layout((_MLA_TOKEN_TILE * _MLA_SCALE_GROUPS,), stride=(1,))
-            )
+
             q_base_addr = shared_ptr_to_u32(storage.q_stage.data_ptr())
             kv_base_addr = shared_ptr_to_u32(storage.kv_stage_a.data_ptr())
-            kv_base_b = shared_ptr_to_u32(storage.kv_stage_b.data_ptr())
 
             _run_one_pass_sparse_mla_tile(
                 q_u32,
@@ -288,8 +314,8 @@ class SparseMLASplitDecodeForwardKernel:
                 q_idx,
                 chunk_idx,
                 tmp_lse,
-                kv_base_b,
-                sScale_b,
+                Int32(0),  # kv_base_b unused in single-tile path
+                sScale,    # sScale_b unused in single-tile path, pass sScale as placeholder
             )
 
 
