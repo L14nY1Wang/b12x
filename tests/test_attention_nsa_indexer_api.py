@@ -518,3 +518,109 @@ def test_sparse_nsa_index_extend_logits_cuda_matches_reference_for_large_head_co
     assert torch.isneginf(actual[0, 33:192]).all()
     assert torch.isneginf(actual[1, :192]).all()
     assert torch.isneginf(actual[6, 1:]).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for extend kernel coverage")
+@pytest.mark.parametrize(
+    "q_rows, k_rows",
+    [
+        (256, 4096),   # shortest prefill q, >2048 k — crosses the K-tile budget.
+        (512, 8192),   # multi-Q-tile prefill over long context.
+        (1024, 3072),  # many Q-tiles, mid-length K.
+    ],
+)
+def test_sparse_nsa_index_extend_logits_cuda_matches_reference_for_long_prefill(
+    q_rows: int, k_rows: int
+) -> None:
+    device = torch.device("cuda")
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(72_200 + q_rows * 17 + k_rows)
+
+    num_heads = 64
+    q_fp8 = (
+        torch.randn((q_rows, num_heads, 128), generator=gen, dtype=torch.float32).to(device=device) / 2
+    ).to(torch.float8_e4m3fn)
+    weights = torch.randn((q_rows, num_heads), generator=gen, dtype=torch.float32).to(device=device)
+    k = torch.randn((k_rows, 128), generator=gen, dtype=torch.float32).to(device=device) / 3
+    kv_fp8 = _quantize_rows_to_kv_fp8(k)
+
+    # Causal ragged ranges: row q sees k ∈ [0, q+1). Spans the full k_rows range
+    # for tail rows and exercises per-row sparse-range liveness for early rows.
+    positions = torch.arange(q_rows, dtype=torch.int32, device=device)
+    k_start = torch.zeros(q_rows, dtype=torch.int32, device=device)
+    k_end = torch.clamp(positions + 1, max=k_rows).to(torch.int32)
+
+    actual = sparse_nsa_index_extend_logits(
+        q_fp8=q_fp8,
+        weights=weights,
+        kv_fp8=kv_fp8,
+        metadata=NSAIndexerExtendLogitsMetadata(
+            k_start=k_start,
+            k_end=k_end,
+        ),
+    )
+    expected = sparse_nsa_extend_logits_reference(
+        q_fp8=q_fp8,
+        weights=weights,
+        kv_fp8=kv_fp8,
+        k_start=k_start,
+        k_end=k_end,
+    )
+
+    torch.cuda.synchronize(device)
+    _assert_logits_close(actual, expected)
+    # Out-of-range positions must stay -inf all the way out to k_rows.
+    for q in (0, q_rows // 2, q_rows - 1):
+        ke = min(q + 1, k_rows)
+        if ke < k_rows:
+            assert torch.isneginf(actual[q, ke:]).all(), f"row {q} leaked non-neginf beyond k_end={ke}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for extend kernel coverage")
+@pytest.mark.parametrize(
+    "q_rows, k_rows",
+    [
+        (256, 3072),   # slightly over the old hardcoded 2048 K-tile budget.
+        (256, 8192),   # well past it — exercises full K-grid scaling.
+    ],
+)
+def test_sparse_nsa_index_extend_logits_cuda_matches_reference_for_dense_long_prefill(
+    q_rows: int, k_rows: int
+) -> None:
+    """Dense (non-causal) long-K prefill: every q row sees every k row.
+
+    Exercises the K-tile grid scaling — with a fixed K_GROUPS=4 launcher and a fixed
+    inner K-tile loop of 4, the kernel can only cover 2048 K-rows per Q-tile; anything
+    beyond that silently stays at -inf and this test catches it.
+    """
+    device = torch.device("cuda")
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(72_400 + q_rows * 31 + k_rows)
+
+    num_heads = 64
+    q_fp8 = (
+        torch.randn((q_rows, num_heads, 128), generator=gen, dtype=torch.float32).to(device=device) / 2
+    ).to(torch.float8_e4m3fn)
+    weights = torch.randn((q_rows, num_heads), generator=gen, dtype=torch.float32).to(device=device)
+    k = torch.randn((k_rows, 128), generator=gen, dtype=torch.float32).to(device=device) / 3
+    kv_fp8 = _quantize_rows_to_kv_fp8(k)
+    k_start = torch.zeros(q_rows, dtype=torch.int32, device=device)
+    k_end = torch.full((q_rows,), k_rows, dtype=torch.int32, device=device)
+
+    actual = sparse_nsa_index_extend_logits(
+        q_fp8=q_fp8,
+        weights=weights,
+        kv_fp8=kv_fp8,
+        metadata=NSAIndexerExtendLogitsMetadata(k_start=k_start, k_end=k_end),
+    )
+    expected = sparse_nsa_extend_logits_reference(
+        q_fp8=q_fp8,
+        weights=weights,
+        kv_fp8=kv_fp8,
+        k_start=k_start,
+        k_end=k_end,
+    )
+    torch.cuda.synchronize(device)
+    _assert_logits_close(actual, expected)
+    # No position should have silently fallen back to -inf.
+    assert torch.isfinite(actual).all(), "kernel left finite positions as -inf"
