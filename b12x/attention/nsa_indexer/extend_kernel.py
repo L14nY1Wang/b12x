@@ -58,6 +58,8 @@ _PREFILL_NUM_MMA_KV = 2  # each K-warp covers 32 K-rows (2x16)
 
 _PREFILL_Q_STAGE_ROWS = _PREFILL_BLOCK_Q   # 32 Q rows per tile
 _PREFILL_Q_STAGE_COLS = _INDEX_HEAD_DIM    # 128 bytes per Q row
+_PREFILL_WEIGHT_COLS = _MAX_Q_HEADS   # 64 heads per Q row
+_PREFILL_WEIGHT_BYTES = _PREFILL_BLOCK_Q * _PREFILL_WEIGHT_COLS * 4  # 8KB
 
 
 def _to_kernel_tensor(
@@ -753,6 +755,41 @@ def ld_shared_u32(smem_addr: Int32, *, loc=None, ip=None) -> Uint32:
     return Uint32(result)
 
 
+def ld_shared_f32(smem_addr: Int32, *, loc=None, ip=None) -> Float32:
+    """Load 32 bits from shared memory as Float32."""
+    result = llvm.inline_asm(
+        T.f32(),
+        [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
+        "ld.shared.f32 {$0}, [$1];",
+        "=f,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Float32(result)
+
+
+def st_shared_v4_f32(smem_addr: Int32, v0: Float32, v1: Float32, v2: Float32, v3: Float32, *, loc=None, ip=None):
+    """Store 128 bits (4 x f32) to shared memory. smem_addr is a u32 shared-memory address."""
+    llvm.inline_asm(
+        None,
+        [
+            Int32(smem_addr).ir_value(loc=loc, ip=ip),
+            Float32(v0).ir_value(loc=loc, ip=ip),
+            Float32(v1).ir_value(loc=loc, ip=ip),
+            Float32(v2).ir_value(loc=loc, ip=ip),
+            Float32(v3).ir_value(loc=loc, ip=ip),
+        ],
+        "st.shared.v4.f32 [$0], {$1, $2, $3, $4};",
+        "r,f,f,f,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
 @cute.jit
 def _pack_q_mxfp8_reg_smem_ptr(
     q_smem_base: Int32,
@@ -946,6 +983,10 @@ class SparseNSAExtendLogitsPrefillKernel:
                 cute.struct.MemRange[cutlass.Uint8, _PREFILL_Q_STAGE_ROWS * _PREFILL_Q_STAGE_COLS * 2],
                 1024,
             ]
+            w_smem: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, _PREFILL_BLOCK_Q * _MAX_Q_HEADS],
+                1024,
+            ]
             scales: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Float32, _PREFILL_BLOCK_K],
                 16,
@@ -994,8 +1035,11 @@ class SparseNSAExtendLogitsPrefillKernel:
         cute.arch.sync_threads()
 
         if s_tile_live[Int32(0)] != Int32(0):
-            # Derive q_smem_base from k_perm_base_addr (same SharedStorage struct)
+            # Derive q_smem_base from k_perm_base_addr (same SharedStorage struct).
+            # q_bytes_smem is double-buffered (2 x 4KB) for cp.async pipelining,
+            # so w_smem sits after both Q buffers.
             q_smem_base = k_perm_base_addr + Int32(_PREFILL_BLOCK_K * _INDEX_HEAD_DIM)
+            w_smem_base = q_smem_base + Int32(_PREFILL_Q_STAGE_ROWS * _PREFILL_Q_STAGE_COLS * 2)
             # TMA load K-tile (128 rows x 128 bytes = 16 KB)
             producer_state = pipeline.PipelineStateSimple(1, Int32(0))
             consumer_state = pipeline.PipelineStateSimple(1, Int32(0))
@@ -1024,6 +1068,25 @@ class SparseNSAExtendLogitsPrefillKernel:
             while scale_linear < Int32(_PREFILL_BLOCK_K):
                 s_scales[scale_linear] = Float32(k_scales[k_tile_base + scale_linear])
                 scale_linear += Int32(_PREFILL_THREADS_PER_CTA)
+            cute.arch.sync_threads()
+
+            # Stage weights for all heads into smem (32 Q-rows x 64 heads x 4B = 8KB).
+            # Each thread writes one aligned 16B (4 f32) chunk per iter; stride ==
+            # coverage == 4 so adjacent threads cover adjacent chunks with no gaps.
+            w_linear = tx * Int32(4)
+            while w_linear < Int32(_PREFILL_BLOCK_Q * _MAX_Q_HEADS):
+                w_q_local = w_linear // num_heads
+                w_head = w_linear % num_heads
+                w_q_row = q_tile_base + w_q_local
+                w0 = Float32(weights[w_q_row, w_head]) if (w_q_row < valid_q_rows and w_head < num_heads) else Float32(0.0)
+                w1 = Float32(weights[w_q_row, w_head + Int32(1)]) if (w_q_row < valid_q_rows and w_head + Int32(1) < num_heads) else Float32(0.0)
+                w2 = Float32(weights[w_q_row, w_head + Int32(2)]) if (w_q_row < valid_q_rows and w_head + Int32(2) < num_heads) else Float32(0.0)
+                w3 = Float32(weights[w_q_row, w_head + Int32(3)]) if (w_q_row < valid_q_rows and w_head + Int32(3) < num_heads) else Float32(0.0)
+                st_shared_v4_f32(
+                    w_smem_base + w_linear * Int32(4),
+                    w0, w1, w2, w3,
+                )
+                w_linear += Int32(_PREFILL_THREADS_PER_CTA * 4)
             cute.arch.sync_threads()
 
             # Accumulator: (1, NUM_MMA_KV, 8) — separate accumulator per K-sub-tile
@@ -1109,10 +1172,8 @@ class SparseNSAExtendLogitsPrefillKernel:
                                     score_frag[Int32(0), mma_kv, reg_id],
                                     Float32(0.0),
                                 )
-                                * (
-                                    Float32(weights[q_tile_base + q_local, head_idx])
-                                    if q_tile_base + q_local < valid_q_rows
-                                    else Float32(0.0)
+                                * ld_shared_f32(
+                                    w_smem_base + (q_local * num_heads + head_idx) * Int32(4)
                                 )
                             )
                 head_idx += Int32(1)
