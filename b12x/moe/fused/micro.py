@@ -153,7 +153,10 @@ class _MoEMicroKernelBase:
             self.b_dtype,
             self.b_layout,
             ab_stage,
-            cutlass.BFloat16,
+            # sC holds the FC2 alpha-multiplied output in fp32 so the scatter
+            # doesn't pay a bf16 round-trip. Costs ~16KB extra smem per kernel;
+            # the bf16 conversion is deferred until the single atomic_add.
+            cutlass.Float32,
             self.c_layout,
             self.epi_stage,
             self.sf_vec_size,
@@ -191,7 +194,7 @@ class _MoEMicroKernelBase:
             cute.size_in_bytes(self.b_dtype, b_smem_staged),
             cute.size_in_bytes(self.sf_dtype, sfa_smem_staged),
             cute.size_in_bytes(self.sf_dtype, sfb_smem_staged),
-            cute.size_in_bytes(cutlass.BFloat16, epi_smem_staged),
+            cute.size_in_bytes(cutlass.Float32, epi_smem_staged),
         ]
         if self.is_gated:
             buffers.insert(2, cute.size_in_bytes(self.b_dtype, b_smem_staged))
@@ -750,7 +753,7 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                 self.buffer_align_bytes,
             ]
             sC: cute.struct.Align[
-                cute.struct.MemRange[cutlass.BFloat16, cute.cosize(epi_smem_staged)],
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(epi_smem_staged)],
                 self.buffer_align_bytes,
             ]
 
@@ -778,7 +781,7 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                 self.buffer_align_bytes,
             ]
             sC: cute.struct.Align[
-                cute.struct.MemRange[cutlass.BFloat16, cute.cosize(epi_smem_staged)],
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(epi_smem_staged)],
                 self.buffer_align_bytes,
             ]
 
@@ -1103,6 +1106,20 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
             csSFB_up_full = thr_ld_SFB.partition_S(sSFB_up)
             crSFB_full = thr_ld_SFB.retile(tCrSFB_full)
 
+            # Per-CTA register accumulator (relu2 single-token only). Each CTA
+            # processes ~N work units that all contribute to the same output
+            # row (scatter_output[0, :]), so instead of scatter_add'ing N bf16
+            # atomics per (thread, output_tile_idx, col) we accumulate in fp32
+            # registers and emit ONE bf16 atomic per position after the work
+            # loop. Combined with fp32 sC, the rounding path goes from 3N to
+            # just 2 per position.
+            _per_cta_accum = self.activation == "relu2" and self.single_token
+            if cutlass.const_expr(_per_cta_accum):
+                cta_acc = cute.make_rmem_tensor((output_tile_cnt, 2), self.acc_dtype)
+                for _ot in cutlass.range_constexpr(output_tile_cnt):
+                    cta_acc[_ot, 0] = cutlass.Float32(0.0)
+                    cta_acc[_ot, 1] = cutlass.Float32(0.0)
+
             num_persistent_clusters = Int32(gdim_z)
             cluster_shape_mn = (
                 Int32(self.cluster_shape_mn[0]),
@@ -1230,11 +1247,16 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                     self.epilog_sync_barrier.arrive_and_wait()
 
                 _is_m_major = self.c_layout.is_m_major_c()
+                # sC is fp32 — use universal copy for the register→smem store
+                # (StMatrix is 16-bit only). The partition layout atom still
+                # uses StMatrix8x8x16b because cute builds the thread↔tile
+                # partition from that pattern; the actual store goes through
+                # CopyUniversalOp which is element-type agnostic.
                 copy_atom_r2s = cute.make_copy_atom(
-                    cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16,
+                    cute.nvgpu.CopyUniversalOp(), cutlass.Float32,
                 )
                 copy_atom_C = cute.make_copy_atom(
-                    cute.nvgpu.warp.StMatrix8x8x16bOp(_is_m_major, 2), cutlass.BFloat16,
+                    cute.nvgpu.warp.StMatrix8x8x16bOp(_is_m_major, 2), cutlass.Float32,
                 )
                 tiled_copy_C_Atom = cute.make_tiled_copy_C_atom(copy_atom_C, tiled_mma)
                 tiled_copy_r2s = cute.make_tiled_copy_S(copy_atom_r2s, tiled_copy_C_Atom)
@@ -1247,7 +1269,8 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                 rD_shape = cute.shape(thr_copy_r2s.partition_S(sC))
                 tRS_rD_layout = cute.make_layout(rD_shape[:3])
                 tRS_rD = cute.make_rmem_tensor(tRS_rD_layout.shape, self.acc_dtype)
-                tRS_rD_out = cute.make_rmem_tensor(tRS_rD_layout.shape, cutlass.BFloat16)
+                # tRS_rD_out is fp32 now; no bf16 conversion before the sC store.
+                tRS_rD_out = cute.make_rmem_tensor(tRS_rD_layout.shape, self.acc_dtype)
 
                 mma_tile_m = self.tile_shape_mnk[0] // cute.size(tRS_rGate, mode=[1])
                 mma_tile_n = self.tile_shape_mnk[1] // cute.size(tRS_rGate, mode=[2])
@@ -1476,8 +1499,10 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                                         relu_g = fmax_f32(g, cutlass.Float32(0.0))
                                         tRS_rD_slice[elem_idx] = relu_g * relu_g
 
+                        # sC is fp32 — keep the alpha-multiplied output in fp32
+                        # through the sC round-trip. bf16 cvt is deferred to
+                        # the single atomic_add at scatter time.
                         acc_vec = tRS_rD.load()
-                        acc_vec = acc_vec.to(cutlass.BFloat16)
                         tRS_rD_out.store(acc_vec)
                         cute.copy(
                             tiled_copy_r2s,
@@ -1639,8 +1664,10 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                                 for elem_idx in cutlass.range_constexpr(cute.size(tRS_rD_slice)):
                                     tRS_rD_slice[elem_idx] = down_alpha_value * down_epi_acc_slice[elem_idx]
 
+                        # sC is fp32 — keep the alpha-multiplied output in fp32
+                        # through the sC round-trip. bf16 cvt is deferred to
+                        # the single atomic_add at scatter time.
                         acc_vec = tRS_rD.load()
-                        acc_vec = acc_vec.to(cutlass.BFloat16)
                         tRS_rD_out.store(acc_vec)
                         epi_buffer = Int32(epi_m) % cute.size(tRS_sD, mode=[3])
                         cute.copy(
@@ -1682,11 +1709,18 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                             sc_v1 = cutlass.Float32(
                                 sC[local_row, local_pair_col * Int32(2) + Int32(1), epi_buffer]
                             )
-                            scatter_add_bf16x2(
-                                get_ptr_as_int64(scatter_output, tok * scatter_N + global_col),
-                                wv * sc_v0,
-                                wv * sc_v1,
-                            )
+                            if cutlass.const_expr(_per_cta_accum):
+                                # Accumulate in fp32 registers. One thread owns
+                                # one (output_tile_idx, pair); we emit the bf16
+                                # atomic_add once after the work loop.
+                                cta_acc[output_tile_idx, 0] += wv * sc_v0
+                                cta_acc[output_tile_idx, 1] += wv * sc_v1
+                            else:
+                                scatter_add_bf16x2(
+                                    get_ptr_as_int64(scatter_output, tok * scatter_N + global_col),
+                                    wv * sc_v0,
+                                    wv * sc_v1,
+                                )
                             pair_idx += Int32(self.num_mma_warps * self.num_threads_per_warp)
 
                         # Post-scatter barrier: needed to ensure all warps
@@ -1718,6 +1752,23 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                         accum_tile_m=accum_tile_m,
                         cta_id_in_cluster=cta_id_in_cluster,
                     )
+
+            # Final scatter pass: each active thread (tidx < pair_cols_per_row)
+            # emits one bf16x2 atomic per output tile from its fp32 accumulator.
+            # For 64 active threads × output_tile_cnt=8 this is 512 atomics per
+            # CTA (vs ~5600 per CTA before). Single-token share-input means all
+            # contributions land at scatter_output[0, :].
+            if cutlass.const_expr(_per_cta_accum):
+                _final_pair_cols = Int32(self.tile_shape_mnk[1] // 2)
+                _scatter_N = Int32(scatter_output.shape[1])
+                if Int32(tidx) < _final_pair_cols:
+                    for _ot in cutlass.range_constexpr(output_tile_cnt):
+                        _gcol = Int32(_ot) * Int32(self.tile_shape_mnk[1]) + Int32(tidx) * Int32(2)
+                        scatter_add_bf16x2(
+                            get_ptr_as_int64(scatter_output, _gcol),
+                            cta_acc[_ot, 0],
+                            cta_acc[_ot, 1],
+                        )
 
         # ===================================================================
         # DMA WARP (warp 4)
