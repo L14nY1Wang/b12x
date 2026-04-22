@@ -412,7 +412,7 @@ def _get_dynamic_chunk_multiplier() -> int:
 def _get_relu2_bs1_spark_micro_cap() -> int:
     cap = _first_env("B12X_RELU2_BS1_SPARK_MICRO_CAP")
     if cap is None:
-        return 42
+        return 48
     return max(1, int(cap))
 
 
