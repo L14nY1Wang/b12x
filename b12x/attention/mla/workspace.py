@@ -387,6 +387,10 @@ class B12XAttentionWorkspace:
     page_table_1_runtime: torch.Tensor | None = None
     cache_seqlens_int32_runtime: torch.Tensor | None = None
     nsa_cache_seqlens_int32_runtime: torch.Tensor | None = None
+    paged_indexer_real_page_table_runtime: torch.Tensor | None = None
+    paged_indexer_seqlens_per_query_runtime: torch.Tensor | None = None
+    paged_indexer_active_width_runtime: torch.Tensor | None = None
+    paged_indexer_schedule_metadata_runtime: torch.Tensor | None = None
     tmp_output: torch.Tensor | None = None
     tmp_lse: torch.Tensor | None = None
     ragged_kv_cache: torch.Tensor | None = None
@@ -569,6 +573,33 @@ class B12XAttentionWorkspace:
         if self.nsa_cache_seqlens_int32_runtime is None:
             self.nsa_cache_seqlens_int32_runtime = torch.empty(
                 (self.max_total_q,),
+                dtype=torch.int32,
+                device=self.device,
+            )
+        if self.paged_indexer_real_page_table_runtime is None:
+            self.paged_indexer_real_page_table_runtime = torch.empty(
+                (self.max_paged_q_rows, self.max_page_table_width),
+                dtype=torch.int32,
+                device=self.device,
+            )
+        if self.paged_indexer_seqlens_per_query_runtime is None:
+            self.paged_indexer_seqlens_per_query_runtime = torch.empty(
+                (self.max_paged_q_rows,),
+                dtype=torch.int32,
+                device=self.device,
+            )
+        if self.paged_indexer_active_width_runtime is None:
+            self.paged_indexer_active_width_runtime = torch.empty(
+                (1,),
+                dtype=torch.int32,
+                device=self.device,
+            )
+        if self.paged_indexer_schedule_metadata_runtime is None:
+            num_sms = 1
+            if self.device.type == "cuda":
+                num_sms = torch.cuda.get_device_properties(self.device).multi_processor_count
+            self.paged_indexer_schedule_metadata_runtime = torch.empty(
+                (int(num_sms) + 1, 2),
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -1076,6 +1107,7 @@ class B12XAttentionWorkspace:
         real_page_table: torch.Tensor,
         seqlens_per_query: torch.Tensor,
         active_width: torch.Tensor,
+        schedule_metadata: torch.Tensor | None = None,
         width_tokens: int,
     ) -> dict[str, torch.Tensor]:
         if self.indexer_paged_logits is None:
@@ -1110,6 +1142,8 @@ class B12XAttentionWorkspace:
             raise ValueError("workspace-backed paged decode requires contiguous seqlens_per_query")
         if not active_width.is_contiguous():
             raise ValueError("workspace-backed paged decode requires contiguous active_width")
+        if schedule_metadata is not None and not schedule_metadata.is_contiguous():
+            raise ValueError("workspace-backed paged decode requires contiguous schedule_metadata")
 
         q_rows = int(q_fp8.shape[0])
         width_tokens = int(width_tokens)
@@ -1166,6 +1200,22 @@ class B12XAttentionWorkspace:
             raise ValueError(
                 f"active_width must have dtype torch.int32, got {active_width.dtype}"
             )
+        if schedule_metadata is not None:
+            if schedule_metadata.device != self.device:
+                raise ValueError(
+                    "schedule_metadata device "
+                    f"{schedule_metadata.device} does not match workspace device {self.device}"
+                )
+            if schedule_metadata.ndim != 2 or schedule_metadata.shape[1] != 2:
+                raise ValueError(
+                    "schedule_metadata must have shape (num_sms + 1, 2), got "
+                    f"{tuple(schedule_metadata.shape)}"
+                )
+            if schedule_metadata.dtype != torch.int32:
+                raise ValueError(
+                    "schedule_metadata must have dtype torch.int32, got "
+                    f"{schedule_metadata.dtype}"
+                )
         if width_tokens < 0:
             raise ValueError(f"width_tokens must be non-negative, got {width_tokens}")
         max_width_tokens = int(self.max_page_table_width) * int(self.page_size)
@@ -1180,12 +1230,48 @@ class B12XAttentionWorkspace:
         )
         if q_rows != 0 and width_tokens != 0:
             logits_view.fill_(float("-inf"))
+        real_page_table_kernel = real_page_table
+        seqlens_per_query_kernel = seqlens_per_query
+        active_width_kernel = active_width
+        schedule_metadata_kernel = schedule_metadata
+        if self.use_cuda_graph:
+            self._allocate_runtime_metadata()
+            assert self.paged_indexer_real_page_table_runtime is not None
+            assert self.paged_indexer_seqlens_per_query_runtime is not None
+            assert self.paged_indexer_active_width_runtime is not None
+            rows, page_width = real_page_table.shape
+            self.paged_indexer_real_page_table_runtime[:rows, :page_width].copy_(
+                real_page_table
+            )
+            self.paged_indexer_seqlens_per_query_runtime[:q_rows].copy_(seqlens_per_query)
+            self.paged_indexer_active_width_runtime.copy_(active_width)
+            real_page_table_kernel = self.paged_indexer_real_page_table_runtime[
+                :rows, :page_width
+            ]
+            seqlens_per_query_kernel = self.paged_indexer_seqlens_per_query_runtime[:q_rows]
+            active_width_kernel = self.paged_indexer_active_width_runtime
+            if schedule_metadata is not None:
+                assert self.paged_indexer_schedule_metadata_runtime is not None
+                schedule_rows = schedule_metadata.shape[0]
+                if schedule_rows > self.paged_indexer_schedule_metadata_runtime.shape[0]:
+                    raise ValueError(
+                        "schedule_metadata rows "
+                        f"{schedule_rows} exceed workspace schedule capacity "
+                        f"{self.paged_indexer_schedule_metadata_runtime.shape[0]}"
+                    )
+                self.paged_indexer_schedule_metadata_runtime[
+                    :schedule_rows, :
+                ].copy_(schedule_metadata)
+                schedule_metadata_kernel = self.paged_indexer_schedule_metadata_runtime[
+                    :schedule_rows, :
+                ]
         return {
             "q_bytes": q_bytes,
             "weights": weights,
-            "real_page_table": real_page_table,
-            "seqlens_per_query": seqlens_per_query,
-            "active_width": active_width,
+            "real_page_table": real_page_table_kernel,
+            "seqlens_per_query": seqlens_per_query_kernel,
+            "active_width": active_width_kernel,
+            "schedule_metadata": schedule_metadata_kernel,
             "logits": logits_view,
             "logits_view": logits_view,
         }

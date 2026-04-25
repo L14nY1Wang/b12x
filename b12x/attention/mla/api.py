@@ -222,6 +222,7 @@ def _run_sparse_mla(
     sm_scale_tensor = _get_sm_scale_tensor(workspace=workspace, device=q_all.device, sm_scale=sm_scale)
     split_cfg = None
     force_split = workspace.mode in ("extend", "verify", "draft_extend")
+    graph_stable_split = workspace.fixed_capacity or workspace.use_cuda_graph
     if not use_reference:
         split_cfg = select_sparse_mla_split_decode_config(
             q_all=q_all,
@@ -245,14 +246,21 @@ def _run_sparse_mla(
             forced_width = int(selected_indices.shape[1])
             if active_token_counts is not None and active_token_counts.numel() > 0:
                 if (
-                    active_token_counts.device.type != "cuda"
-                    or not torch.cuda.is_current_stream_capturing()
+                    not graph_stable_split
+                    and (
+                        active_token_counts.device.type != "cuda"
+                        or not torch.cuda.is_current_stream_capturing()
+                    )
                 ):
                     forced_width = min(
                         forced_width,
                         max(0, int(active_token_counts.max().item())),
                     )
             split_cfg = forced_sparse_mla_split_decode_config_for_width(forced_width)
+        if graph_stable_split and split_cfg is not None:
+            split_cfg = forced_sparse_mla_split_decode_config_for_width(
+                int(selected_indices.shape[1])
+            )
         split_cfg = _apply_mla_prefill_strategy(
             split_cfg=split_cfg,
             workspace=workspace,

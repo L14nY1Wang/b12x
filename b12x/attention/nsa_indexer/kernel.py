@@ -1558,6 +1558,7 @@ def run_sparse_nsa_paged_logits_kernel(
             real_page_table=real_page_table,
             seqlens_per_query=seqlens_per_query,
             active_width=active_width,
+            schedule_metadata=schedule_metadata,
             width_tokens=width_tokens,
         )
         q_bytes = staged["q_bytes"]
@@ -1565,6 +1566,7 @@ def run_sparse_nsa_paged_logits_kernel(
         real_page_table_kernel = staged["real_page_table"]
         seqlens_per_query_kernel = staged["seqlens_per_query"]
         active_width_kernel = staged["active_width"]
+        schedule_metadata_kernel = staged["schedule_metadata"]
         logits = staged["logits"]
         logits_view = staged["logits_view"]
         if contract_phantoms is None:
@@ -1575,6 +1577,7 @@ def run_sparse_nsa_paged_logits_kernel(
         real_page_table_kernel = real_page_table.contiguous()
         seqlens_per_query_kernel = seqlens_per_query.contiguous()
         active_width_kernel = active_width.contiguous()
+        schedule_metadata_kernel = None
         logits = torch.full(
             (rows, width_tokens),
             float("-inf"),
@@ -1607,8 +1610,7 @@ def run_sparse_nsa_paged_logits_kernel(
         _tensor_meta_key(_cp.get("logits", logits)),
     )
     max_pages = int(real_page_table.shape[1])
-    schedule_metadata_kernel = None
-    if schedule_metadata is not None:
+    if schedule_metadata is not None and schedule_metadata_kernel is None:
         if workspace is not None and not schedule_metadata.is_contiguous():
             raise ValueError(
                 "workspace-backed paged decode requires contiguous schedule_metadata"
