@@ -40,6 +40,11 @@ def pack_mla_kv_cache_reference(
     k_rope_2d = _as_2d_cache(k_rope, _MLA_ROPE_DIM, "k_rope")
     if k_nope_2d.shape[0] != k_rope_2d.shape[0]:
         raise ValueError("k_nope and k_rope must have the same token count")
+    if k_rope_2d.dtype != torch.bfloat16:
+        raise ValueError(
+            "k_rope must have dtype torch.bfloat16 because the packed MLA layout "
+            f"stores raw BF16 rope bytes, got {k_rope_2d.dtype}"
+        )
 
     quant_bytes: list[torch.Tensor] = []
     scale_bytes: list[torch.Tensor] = []
@@ -162,21 +167,38 @@ def _sparse_attention_reference(
     )
     q_all_f = q_all.to(torch.float32)
     num_kv = k_all.shape[0]
+    width = page_table_1.shape[1]
+    if num_kv == 0 or width == 0:
+        return out.to(q_all.dtype)
+
+    positions = torch.arange(width, dtype=torch.long, device=q_all.device)
+    tiny = torch.finfo(torch.float32).tiny
 
     for row in range(q_all.shape[0]):
-        valid = page_table_1[row]
+        selected = page_table_1[row].to(torch.long)
+        active_mask = torch.ones((width,), dtype=torch.bool, device=q_all.device)
         if active_token_counts is not None:
-            token_end = int(active_token_counts[row].item())
-            token_end = max(0, min(token_end, valid.shape[0]))
-            valid = valid[:token_end]
-        valid = valid[(valid >= 0) & (valid < num_kv)]
-        if valid.numel() == 0:
-            continue
+            token_end = active_token_counts[row].to(torch.long).clamp(min=0, max=width)
+            active_mask = positions < token_end
+        valid_mask = active_mask & (selected >= 0) & (selected < num_kv)
+        safe_selected = selected.clamp(0, num_kv - 1)
 
-        k_sel = k_all.index_select(0, valid.to(torch.long))
-        v_sel = v_all.index_select(0, valid.to(torch.long))
+        k_sel = k_all.index_select(0, safe_selected)
+        v_sel = v_all.index_select(0, safe_selected)
         scores = torch.matmul(q_all_f[row], k_sel.transpose(0, 1)) * float(sm_scale)
-        probs = torch.softmax(scores, dim=-1)
+        scores = torch.where(
+            valid_mask.unsqueeze(0),
+            scores,
+            torch.full_like(scores, float("-inf")),
+        )
+        row_max = scores.amax(dim=-1, keepdim=True)
+        row_max = torch.where(torch.isfinite(row_max), row_max, torch.zeros_like(row_max))
+        exp_scores = torch.where(
+            valid_mask.unsqueeze(0),
+            torch.exp(scores - row_max),
+            torch.zeros_like(scores),
+        )
+        probs = exp_scores / exp_scores.sum(dim=-1, keepdim=True).clamp_min(tiny)
         out[row] = torch.matmul(probs, v_sel)
 
     return out.to(q_all.dtype)

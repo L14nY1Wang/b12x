@@ -2192,8 +2192,6 @@ def supports_sparse_mla_kernel(
     page_table_1: torch.Tensor,
     v_head_dim: int,
 ) -> bool:
-    if os.environ.get("B12X_MLA_FORCE_REFERENCE", "0") == "1":
-        return False
     return (
         select_sparse_mla_traits(
             q_all=q_all,

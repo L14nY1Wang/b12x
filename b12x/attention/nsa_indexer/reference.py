@@ -203,37 +203,31 @@ def sparse_nsa_paged_logits_reference(
     )
     q_fp32 = q_fp8.to(torch.float32)
     max_page_capacity = k_quant.shape[0]
+    if real_page_table.shape[0] == 0 or max_page_capacity == 0:
+        return logits_out
 
+    token_pos = torch.arange(width_tokens, device=q_fp8.device, dtype=torch.long)
+    page_col = torch.div(token_pos, page_size, rounding_mode="floor")
+    slot_idx = token_pos % page_size
+    neg_inf = torch.full((width_tokens,), float("-inf"), dtype=torch.float32, device=q_fp8.device)
     for query_row in range(valid_q_rows):
-        batch_row = int(query_row_to_batch[query_row].item())
-        if batch_row < 0 or batch_row >= real_page_table.shape[0]:
-            raise ValueError(
-                f"query_row_to_batch[{query_row}]={batch_row} is out of bounds for "
-                f"{real_page_table.shape[0]} batch rows"
-            )
-        seq_len = min(int(seqlens_per_query[query_row].item()), width_tokens)
-        if seq_len <= 0:
-            continue
-        token_pos = torch.arange(seq_len, device=q_fp8.device, dtype=torch.long)
-        page_col = torch.div(token_pos, page_size, rounding_mode="floor")
-        slot_idx = token_pos % page_size
-        page_ids = real_page_table[batch_row, page_col].to(torch.long)
-        valid_mask = page_ids >= 0
-        if not torch.any(valid_mask):
-            continue
-        valid_page_ids = page_ids[valid_mask]
-        if torch.any(valid_page_ids >= max_page_capacity):
-            bad = int(valid_page_ids.max().item())
-            raise ValueError(
-                f"real_page_table page id {bad} exceeds index_k_cache page capacity {max_page_capacity}"
-            )
-        valid_token_pos = token_pos[valid_mask]
-        valid_slot_idx = slot_idx[valid_mask]
-        k_selected = k_quant[valid_page_ids, valid_slot_idx]
-        scale_selected = k_scale[valid_page_ids, valid_slot_idx]
+        batch_row = query_row_to_batch[query_row].to(torch.long)
+        batch_valid = (batch_row >= 0) & (batch_row < real_page_table.shape[0])
+        safe_batch_row = batch_row.clamp(0, real_page_table.shape[0] - 1).reshape(1)
+        page_ids = real_page_table.index_select(0, safe_batch_row)[0, page_col].to(torch.long)
+        seq_len = seqlens_per_query[query_row].to(torch.long).clamp(min=0, max=width_tokens)
+        valid_mask = (
+            batch_valid
+            & (token_pos < seq_len)
+            & (page_ids >= 0)
+            & (page_ids < max_page_capacity)
+        )
+        safe_page_ids = page_ids.clamp(0, max_page_capacity - 1)
+        k_selected = k_quant[safe_page_ids, slot_idx]
+        scale_selected = k_scale[safe_page_ids, slot_idx]
         score = torch.matmul(q_fp32[query_row], k_selected.transpose(0, 1))
         logits = (torch.relu(score) * weights_f[query_row].unsqueeze(1)).sum(dim=0)
-        logits_out[query_row, valid_token_pos] = logits * scale_selected
+        logits_out[query_row].copy_(torch.where(valid_mask, logits * scale_selected, neg_inf))
 
     return logits_out
 
@@ -291,13 +285,20 @@ def sparse_nsa_extend_logits_reference(
         dtype=torch.float32,
         device=q_fp8.device,
     )
+    if k_quant.shape[0] == 0:
+        return logits_out
+    token_pos = torch.arange(k_quant.shape[0], dtype=torch.long, device=q_fp8.device)
     for query_row in range(valid_q_rows):
-        ks = max(0, int(k_start[query_row].item()))
-        ke = min(int(k_end[query_row].item()), k_quant.shape[0])
-        if ke <= ks:
-            continue
-        score = torch.matmul(q_fp32[query_row], k_fp32[ks:ke].transpose(0, 1))
+        ks = k_start[query_row].to(torch.long).clamp(min=0, max=k_quant.shape[0])
+        ke = k_end[query_row].to(torch.long).clamp(min=0, max=k_quant.shape[0])
+        valid_mask = (token_pos >= ks) & (token_pos < ke)
+        score = torch.matmul(q_fp32[query_row], k_fp32.transpose(0, 1))
         logits = (torch.relu(score) * weights_f[query_row].unsqueeze(1)).sum(dim=0)
-        logits_out[query_row, ks:ke] = logits * k_scale[ks:ke]
+        row_out = torch.where(
+            valid_mask,
+            logits * k_scale,
+            torch.full_like(logits, float("-inf")),
+        )
+        logits_out[query_row].copy_(row_out)
 
     return logits_out

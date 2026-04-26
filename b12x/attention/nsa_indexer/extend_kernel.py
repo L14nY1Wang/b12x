@@ -1783,8 +1783,6 @@ def supports_sparse_nsa_extend_logits_kernel(
     k_start: torch.Tensor,
     k_end: torch.Tensor,
 ) -> bool:
-    if os.environ.get("B12X_NSA_INDEXER_FORCE_REFERENCE", "0") == "1":
-        return False
     if q_fp8.device.type != "cuda":
         return False
     if q_fp8.ndim != 3 or q_fp8.shape[2] != _INDEX_HEAD_DIM:

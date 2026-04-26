@@ -1452,8 +1452,6 @@ def supports_sparse_nsa_paged_logits_kernel(
     seqlens_per_query: torch.Tensor,
     page_size: int,
 ) -> bool:
-    if os.environ.get("B12X_NSA_INDEXER_FORCE_REFERENCE", "0") == "1":
-        return False
     if page_size != _PAGE_SIZE:
         return False
     if q_fp8.device.type != "cuda":

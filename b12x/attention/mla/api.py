@@ -218,57 +218,55 @@ def _run_sparse_mla(
             f"q_all head_dim {q_all.shape[-1]} does not match workspace head_dim {workspace.head_dim}"
         )
 
-    use_reference = os.environ.get("B12X_MLA_FORCE_REFERENCE", "0") == "1"
     sm_scale_tensor = _get_sm_scale_tensor(workspace=workspace, device=q_all.device, sm_scale=sm_scale)
     split_cfg = None
     force_split = workspace.mode in ("extend", "verify", "draft_extend")
     graph_stable_split = workspace.fixed_capacity or workspace.use_cuda_graph
-    if not use_reference:
-        split_cfg = select_sparse_mla_split_decode_config(
+    split_cfg = select_sparse_mla_split_decode_config(
+        q_all=q_all,
+        kv_cache=kv_cache,
+        page_table_1=selected_indices,
+        active_token_counts=active_token_counts,
+        output_dtype=q_all.dtype,
+        v_head_dim=v_head_dim,
+    )
+    if (
+        force_split
+        and split_cfg is None
+        and q_all.device.type == "cuda"
+        and supports_sparse_mla_kernel(
             q_all=q_all,
             kv_cache=kv_cache,
             page_table_1=selected_indices,
-            active_token_counts=active_token_counts,
-            output_dtype=q_all.dtype,
             v_head_dim=v_head_dim,
         )
-        if (
-            force_split
-            and split_cfg is None
-            and q_all.device.type == "cuda"
-            and supports_sparse_mla_kernel(
-                q_all=q_all,
-                kv_cache=kv_cache,
-                page_table_1=selected_indices,
-                v_head_dim=v_head_dim,
-            )
-        ):
-            forced_width = int(selected_indices.shape[1])
-            if active_token_counts is not None and active_token_counts.numel() > 0:
-                if (
-                    not graph_stable_split
-                    and (
-                        active_token_counts.device.type != "cuda"
-                        or not torch.cuda.is_current_stream_capturing()
-                    )
-                ):
-                    forced_width = min(
-                        forced_width,
-                        max(0, int(active_token_counts.max().item())),
-                    )
-            split_cfg = forced_sparse_mla_split_decode_config_for_width(forced_width)
-        if graph_stable_split and split_cfg is not None:
-            split_cfg = forced_sparse_mla_split_decode_config_for_width(
-                int(selected_indices.shape[1])
-            )
-        split_cfg = _apply_mla_prefill_strategy(
-            split_cfg=split_cfg,
-            workspace=workspace,
-            active_token_counts=active_token_counts,
-            device=q_all.device,
-            q_rows=int(q_all.shape[0]),
-            topk_width=int(selected_indices.shape[1]),
+    ):
+        forced_width = int(selected_indices.shape[1])
+        if active_token_counts is not None and active_token_counts.numel() > 0:
+            if (
+                not graph_stable_split
+                and (
+                    active_token_counts.device.type != "cuda"
+                    or not torch.cuda.is_current_stream_capturing()
+                )
+            ):
+                forced_width = min(
+                    forced_width,
+                    max(0, int(active_token_counts.max().item())),
+                )
+        split_cfg = forced_sparse_mla_split_decode_config_for_width(forced_width)
+    if graph_stable_split and split_cfg is not None:
+        split_cfg = forced_sparse_mla_split_decode_config_for_width(
+            int(selected_indices.shape[1])
         )
+    split_cfg = _apply_mla_prefill_strategy(
+        split_cfg=split_cfg,
+        workspace=workspace,
+        active_token_counts=active_token_counts,
+        device=q_all.device,
+        q_rows=int(q_all.shape[0]),
+        topk_width=int(selected_indices.shape[1]),
+    )
     if split_cfg is not None:
         if workspace.tmp_output is None or workspace.tmp_lse is None:
             raise RuntimeError("workspace is missing split MLA buffers")
@@ -304,7 +302,7 @@ def _run_sparse_mla(
             launch_num_chunks=launch_num_chunks,
             workspace=workspace,
         )
-    elif not use_reference and supports_sparse_mla_kernel(
+    elif supports_sparse_mla_kernel(
         q_all=q_all,
         kv_cache=kv_cache,
         page_table_1=selected_indices,
