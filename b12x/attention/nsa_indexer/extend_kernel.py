@@ -1438,17 +1438,6 @@ class SparseNSAExtendLogitsPrefill512Kernel:
                 cute.struct.MemRange[cutlass.Uint8, _PREFILL512_BLOCK_K * _INDEX_HEAD_DIM],
                 1024,
             ]
-            q_bytes_smem: cute.struct.Align[
-                cute.struct.MemRange[
-                    cutlass.Uint8,
-                    _PREFILL_Q_STAGE_ROWS * _PREFILL_Q_STAGE_COLS * _PREFILL512_Q_HEADS_BATCH,
-                ],
-                1024,
-            ]
-            w_smem: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, _PREFILL512_BLOCK_Q * _MAX_Q_HEADS],
-                1024,
-            ]
             scales: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Float32, _PREFILL512_BLOCK_K],
                 16,
@@ -1496,8 +1485,6 @@ class SparseNSAExtendLogitsPrefill512Kernel:
         cute.arch.sync_threads()
 
         if s_tile_live[Int32(0)] != Int32(0):
-            q_smem_base = k_perm_base_addr + Int32(_PREFILL512_BLOCK_K * _INDEX_HEAD_DIM)
-            w_smem_base = q_smem_base + Int32(_PREFILL_Q_STAGE_BYTES * _PREFILL512_Q_HEADS_BATCH)
             producer_state = pipeline.PipelineStateSimple(1, Int32(0))
             consumer_state = pipeline.PipelineStateSimple(1, Int32(0))
             if warp_idx == Int32(0):
@@ -1533,22 +1520,9 @@ class SparseNSAExtendLogitsPrefill512Kernel:
                 scale_linear += Int32(_PREFILL512_THREADS_PER_CTA)
             cute.arch.sync_threads()
 
-            w_linear = tx * Int32(4)
-            while w_linear < Int32(_PREFILL512_BLOCK_Q * _MAX_Q_HEADS):
-                w_q_local = w_linear // num_heads
-                w_head = w_linear % num_heads
-                w_q_row = q_tile_base + w_q_local
-                w0 = Float32(weights[w_q_row, w_head]) if (w_q_row < valid_q_rows and w_head < num_heads) else Float32(0.0)
-                w1 = Float32(weights[w_q_row, w_head + Int32(1)]) if (w_q_row < valid_q_rows and w_head + Int32(1) < num_heads) else Float32(0.0)
-                w2 = Float32(weights[w_q_row, w_head + Int32(2)]) if (w_q_row < valid_q_rows and w_head + Int32(2) < num_heads) else Float32(0.0)
-                w3 = Float32(weights[w_q_row, w_head + Int32(3)]) if (w_q_row < valid_q_rows and w_head + Int32(3) < num_heads) else Float32(0.0)
-                st_shared_v4_f32(
-                    w_smem_base + w_linear * Int32(4),
-                    w0, w1, w2, w3,
-                )
-                w_linear += Int32(_PREFILL512_THREADS_PER_CTA * 4)
-            cute.arch.sync_threads()
-
+            # Global-Q path: read Q and weights directly from global memory,
+            # no smem staging. Saves ~24KB smem and eliminates head-batching
+            # sync overhead.
             acc_layout = cute.make_layout(
                 (1, _PREFILL512_NUM_MMA_KV, 8), stride=(16, 8, 1)
             )
@@ -1557,79 +1531,44 @@ class SparseNSAExtendLogitsPrefill512Kernel:
                 for reg_id in cutlass.range_constexpr(8):
                     acc_frag[Int32(0), mma_kv, reg_id] = Float32(0.0)
 
-            lane_group_pre = lane // Int32(4)
-            q_local_rs0 = warp_q_idx * Int32(16) + lane_group_pre
-            q_local_rs1 = q_local_rs0 + Int32(8)
-            w_off_rs0 = q_local_rs0 * num_heads * Int32(4)
-            w_off_rs1 = q_local_rs1 * num_heads * Int32(4)
+            lane_group = lane // Int32(4)
 
-            threads_per_row = Int32(8)
-            row_local = tx // threads_per_row
-            col_group = tx % threads_per_row
-            u32_col_base = col_group * Int32(4)
-            q_row = q_tile_base + row_local
-            in_bounds_pred = Int32(1) if (row_local < Int32(_PREFILL_Q_STAGE_ROWS) and q_row < valid_q_rows) else Int32(0)
-            thread_offset = row_local * Int32(_PREFILL_Q_STAGE_COLS) + u32_col_base * Int32(4)
-            q_smem_stride = Int32(_PREFILL_Q_STAGE_BYTES)
-            q_row_for_async = q_row if row_local < Int32(_PREFILL_Q_STAGE_ROWS) else Int32(0)
-
-            batch_base_head = Int32(0)
-            while batch_base_head < num_heads:
-                for block_offset in cutlass.range_constexpr(_PREFILL512_Q_HEADS_BATCH):
-                    head_in_batch = Int32(block_offset)
-                    global_head = batch_base_head + head_in_batch
-                    if global_head < num_heads:
-                        gmem_u32_offset = (
-                            q_row_for_async * num_heads + global_head
-                        ) * Int32(_INDEX_HEAD_DIM // 4) + u32_col_base
-                        cp_async_128b_pred(
-                            q_smem_base + head_in_batch * q_smem_stride + thread_offset,
-                            get_ptr_as_int64(q_u32, gmem_u32_offset),
-                            in_bounds_pred,
+            head_idx = Int32(0)
+            while head_idx < num_heads:
+                score_frag = cute.make_rmem_tensor(acc_layout, Float32)
+                for mma_kv in cutlass.range_constexpr(_PREFILL512_NUM_MMA_KV):
+                    for reg_id in cutlass.range_constexpr(8):
+                        score_frag[Int32(0), mma_kv, reg_id] = Float32(0.0)
+                _literal_qk_mma_into_sfrag_mxfp8_raw(
+                    score_frag,
+                    q_u32,
+                    head_idx,
+                    q_tile_base,
+                    valid_q_rows,
+                    k_perm_base_addr,
+                    lane,
+                    warp_q_idx,
+                    warp_k_idx,
+                    Int32(0),
+                    Int32(_PREFILL512_NUM_MMA_Q),
+                    Int32(_PREFILL512_NUM_MMA_KV),
+                    Int32(_INDEX_HEAD_DIM // 16),
+                    Int32(_FP8_ROW_VECS),
+                )
+                for mma_kv in cutlass.range_constexpr(_PREFILL512_NUM_MMA_KV):
+                    for reg_id in cutlass.range_constexpr(8):
+                        row_slot = (reg_id % 4) // 2
+                        q_local = warp_q_idx * Int32(16) + lane_group + Int32(8 * row_slot)
+                        w_val = Float32(weights[q_tile_base + q_local, head_idx]) if (q_tile_base + q_local < valid_q_rows and head_idx < num_heads) else Float32(0.0)
+                        acc_frag[Int32(0), mma_kv, reg_id] = Float32(
+                            acc_frag[Int32(0), mma_kv, reg_id]
+                            + attention_utils.fmax(
+                                score_frag[Int32(0), mma_kv, reg_id],
+                                Float32(0.0),
+                            )
+                            * w_val
                         )
-                cute.arch.cp_async_commit_group()
-                cute.arch.cp_async_wait_group(0)
-                cute.arch.sync_threads()
-
-                for block_offset in cutlass.range_constexpr(_PREFILL512_Q_HEADS_BATCH):
-                    head_idx = batch_base_head + Int32(block_offset)
-                    if head_idx < num_heads:
-                        curr_mma_base = q_smem_base + Int32(block_offset) * q_smem_stride
-
-                        score_frag = cute.make_rmem_tensor(acc_layout, Float32)
-                        for mma_kv in cutlass.range_constexpr(_PREFILL512_NUM_MMA_KV):
-                            for reg_id in cutlass.range_constexpr(8):
-                                score_frag[Int32(0), mma_kv, reg_id] = Float32(0.0)
-                        _prefill_qk_mma_from_smem_q(
-                            score_frag,
-                            curr_mma_base,
-                            k_perm_base_addr,
-                            lane,
-                            warp_q_idx,
-                            warp_k_idx,
-                            Int32(0),
-                            Int32(_PREFILL512_NUM_MMA_Q),
-                            Int32(_PREFILL512_NUM_MMA_KV),
-                            Int32(_INDEX_HEAD_DIM // 16),
-                            Int32(_FP8_ROW_VECS),
-                        )
-                        lane_group = lane // Int32(4)
-                        for mma_kv in cutlass.range_constexpr(_PREFILL512_NUM_MMA_KV):
-                            for reg_id in cutlass.range_constexpr(8):
-                                row_slot = (reg_id % 4) // 2
-                                w_off = w_off_rs0 if row_slot == Int32(0) else w_off_rs1
-                                acc_frag[Int32(0), mma_kv, reg_id] = Float32(
-                                    acc_frag[Int32(0), mma_kv, reg_id]
-                                    + attention_utils.fmax(
-                                        score_frag[Int32(0), mma_kv, reg_id],
-                                        Float32(0.0),
-                                    )
-                                    * ld_shared_f32(
-                                        w_smem_base + w_off + head_idx * Int32(4)
-                                    )
-                                )
-                cute.arch.sync_threads()
-                batch_base_head += Int32(_PREFILL512_Q_HEADS_BATCH)
+                head_idx += Int32(1)
 
             lane_group = lane // Int32(4)
             lane_pair_base = Int32(2) * (lane % Int32(4))
