@@ -19,7 +19,7 @@ from serve.logging import StartupSession, get_logger
 from serve.model.attention import B12xPagedAttention
 from serve.model.loader import LoadedModel
 from serve.model.ops import rms_norm
-from serve.model.workspaces import get_b12x_moe_workspace_pool
+from serve.model.workspaces import get_b12x_execution_lane
 
 LOGGER = get_logger(__name__)
 
@@ -68,7 +68,8 @@ class ModelRunner:
         self.max_total_tokens = max_total_tokens
 
         # Inject per-layer workspaces and bind per-layer cache refs.
-        moe_workspace = get_b12x_moe_workspace_pool(self.device)
+        execution_lane = get_b12x_execution_lane(self.device)
+        moe_workspace = execution_lane.moe_workspace_pool
         shared_attn_workspaces: dict[tuple[object, ...], dict[str, object]] = {}
 
         kv_layer_idx = 0

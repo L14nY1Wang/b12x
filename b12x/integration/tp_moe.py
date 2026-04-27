@@ -62,6 +62,7 @@ class TPMoEWorkspace:
     scale_flat: torch.Tensor | None = None
     packed_a_storage_ptr: object = None
     route_workspace: "_TPRouteWorkspace | None" = None
+    volatile_launch_state: bool = False
 
 
 @dataclass(kw_only=True)
@@ -100,21 +101,52 @@ class TPDynamicWorkspace(TPMoEWorkspace):
 
 @dataclass
 class TPMoEWorkspacePool:
-    """Caller-owned capacity-based workspace cache partitioned by CUDA stream.
+    """Caller-owned capacity-based workspace cache for one execution lane.
 
-    A single explicit pool may be shared across multiple layers, but overlapping
-    launches on different CUDA streams must still use distinct scratch buffers.
-    The pool therefore keys allocations by both launch shape and current stream.
+    A single explicit pool may be shared across layers in a lane. Independent
+    overlapping lanes must use distinct pools; internal fork/join streams share
+    the lane pool and therefore the same scratch arena.
     """
 
     workspaces: Dict[Tuple, TPMoEWorkspace] = field(default_factory=dict)
     route_workspaces: Dict[Tuple, "_TPRouteWorkspace"] = field(default_factory=dict)
     core_arenas: Dict[Tuple, "_TPCoreArena"] = field(default_factory=dict)
+    shared_arena: torch.Tensor | None = None
+    shared_arena_nbytes: int = 0
+    route_workspace_nbytes: int = 0
+    core_arena_offset_bytes: int = 0
+    core_arena_nbytes: int = 0
+    frozen: bool = False
 
     def clear(self) -> None:
         self.workspaces.clear()
         self.route_workspaces.clear()
         self.core_arenas.clear()
+
+    def bind_shared_arena(
+        self,
+        shared_arena: torch.Tensor,
+        *,
+        route_workspace_nbytes: int,
+        core_workspace_nbytes: int,
+        frozen: bool = True,
+    ) -> None:
+        if shared_arena.dtype != torch.uint8:
+            raise TypeError(f"shared_arena must have dtype torch.uint8, got {shared_arena.dtype}")
+        route_workspace_nbytes = align_up(max(int(route_workspace_nbytes), 0), 16)
+        core_workspace_nbytes = max(int(core_workspace_nbytes), 0)
+        required = route_workspace_nbytes + core_workspace_nbytes
+        if shared_arena.numel() < max(required, 1):
+            raise ValueError(
+                f"shared_arena has {shared_arena.numel()} bytes, but MoE workspace requires {required}"
+            )
+        self.clear()
+        self.shared_arena = shared_arena
+        self.shared_arena_nbytes = int(shared_arena.numel())
+        self.route_workspace_nbytes = route_workspace_nbytes
+        self.core_arena_offset_bytes = route_workspace_nbytes
+        self.core_arena_nbytes = core_workspace_nbytes
+        self.frozen = bool(frozen)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -180,6 +212,14 @@ class _TPCoreArena:
     plan: _TPCoreWorkspacePlan
     shared_arena: torch.Tensor
     tensors: Dict[str, torch.Tensor]
+
+
+@dataclass(frozen=True, kw_only=True)
+class TPMoEArenaLayout:
+    route_workspace_nbytes: int
+    core_workspace_nbytes: int
+    total_nbytes: int
+    core_token_counts: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -637,11 +677,13 @@ def _refresh_dynamic_workspace_scales(
     a2_gscale: torch.Tensor,
     *,
     input_scales_static: bool,
+    force: bool = False,
 ) -> None:
     a1_src_ptr = a1_gscale.data_ptr()
     a2_src_ptr = a2_gscale.data_ptr()
     if (
-        not input_scales_static
+        force
+        or not input_scales_static
         or workspace.input_gs_src_ptr != a1_src_ptr
         or workspace.down_input_scale_src_ptr != a2_src_ptr
     ):
@@ -670,6 +712,16 @@ def _finalize_workspace_views(workspace: TPMoEWorkspace) -> None:
         cute.AddressSpace.gmem,
         assumed_align=16,
     )
+
+
+def _prepare_workspace_for_launch(workspace: TPMoEWorkspace) -> None:
+    if not workspace.volatile_launch_state:
+        return
+    # Shared execution-lane arenas overlay MoE scratch with attention/indexer
+    # scratch. The resident-grid barrier scalars are launch state, so refresh
+    # them after any previous phase may have overwritten them.
+    workspace.barrier_count.zero_()
+    workspace.barrier_epoch.zero_()
 
 
 def _dtype_nbytes(dtype: torch.dtype) -> int:
@@ -803,17 +855,66 @@ def _allocate_arena_tensor(
     return tensor, offset + nbytes
 
 
-def _allocate_core_arena(plan: _TPCoreWorkspacePlan) -> _TPCoreArena:
+def _core_workspace_nbytes(plan: _TPCoreWorkspacePlan) -> int:
     arena_nbytes = 0
     for spec in plan.tensor_specs:
         arena_nbytes = align_up(arena_nbytes, max(16, _dtype_nbytes(spec.dtype)))
         arena_nbytes += _tensor_numel(spec.shape) * _dtype_nbytes(spec.dtype)
-    shared_arena = torch.empty(arena_nbytes, dtype=torch.uint8, device=plan.device)
-    offset = 0
+    return int(arena_nbytes)
+
+
+def _emit_core_workspace_stats(
+    plan: _TPCoreWorkspacePlan,
+    *,
+    storage: str,
+    required_nbytes: int,
+    capacity_nbytes: int | None = None,
+) -> None:
+    return
+
+
+def _materialize_core_arena(
+    plan: _TPCoreWorkspacePlan,
+    shared_arena: torch.Tensor,
+    *,
+    offset_bytes: int = 0,
+    capacity_nbytes: int | None = None,
+) -> _TPCoreArena:
+    arena_nbytes = _core_workspace_nbytes(plan)
+    offset_bytes = int(offset_bytes)
+    if capacity_nbytes is None:
+        capacity_nbytes = shared_arena.numel() - offset_bytes
+    if capacity_nbytes < arena_nbytes:
+        raise ValueError(
+            f"MoE core arena requires {arena_nbytes} bytes, but only {capacity_nbytes} are available"
+        )
+    relative_offset = 0
     tensors: Dict[str, torch.Tensor] = {}
     for spec in plan.tensor_specs:
-        tensors[spec.name], offset = _allocate_arena_tensor(shared_arena, offset, spec)
+        tensor, absolute_next = _allocate_arena_tensor(
+            shared_arena,
+            offset_bytes + relative_offset,
+            spec,
+        )
+        tensors[spec.name] = tensor
+        relative_offset = absolute_next - offset_bytes
     return _TPCoreArena(plan=plan, shared_arena=shared_arena, tensors=tensors)
+
+
+def _allocate_core_arena(plan: _TPCoreWorkspacePlan) -> _TPCoreArena:
+    arena_nbytes = _core_workspace_nbytes(plan)
+    shared_arena = torch.empty(
+        arena_nbytes,
+        dtype=torch.uint8,
+        device=plan.device,
+    )
+    arena = _materialize_core_arena(plan, shared_arena)
+    _emit_core_workspace_stats(
+        plan,
+        storage="standalone",
+        required_nbytes=arena_nbytes,
+    )
+    return arena
 
 
 def _materialize_workspace_from_core_arena(
@@ -823,6 +924,7 @@ def _materialize_workspace_from_core_arena(
     a1_gscale: torch.Tensor,
     a2_gscale: torch.Tensor,
     input_scales_static: bool,
+    volatile_launch_state: bool = False,
 ) -> TPMoEWorkspace:
     tensors = arena.tensors
     common_kwargs = dict(
@@ -838,6 +940,7 @@ def _materialize_workspace_from_core_arena(
         row_counts=tensors["row_counts"],
         barrier_count=tensors["barrier_count"],
         barrier_epoch=tensors["barrier_epoch"],
+        volatile_launch_state=bool(volatile_launch_state),
     )
     if plan.implementation == "static":
         workspace = TPCompactStaticWorkspace(
@@ -888,6 +991,7 @@ def _materialize_workspace_from_core_arena(
         a1_gscale,
         a2_gscale,
         input_scales_static=input_scales_static,
+        force=volatile_launch_state,
     )
     _finalize_workspace_views(workspace)
     return workspace
@@ -932,7 +1036,25 @@ def _alloc_workspace(
             raise ValueError("storage_key is required when allocating from a workspace pool")
         arena = pool.core_arenas.get(storage_key)
         if arena is None or arena.plan != plan:
-            arena = _allocate_core_arena(plan)
+            if pool.shared_arena is None:
+                arena = _allocate_core_arena(plan)
+            else:
+                if pool.shared_arena.device != plan.device:
+                    raise ValueError(
+                        f"MoE pool arena device {pool.shared_arena.device} does not match plan device {plan.device}"
+                    )
+                arena = _materialize_core_arena(
+                    plan,
+                    pool.shared_arena,
+                    offset_bytes=pool.core_arena_offset_bytes,
+                    capacity_nbytes=pool.core_arena_nbytes,
+                )
+                _emit_core_workspace_stats(
+                    plan,
+                    storage="shared",
+                    required_nbytes=_core_workspace_nbytes(plan),
+                    capacity_nbytes=pool.core_arena_nbytes,
+                )
             pool.core_arenas[storage_key] = arena
     else:
         arena = _allocate_core_arena(plan)
@@ -942,6 +1064,7 @@ def _alloc_workspace(
         a1_gscale=a1_gscale,
         a2_gscale=a2_gscale,
         input_scales_static=input_scales_static,
+        volatile_launch_state=bool(pool is not None and pool.shared_arena is not None),
     )
 
 
@@ -1186,7 +1309,6 @@ def _validate_workspace(
 def _workspace_pool_key(
     implementation: str,
     *,
-    stream_key: int,
     state_E: int,
     weight_E: int,
     max_rows: int,
@@ -1204,7 +1326,6 @@ def _workspace_pool_key(
         max_rows = -1
     return (
         implementation,
-        stream_key,
         state_E,
         weight_E,
         max_rows,
@@ -1270,10 +1391,8 @@ def _resolve_workspace(
             "workspace must be a TPMoEWorkspace or TPMoEWorkspacePool"
         )
 
-    stream_key = int(torch.cuda.current_stream(plan.device).stream_id)
     key = _workspace_pool_key(
         plan.implementation,
-        stream_key=stream_key,
         state_E=plan.state_E,
         weight_E=plan.weight_E,
         max_rows=plan.max_rows,
@@ -1367,6 +1486,7 @@ def _resolve_workspace(
             a1_gscale,
             a2_gscale,
             input_scales_static=input_scales_static,
+            force=resolved.volatile_launch_state,
         )
     return resolved
 
@@ -1424,9 +1544,99 @@ def allocate_tp_moe_workspace(
     )
 
 
-def allocate_tp_moe_workspace_pool() -> TPMoEWorkspacePool:
-    """Allocate an explicit caller-owned workspace pool."""
-    return TPMoEWorkspacePool()
+def plan_tp_moe_arena_layout(
+    *,
+    max_tokens: int,
+    weight_E: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    device: torch.device | str,
+    dtype: torch.dtype,
+    core_token_counts: tuple[int, ...] | None = None,
+    route_num_experts: int | None = None,
+    route_logits_dtype: torch.dtype | None = None,
+) -> TPMoEArenaLayout:
+    """Compute the byte layout needed by one lane-owned MoE pool."""
+    device = torch.device(device)
+    max_tokens = max(int(max_tokens), 1)
+    weight_E = max(int(weight_E), 1)
+    k = max(int(k), 1)
+    n = max(int(n), 1)
+    num_topk = max(int(num_topk), 1)
+    if core_token_counts is None:
+        core_token_counts = (max_tokens,)
+    else:
+        core_token_counts = tuple(max(int(token_count), 1) for token_count in core_token_counts)
+        if max_tokens not in core_token_counts:
+            core_token_counts = (max_tokens, *core_token_counts)
+    static_cutover_pairs = _get_static_compact_cutover_pairs()
+    max_static_tokens = static_cutover_pairs // num_topk
+    if max_static_tokens >= 1:
+        static_boundary_tokens = min(max_tokens, max_static_tokens)
+        if static_boundary_tokens not in core_token_counts:
+            core_token_counts = (*core_token_counts, static_boundary_tokens)
+    route_num_experts = int(route_num_experts if route_num_experts is not None else weight_E)
+    route_logits_dtype = route_logits_dtype or dtype
+    core_nbytes = 0
+    for token_count in core_token_counts:
+        plan = _make_workspace_plan(
+            num_tokens=token_count,
+            weight_E=weight_E,
+            k=k,
+            n=n,
+            num_topk=num_topk,
+            device=device,
+            dtype=dtype,
+            eager_exact_dynamic=False,
+        )
+        core_plan = _plan_core_workspace(
+            plan.implementation,
+            plan.state_E,
+            plan.weight_E,
+            plan.k,
+            plan.n,
+            plan.num_topk,
+            plan.device,
+            plan.dtype,
+            routed_rows=plan.routed_rows,
+            max_rows=plan.max_rows,
+            dynamic_physical_tiles=plan.dynamic_physical_tiles,
+            dynamic_task_capacity=plan.dynamic_task_capacity,
+        )
+        core_nbytes = max(core_nbytes, _core_workspace_nbytes(core_plan))
+    route_nbytes = _route_workspace_nbytes(
+        num_tokens=max_tokens,
+        num_experts=route_num_experts,
+        top_k=num_topk,
+        logits_dtype=route_logits_dtype,
+    )
+    route_nbytes = align_up(route_nbytes, 16)
+    return TPMoEArenaLayout(
+        route_workspace_nbytes=route_nbytes,
+        core_workspace_nbytes=core_nbytes,
+        total_nbytes=max(route_nbytes + core_nbytes, 1),
+        core_token_counts=core_token_counts,
+    )
+
+
+def allocate_tp_moe_workspace_pool(
+    *,
+    shared_arena: torch.Tensor | None = None,
+    route_workspace_nbytes: int = 0,
+    core_workspace_nbytes: int = 0,
+    frozen: bool = False,
+) -> TPMoEWorkspacePool:
+    """Allocate an explicit caller-owned workspace pool for one execution lane."""
+    pool = TPMoEWorkspacePool()
+    if shared_arena is not None:
+        pool.bind_shared_arena(
+            shared_arena,
+            route_workspace_nbytes=route_workspace_nbytes,
+            core_workspace_nbytes=core_workspace_nbytes,
+            frozen=frozen,
+        )
+    return pool
 
 
 def _get_kernel_cache(impl: str) -> Dict[Tuple, Tuple]:
@@ -2238,6 +2448,7 @@ def _launch_exact_relu2_bs1_nemotron(
         input_scales_static=input_scales_static,
     )
     assert isinstance(resolved, TPCompactStaticWorkspace)
+    _prepare_workspace_for_launch(resolved)
     launcher.compiled(
         a, flat_ids, flat_weights,
         resolved.packed_a_view, resolved.sfa_ptr,
@@ -2285,6 +2496,7 @@ def _launch_dynamic(
         mac_override=effective_mac,
         activation=activation,
     )
+    _prepare_workspace_for_launch(workspace)
     _gptr = lambda dtype, t, align=16: make_ptr(dtype, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align)
     ids_cutlass_dtype = cutlass.Int32 if flat_ids.dtype == torch.int32 else cutlass.Int64
     ids_align = 4 if flat_ids.dtype == torch.int32 else 8
@@ -2423,6 +2635,7 @@ def _launch_compact_static(
             activation=activation,
         )
         launch_ids = flat_ids
+    _prepare_workspace_for_launch(workspace)
     compiled(
         a, launch_ids, flat_weights,
         workspace.packed_a_view, workspace.sfa_ptr,
@@ -2733,11 +2946,132 @@ def _alloc_route_workspace(
     device: torch.device,
     logits_dtype: torch.dtype,
 ) -> _TPRouteWorkspace:
+    required = _route_workspace_nbytes(
+        num_tokens=num_tokens,
+        num_experts=num_experts,
+        top_k=top_k,
+        logits_dtype=logits_dtype,
+    )
+    _emit_route_workspace_stats(
+        storage="standalone",
+        required_nbytes=required,
+        num_tokens=num_tokens,
+        num_experts=num_experts,
+        top_k=top_k,
+        device=device,
+        logits_dtype=logits_dtype,
+    )
     return _TPRouteWorkspace(
         router_logits=torch.empty(num_tokens, num_experts, device=device, dtype=logits_dtype),
         topk_logits=torch.empty(num_tokens, top_k, device=device, dtype=torch.float32),
         topk_ids=torch.empty(num_tokens, top_k, device=device, dtype=torch.int32),
         topk_weights=torch.empty(num_tokens, top_k, device=device, dtype=torch.float32),
+    )
+
+
+def _route_workspace_specs(
+    *,
+    num_tokens: int,
+    num_experts: int,
+    top_k: int,
+    logits_dtype: torch.dtype,
+) -> tuple[_TensorAllocSpec, ...]:
+    return (
+        _TensorAllocSpec("router_logits", (num_tokens, num_experts), logits_dtype),
+        _TensorAllocSpec("topk_logits", (num_tokens, top_k), torch.float32),
+        _TensorAllocSpec("topk_ids", (num_tokens, top_k), torch.int32),
+        _TensorAllocSpec("topk_weights", (num_tokens, top_k), torch.float32),
+    )
+
+
+def _route_workspace_nbytes(
+    *,
+    num_tokens: int,
+    num_experts: int,
+    top_k: int,
+    logits_dtype: torch.dtype,
+) -> int:
+    offset = 0
+    for spec in _route_workspace_specs(
+        num_tokens=num_tokens,
+        num_experts=num_experts,
+        top_k=top_k,
+        logits_dtype=logits_dtype,
+    ):
+        offset = align_up(offset, max(16, _dtype_nbytes(spec.dtype)))
+        offset += _tensor_numel(spec.shape) * _dtype_nbytes(spec.dtype)
+    return int(offset)
+
+
+def _emit_route_workspace_stats(
+    *,
+    storage: str,
+    required_nbytes: int,
+    capacity_nbytes: int | None = None,
+    num_tokens: int,
+    num_experts: int,
+    top_k: int,
+    device: torch.device,
+    logits_dtype: torch.dtype,
+) -> None:
+    return
+
+
+def _materialize_route_workspace(
+    shared_arena: torch.Tensor,
+    *,
+    offset_bytes: int,
+    capacity_nbytes: int,
+    num_tokens: int,
+    num_experts: int,
+    top_k: int,
+    logits_dtype: torch.dtype,
+) -> _TPRouteWorkspace:
+    required = _route_workspace_nbytes(
+        num_tokens=num_tokens,
+        num_experts=num_experts,
+        top_k=top_k,
+        logits_dtype=logits_dtype,
+    )
+    if capacity_nbytes < required:
+        raise ValueError(
+            f"MoE route workspace requires {required} bytes, but only {capacity_nbytes} are available"
+        )
+    _emit_route_workspace_stats(
+        storage="shared",
+        required_nbytes=required,
+        capacity_nbytes=capacity_nbytes,
+        num_tokens=num_tokens,
+        num_experts=num_experts,
+        top_k=top_k,
+        device=shared_arena.device,
+        logits_dtype=logits_dtype,
+    )
+    offset = int(offset_bytes)
+    tensors: Dict[str, torch.Tensor] = {}
+    for spec in _route_workspace_specs(
+        num_tokens=num_tokens,
+        num_experts=num_experts,
+        top_k=top_k,
+        logits_dtype=logits_dtype,
+    ):
+        tensors[spec.name], offset = _allocate_arena_tensor(shared_arena, offset, spec)
+    return _TPRouteWorkspace(
+        router_logits=tensors["router_logits"],
+        topk_logits=tensors["topk_logits"],
+        topk_ids=tensors["topk_ids"],
+        topk_weights=tensors["topk_weights"],
+    )
+
+
+def _slice_route_workspace(route_workspace: _TPRouteWorkspace, num_tokens: int) -> _TPRouteWorkspace:
+    if route_workspace.router_logits.shape[0] == num_tokens:
+        return route_workspace
+    return _TPRouteWorkspace(
+        router_logits=route_workspace.router_logits[:num_tokens],
+        topk_logits=route_workspace.topk_logits[:num_tokens],
+        topk_ids=route_workspace.topk_ids[:num_tokens],
+        topk_weights=route_workspace.topk_weights[:num_tokens],
     )
 
 
@@ -2757,24 +3091,45 @@ def _get_route_workspace(
 
     if isinstance(workspace, TPMoEWorkspacePool):
         key = (
-            int(torch.cuda.current_stream(device=device).stream_id),
             device.index,
-            m,
             num_experts,
             top_k,
             logits_dtype,
         )
         route_workspace = workspace.route_workspaces.get(key)
-        if route_workspace is None:
-            route_workspace = _alloc_route_workspace(
-                num_tokens=m,
-                num_experts=num_experts,
-                top_k=top_k,
-                device=device,
-                logits_dtype=logits_dtype,
-            )
+        needs_growth = (
+            route_workspace is None
+            or route_workspace.router_logits.shape[0] < m
+            or route_workspace.router_logits.shape[1] != num_experts
+            or route_workspace.topk_ids.shape[1] != top_k
+            or route_workspace.router_logits.dtype != logits_dtype
+            or route_workspace.router_logits.device != device
+        )
+        if needs_growth:
+            if workspace.shared_arena is None:
+                route_workspace = _alloc_route_workspace(
+                    num_tokens=m,
+                    num_experts=num_experts,
+                    top_k=top_k,
+                    device=device,
+                    logits_dtype=logits_dtype,
+                )
+            else:
+                if workspace.shared_arena.device != device:
+                    raise ValueError(
+                        f"MoE pool arena device {workspace.shared_arena.device} does not match hidden_states device {device}"
+                    )
+                route_workspace = _materialize_route_workspace(
+                    workspace.shared_arena,
+                    offset_bytes=0,
+                    capacity_nbytes=workspace.route_workspace_nbytes,
+                    num_tokens=m,
+                    num_experts=num_experts,
+                    top_k=top_k,
+                    logits_dtype=logits_dtype,
+                )
             workspace.route_workspaces[key] = route_workspace
-        return route_workspace
+        return _slice_route_workspace(route_workspace, m)
 
     route_workspace = workspace.route_workspace
     if (

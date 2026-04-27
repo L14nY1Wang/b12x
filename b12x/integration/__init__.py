@@ -5,6 +5,16 @@ from .attention import (
     infer_paged_attention_mode,
     paged_attention_forward,
 )
+from .arena import (
+    B12XExecutionLane,
+    B12XExecutionLaneArena,
+    B12XJointArenaSpec,
+    B12XMoEArenaCaps,
+    ensure_b12x_execution_lane_arena,
+    get_b12x_execution_lane,
+    get_b12x_moe_workspace_pool,
+    set_b12x_execution_lane_arena,
+)
 from .mla import (
     B12XAttentionArena,
     B12XAttentionArenaCaps,
@@ -29,9 +39,13 @@ from .nsa_indexer import (
 from .tp_moe import (
     B12XFP4ExpertWeights,
     B12XTopKRouting,
+    TPMoEArenaLayout,
+    TPMoEWorkspacePool,
+    allocate_tp_moe_workspace_pool,
     b12x_moe_fp4,
     b12x_route_experts_fast,
     b12x_sparse_moe_fp4,
+    plan_tp_moe_arena_layout,
 )
 
 __all__ = [
@@ -40,6 +54,14 @@ __all__ = [
     "create_paged_plan",
     "infer_paged_attention_mode",
     "paged_attention_forward",
+    "B12XExecutionLane",
+    "B12XExecutionLaneArena",
+    "B12XJointArenaSpec",
+    "B12XMoEArenaCaps",
+    "ensure_b12x_execution_lane_arena",
+    "get_b12x_execution_lane",
+    "get_b12x_moe_workspace_pool",
+    "set_b12x_execution_lane_arena",
     "B12XAttentionArena",
     "B12XAttentionArenaCaps",
     "B12XAttentionWorkspace",
@@ -59,7 +81,11 @@ __all__ = [
     "unpack_nsa_index_k_cache_reference",
     "B12XFP4ExpertWeights",
     "B12XTopKRouting",
+    "TPMoEArenaLayout",
+    "TPMoEWorkspacePool",
+    "allocate_tp_moe_workspace_pool",
     "b12x_moe_fp4",
     "b12x_route_experts_fast",
     "b12x_sparse_moe_fp4",
+    "plan_tp_moe_arena_layout",
 ]
