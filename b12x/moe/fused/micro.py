@@ -922,12 +922,10 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
             quant_expert_id = expert_id
             if cutlass.const_expr(self.share_input_across_experts):
                 if cutlass.const_expr(self.single_token):
-                    # bs=1 single_token share_input: every CTA redundantly
-                    # quantizes its own copy of the input into slot [0, 0]
-                    # using CTA-0's scale. Non-gated kernels can skip the
-                    # cross-CTA grid barrier below; gated kernels keep it for
-                    # correctness.
-                    should_quantize = Int32(1) if pair_idx == Int32(bidz) else Int32(0)
+                    # Match FI main: pair 0 writes the shared packed input slot,
+                    # and the resident-grid barrier below makes it visible to
+                    # CTAs that did not participate in Phase 1 routing work.
+                    should_quantize = Int32(1) if pair_idx == Int32(0) else Int32(0)
                     if cutlass.const_expr(not self.is_gated):
                         quant_expert_id = topk_ids[Int32(0)].to(Int32)
                     else:
@@ -989,23 +987,9 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                 cute.arch.sync_threads()
             pair_idx += Int32(gdim_z)
 
-        # For the non-gated bs=1 share_input_across_experts path above, every
-        # CTA wrote its own bit-identical copy to packed_a_storage[0, 0], so no
-        # cross-CTA ordering is needed. Gated kernels still use the resident
-        # barrier; their two-pass FC1 path is sensitive to the weaker ordering.
-        if cutlass.const_expr(
-            self.share_input_across_experts
-            and self.single_token
-            and not self.is_gated
-        ):
-            cute.arch.sync_threads()
-            _threadfence()
-            cute.arch.fence_proxy("async.global")
-            cute.arch.sync_threads()
-        else:
-            self._resident_grid_barrier(
-                barrier_count, barrier_epoch, Int32(gdim_z), is_cta_leader,
-            )
+        self._resident_grid_barrier(
+            barrier_count, barrier_epoch, Int32(gdim_z), is_cta_leader,
+        )
 
         gA = cute.local_tile(mA, self.sa_tile_shape_mk, (None, None, None))
         # FC1 weights tile over N. Gated activation packs [up, gate] along N;
@@ -1180,7 +1164,9 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                     weight_expert_idx = weight_expert_ids[local_expert_idx]
                     valid_rows = row_counts[local_expert_idx]
                 input_local_expert_idx = (
-                    Int32(0) if cutlass.const_expr(self.share_input_across_experts) else local_expert_idx
+                    Int32(0)
+                    if cutlass.const_expr(self.share_input_across_experts)
+                    else local_expert_idx
                 )
                 alpha_value = alpha[weight_expert_idx].to(cutlass.Float32)
                 tile_m_base = tile_coord[0] * Int32(self.tile_shape_mnk[0])
@@ -1801,7 +1787,9 @@ class MoEMicroKernelBackend(_MoEMicroKernelBase):
                 else:
                     weight_expert_idx = weight_expert_ids[local_expert_idx]
                 input_local_expert_idx = (
-                    Int32(0) if cutlass.const_expr(self.share_input_across_experts) else local_expert_idx
+                    Int32(0)
+                    if cutlass.const_expr(self.share_input_across_experts)
+                    else local_expert_idx
                 )
 
                 sa_tile_coord_m = tc[0] // self.sa_tiles_per_block

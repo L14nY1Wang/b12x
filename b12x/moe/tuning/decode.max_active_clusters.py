@@ -16,7 +16,6 @@ register_max_active_clusters_policy(
         (10, 84),
         (16, 63),
         (20, 84),
-        (24, 56),
     ),
 )
 

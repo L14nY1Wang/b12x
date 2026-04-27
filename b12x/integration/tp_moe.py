@@ -2280,11 +2280,11 @@ def _is_exact_relu2_bs1_nemotron_case(
         and a2_gscale.numel() == 1
     ):
         return False
-    num_tokens = a.shape[0]
-    # Specialized decode path supports bs=1 and bs=2 (the common chatbot
-    # single-request / speculative-verify regime). Larger batches go through
-    # the generic static/dynamic path.
-    return num_tokens in (1, 2) and topk_ids.shape[0] == num_tokens
+    if os.environ.get("B12X_MICRO_SHARE_INPUT_ACROSS_EXPERTS", "1") == "0":
+        return False
+    # This exact launcher compiles the micro-kernel's single-token shared-input
+    # path. Multi-token batches must use the generic static/dynamic path.
+    return a.shape[0] == 1 and topk_ids.shape[0] == 1
 
 
 def _get_exact_relu2_bs1_nemotron_launcher(
@@ -2618,10 +2618,7 @@ def _launch_compact_static(
             fast_math=fast_math,
             share_input_across_experts=share_input_across_experts,
             share_expert_scales=share_expert_scales,
-            single_token=(
-                m == 1
-                and (activation == "relu2" or share_input_across_experts)
-            ),
+            single_token=m == 1,
             mac_override=micro_mac,
             activation=activation,
         )
@@ -2890,12 +2887,16 @@ def b12x_moe_fp4(
             fast_math=fast_math,
             stream=stream,
             share_input_across_experts=(
-                activation in ("relu2", "silu")
+                activation == "relu2"
                 and m == 1
                 and a1_gscale.numel() == 1
                 and os.environ.get("B12X_MICRO_SHARE_INPUT_ACROSS_EXPERTS", "1") != "0"
             ),
-            share_expert_scales=(a1_gscale.numel() == 1 and a2_gscale.numel() == 1),
+            share_expert_scales=(
+                activation == "relu2"
+                and a1_gscale.numel() == 1
+                and a2_gscale.numel() == 1
+            ),
             activation=activation,
         )
     return scatter_output
