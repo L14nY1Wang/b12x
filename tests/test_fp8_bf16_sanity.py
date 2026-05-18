@@ -25,9 +25,6 @@ class TinyFp8Bf16DequantKernel:
     num_threads = 32
     dtype = cutlass.BFloat16
 
-    def _make_smem_layout(self):
-        return cute.make_layout((self.tile_m, self.tile_n))
-
     @cute.jit
     def __call__(
         self,
@@ -48,8 +45,7 @@ class TinyFp8Bf16DequantKernel:
             raise ValueError("out must have shape (16, 16)")
         if const_expr(mDescale.shape != (1,)):
             raise ValueError("descale must have shape (1,)")
-        s_layout = self._make_smem_layout()
-        self.kernel(mB, mDescale, mOut, s_layout).launch(
+        self.kernel(mB, mDescale, mOut).launch(
             grid=(1, 1, 1),
             block=[self.num_threads, 1, 1],
             stream=stream,
@@ -61,11 +57,11 @@ class TinyFp8Bf16DequantKernel:
         mB: cute.Tensor,
         mDescale: cute.Tensor,
         mOut: cute.Tensor,
-        s_layout: cutlass.Constexpr,
     ):
         tidx = cute.arch.thread_idx()[0]
         lane = cute.arch.lane_idx()
         smem = cutlass_utils.SmemAllocator()
+        s_layout = cute.make_layout((self.tile_m, self.tile_n))
         sB = smem.allocate_tensor(element_type=self.dtype, layout=s_layout, byte_alignment=128)
         mBu8 = cute.recast_tensor(mB, cutlass.Uint8)
         descale_bf2 = broadcast_f32_to_bfloat2(mDescale[0])

@@ -52,12 +52,12 @@ def test_paged_extend_fp8_traits_expand_kv_tile_without_duplicate_bf16_cache() -
     )
     traits = select_paged_forward_traits_from_plan(plan)
 
-    assert traits.cta_tile_q == 32
+    assert traits.cta_tile_q == 64
     assert traits.num_warps_q == 4
     assert traits.num_warps_kv == 1
     assert traits.num_mma_q == 1
-    assert traits.num_mma_kv == 4
-    assert traits.cta_tile_kv == 64
+    assert traits.num_mma_kv == 2
+    assert traits.cta_tile_kv == 32
     assert traits.shared_storage_bytes == 49152
 
 
@@ -82,3 +82,37 @@ def test_paged_fp8_traits_use_more_kv_mmas_than_bf16_traits() -> None:
     assert fp8_traits.num_mma_kv == 4
     assert bf16_traits.num_mma_kv == 1
     assert fp8_traits.cta_tile_kv > bf16_traits.cta_tile_kv
+
+
+def test_paged_bf16_decode_traits_cover_padded_sync_storage_for_128_vo() -> None:
+    traits = select_paged_forward_traits(
+        cta_tile_q=16,
+        head_dim_qk=128,
+        head_dim_vo=128,
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        device="cuda",
+    )
+
+    padded_sync_bytes = (
+        traits.num_warps_kv
+        * traits.cta_tile_q
+        * (traits.head_dim_vo + 24)
+        * 4
+        + traits.num_warps_kv * traits.cta_tile_q * 8
+    )
+    assert traits.shared_storage_bytes >= padded_sync_bytes
+
+
+def test_paged_fp8_decode_traits_keep_minimax_head128_tile_within_page() -> None:
+    traits = select_paged_forward_traits(
+        cta_tile_q=16,
+        head_dim_qk=128,
+        head_dim_vo=128,
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.float8_e4m3fn,
+        device="cuda",
+    )
+
+    assert traits.num_mma_kv == 1
+    assert traits.cta_tile_kv == 64

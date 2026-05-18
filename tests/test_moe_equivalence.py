@@ -83,9 +83,9 @@ def test_moe_nonzero(m):
     x, topk_ids, topk_weights = make_routed_inputs(spec, m, seed=99, device=device)
     workspace = allocate_tp_moe_workspace(
         x,
-        weights.w13_input_scale_per_expert,
+        weights.w13_input_scale_quant_per_expert,
         weights.w13_weight,
-        weights.w2_input_scale_per_expert,
+        weights.w2_input_scale_quant_per_expert,
         weights.w2_weight,
         topk_ids,
         input_scales_static=True,
@@ -93,11 +93,11 @@ def test_moe_nonzero(m):
 
     out = b12x_moe_fp4(
         x,
-        weights.w13_input_scale_per_expert,
+        weights.w13_input_scale_quant_per_expert,
         weights.w13_weight,
         weights.w13_blockscale_swizzled,
         weights.g1_alphas_per_expert,
-        weights.w2_input_scale_per_expert,
+        weights.w2_input_scale_quant_per_expert,
         weights.w2_weight,
         weights.w2_blockscale_swizzled,
         weights.g2_alphas_per_expert,
@@ -137,9 +137,9 @@ def test_moe_cuda_graph_replay_tracks_routing_updates(m):
     graph_output = torch.empty_like(x_buf)
     workspace = allocate_tp_moe_workspace(
         x_buf,
-        weights.w13_input_scale_per_expert,
+        weights.w13_input_scale_quant_per_expert,
         weights.w13_weight,
-        weights.w2_input_scale_per_expert,
+        weights.w2_input_scale_quant_per_expert,
         weights.w2_weight,
         topk_ids_buf,
         input_scales_static=True,
@@ -148,11 +148,11 @@ def test_moe_cuda_graph_replay_tracks_routing_updates(m):
     # Compile once before capture; the replay check below is about routing safety.
     b12x_moe_fp4(
         x_buf,
-        weights.w13_input_scale_per_expert,
+        weights.w13_input_scale_quant_per_expert,
         weights.w13_weight,
         weights.w13_blockscale_swizzled,
         weights.g1_alphas_per_expert,
-        weights.w2_input_scale_per_expert,
+        weights.w2_input_scale_quant_per_expert,
         weights.w2_weight,
         weights.w2_blockscale_swizzled,
         weights.g2_alphas_per_expert,
@@ -168,11 +168,11 @@ def test_moe_cuda_graph_replay_tracks_routing_updates(m):
     with torch.cuda.graph(graph):
         b12x_moe_fp4(
             x_buf,
-            weights.w13_input_scale_per_expert,
+            weights.w13_input_scale_quant_per_expert,
             weights.w13_weight,
             weights.w13_blockscale_swizzled,
             weights.g1_alphas_per_expert,
-            weights.w2_input_scale_per_expert,
+            weights.w2_input_scale_quant_per_expert,
             weights.w2_weight,
             weights.w2_blockscale_swizzled,
             weights.g2_alphas_per_expert,
@@ -195,11 +195,11 @@ def test_moe_cuda_graph_replay_tracks_routing_updates(m):
 
         eager_out = b12x_moe_fp4(
             x,
-            weights.w13_input_scale_per_expert,
+            weights.w13_input_scale_quant_per_expert,
             weights.w13_weight,
             weights.w13_blockscale_swizzled,
             weights.g1_alphas_per_expert,
-            weights.w2_input_scale_per_expert,
+            weights.w2_input_scale_quant_per_expert,
             weights.w2_weight,
             weights.w2_blockscale_swizzled,
             weights.g2_alphas_per_expert,

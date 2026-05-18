@@ -60,11 +60,11 @@ def _load_qwen_case() -> tuple[ModelSpec, object, torch.Tensor]:
 
 def _pack_experts(weights) -> B12XFP4ExpertWeights:
     return B12XFP4ExpertWeights(
-        a1_gscale=weights.w13_input_scale_per_expert,
+        a1_gscale=weights.w13_input_scale_quant_per_expert,
         w1_fp4=weights.w13_weight,
         w1_blockscale=weights.w13_blockscale_swizzled,
         w1_alphas=weights.g1_alphas_per_expert,
-        a2_gscale=weights.w2_input_scale_per_expert,
+        a2_gscale=weights.w2_input_scale_quant_per_expert,
         w2_fp4=weights.w2_weight,
         w2_blockscale=weights.w2_blockscale_swizzled,
         w2_alphas=weights.g2_alphas_per_expert,
@@ -98,9 +98,9 @@ def test_route_experts_fast_matches_manual_qwen_gate_path(m: int) -> None:
     router_logits, topk_ids, topk_weights = _manual_route(hidden_states, gate_weight, spec.top_k)
     workspace = allocate_tp_moe_workspace(
         hidden_states,
-        weights.w13_input_scale_per_expert,
+        weights.w13_input_scale_quant_per_expert,
         weights.w13_weight,
-        weights.w2_input_scale_per_expert,
+        weights.w2_input_scale_quant_per_expert,
         weights.w2_weight,
         topk_ids,
         input_scales_static=True,
@@ -137,9 +137,9 @@ def test_route_experts_fast_reuses_exact_workspace_buffers() -> None:
     _, topk_ids, _ = _manual_route(hidden_states, gate_weight, spec.top_k)
     workspace = allocate_tp_moe_workspace(
         hidden_states,
-        weights.w13_input_scale_per_expert,
+        weights.w13_input_scale_quant_per_expert,
         weights.w13_weight,
-        weights.w2_input_scale_per_expert,
+        weights.w2_input_scale_quant_per_expert,
         weights.w2_weight,
         topk_ids,
         input_scales_static=True,
@@ -180,20 +180,20 @@ def test_sparse_moe_fp4_matches_manual_qwen_gate_path(m: int) -> None:
     router_logits, topk_ids, topk_weights = _manual_route(hidden_states, gate_weight, spec.top_k)
     workspace = allocate_tp_moe_workspace(
         hidden_states,
-        weights.w13_input_scale_per_expert,
+        weights.w13_input_scale_quant_per_expert,
         weights.w13_weight,
-        weights.w2_input_scale_per_expert,
+        weights.w2_input_scale_quant_per_expert,
         weights.w2_weight,
         topk_ids,
         input_scales_static=True,
     )
     manual_output = b12x_moe_fp4(
         hidden_states,
-        weights.w13_input_scale_per_expert,
+        weights.w13_input_scale_quant_per_expert,
         weights.w13_weight,
         weights.w13_blockscale_swizzled,
         weights.g1_alphas_per_expert,
-        weights.w2_input_scale_per_expert,
+        weights.w2_input_scale_quant_per_expert,
         weights.w2_weight,
         weights.w2_blockscale_swizzled,
         weights.g2_alphas_per_expert,
@@ -236,20 +236,20 @@ def test_sparse_moe_fp4_matches_manual_qwen_router_logits(m: int) -> None:
     router_logits, topk_ids, topk_weights = _manual_route(hidden_states, gate_weight, spec.top_k)
     workspace = allocate_tp_moe_workspace(
         hidden_states,
-        weights.w13_input_scale_per_expert,
+        weights.w13_input_scale_quant_per_expert,
         weights.w13_weight,
-        weights.w2_input_scale_per_expert,
+        weights.w2_input_scale_quant_per_expert,
         weights.w2_weight,
         topk_ids,
         input_scales_static=True,
     )
     manual_output = b12x_moe_fp4(
         hidden_states,
-        weights.w13_input_scale_per_expert,
+        weights.w13_input_scale_quant_per_expert,
         weights.w13_weight,
         weights.w13_blockscale_swizzled,
         weights.g1_alphas_per_expert,
-        weights.w2_input_scale_per_expert,
+        weights.w2_input_scale_quant_per_expert,
         weights.w2_weight,
         weights.w2_blockscale_swizzled,
         weights.g2_alphas_per_expert,

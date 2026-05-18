@@ -5,6 +5,7 @@ import importlib.metadata
 import inspect
 import os
 import sys
+from contextlib import suppress
 from functools import lru_cache
 from functools import wraps
 from pathlib import Path
@@ -57,7 +58,9 @@ def _tree_state(root: Path) -> tuple[tuple[str, int, int], ...]:
 
 
 @lru_cache(maxsize=8)
-def _tree_fingerprint_cached(root_str: str, state: tuple[tuple[str, int, int], ...]) -> str:
+def _tree_fingerprint_cached(
+    root_str: str, state: tuple[tuple[str, int, int], ...]
+) -> str:
     root = Path(root_str)
     digest = hashlib.sha256()
     for rel_path, _mtime_ns, _size in state:
@@ -113,6 +116,15 @@ def _runtime_toolchain_key() -> tuple[object, ...]:
         ("torch", torch_version),
         ("torch_cuda", torch_cuda_version),
         ("cutlass_dsl", cutlass_version),
+        (
+            "cutlass_dsl_libs_base",
+            _distribution_version("nvidia-cutlass-dsl-libs-base"),
+        ),
+        (
+            "cutlass_dsl_libs_cu13",
+            _distribution_version("nvidia-cutlass-dsl-libs-cu13"),
+        ),
+        ("cuda_python", _distribution_version("cuda-python")),
         ("cuda_bindings", _distribution_version("cuda-bindings")),
     )
 
@@ -135,7 +147,9 @@ def _compile_environment_key() -> tuple[tuple[str, str], ...]:
 def _function_fingerprint(func: Any) -> tuple[str, str, str]:
     func = inspect.unwrap(func)
     module = getattr(func, "__module__", "")
-    qualname = getattr(func, "__qualname__", getattr(func, "__name__", type(func).__qualname__))
+    qualname = getattr(
+        func, "__qualname__", getattr(func, "__name__", type(func).__qualname__)
+    )
     if module == "b12x" or module.startswith("b12x."):
         return module, qualname, f"b12x:{_b12x_package_fingerprint()}"
     try:
@@ -169,7 +183,7 @@ def _normalize_compile_target(func: Any, visited: set[int]) -> Any:
         )
     if inspect.isfunction(func):
         return ("function", _function_fingerprint(func))
-    if hasattr(func, "__call__") and hasattr(func.__call__, "__func__"):
+    if callable(func) and hasattr(func.__call__, "__func__"):
         state = vars(func) if hasattr(func, "__dict__") else None
         return (
             "callable_instance",
@@ -252,7 +266,11 @@ def _tensor_like_cache_key(value: Any, visited: set[int]) -> Any | None:
     assumed_align = _first_present_attr(value, "_assumed_align")
     use_32bit_stride = _first_present_attr(value, "_use_32bit_stride")
     shape_key = tuple(_structural_dim_key(dim, visited) for dim in shape)
-    stride_key = None if stride is None else tuple(_structural_dim_key(dim, visited) for dim in stride)
+    stride_key = (
+        None
+        if stride is None
+        else tuple(_structural_dim_key(dim, visited) for dim in stride)
+    )
     stride_order_key = (
         None
         if stride_order is None
@@ -293,7 +311,8 @@ def _structural_cache_key(value: Any, visited: set[int] | None = None) -> Any:
             "namespace",
             tuple(
                 sorted(
-                    (k, _structural_cache_key(v, visited)) for k, v in vars(value).items()
+                    (k, _structural_cache_key(v, visited))
+                    for k, v in vars(value).items()
                 )
             ),
         )
@@ -333,8 +352,13 @@ def _structural_cache_key(value: Any, visited: set[int] | None = None) -> Any:
         )
     if type_module == "cutlass.cute.runtime" and type_name == "_FakeCompactTensor":
         dtype = getattr(value, "_dtype", None)
-        shape = tuple(_structural_dim_key(dim, visited) for dim in getattr(value, "_shape", ()))
-        stride_order = tuple(_structural_dim_key(dim, visited) for dim in getattr(value, "_stride_order", ()))
+        shape = tuple(
+            _structural_dim_key(dim, visited) for dim in getattr(value, "_shape", ())
+        )
+        stride_order = tuple(
+            _structural_dim_key(dim, visited)
+            for dim in getattr(value, "_stride_order", ())
+        )
         memspace = getattr(value, "_memspace", None)
         assumed_align = getattr(value, "_assumed_align", None)
         use_32bit_stride = getattr(value, "_use_32bit_stride", None)
@@ -454,81 +478,6 @@ def _store_cute_compile_to_disk(cache_key: str, compiled: Any) -> None:
     os.replace(tmp_path, object_path)
 
 
-def _patch_cutlass_sm120_blockscaled_arch_check() -> None:
-    try:
-        from cutlass.cute.nvgpu.warp import mma as mma_mod
-    except Exception:
-        return
-
-    blockscaled_op = getattr(mma_mod, "MmaSM120BlockScaledOp", None)
-    if blockscaled_op is None:
-        return
-    if getattr(blockscaled_op, "_b12x_sm121a_patch", False):
-        return
-
-    original_post_init = blockscaled_op.__post_init__
-    Arch = mma_mod.Arch
-    dsl_base = getattr(mma_mod, "CuTeDSL", None)
-    if dsl_base is None:
-        dsl_base = getattr(mma_mod, "BaseDSL", None)
-    if dsl_base is None:
-        return
-    OpError = mma_mod.OpError
-    Float4E2M1FN = mma_mod.Float4E2M1FN
-    Float32 = mma_mod.Float32
-    Float8E4M3FN = mma_mod.Float8E4M3FN
-    Float8E8M0FNU = mma_mod.Float8E8M0FNU
-
-    @wraps(original_post_init)
-    def patched_post_init(self) -> None:
-        arch = dsl_base._get_dsl().get_arch_enum()
-        allowed_archs = {Arch.sm_120a}
-        sm_121a = getattr(Arch, "sm_121a", None)
-        if sm_121a is not None:
-            allowed_archs.add(sm_121a)
-        if arch not in allowed_archs:
-            raise OpError(
-                self,
-                f"expects arch to be one of {self.admissible_archs}, but got {arch}",
-                suggestion="Ensure env CUTE_DSL_ARCH matches your GPU architecture",
-            )
-        if self.ab_dtype != Float4E2M1FN:
-            raise OpError(
-                self,
-                "expects the 'ab_dtype' Op parameter to be Float4E2M1FN",
-            )
-        if self.acc_dtype != Float32:
-            raise OpError(
-                self,
-                "expects the 'acc_dtype' Op parameter to be Float32",
-            )
-        if self.shape_mnk != (16, 8, 64):
-            raise OpError(
-                self,
-                "expects the 'shape_mnk' Op parameter to be (16,8,64)",
-            )
-        if self.sf_vec_size == 16:
-            if self.sf_type != Float8E4M3FN:
-                raise OpError(
-                    self,
-                    "expects the 'sf_type' Op parameter to be Float8E4M3FN",
-                )
-        elif self.sf_vec_size == 32:
-            if self.sf_type != Float8E8M0FNU:
-                raise OpError(
-                    self,
-                    "expects the 'sf_type' Op parameter to be Float8E8M0FNU",
-                )
-        else:
-            raise OpError(
-                self,
-                "expects the 'sf_vec_size' Op parameter to be 16 or 32",
-            )
-
-    blockscaled_op.__post_init__ = patched_post_init
-    blockscaled_op._b12x_sm121a_patch = True
-
-
 def apply_cutlass_runtime_patches() -> None:
     global _PATCHED
     if _PATCHED:
@@ -567,14 +516,11 @@ def apply_cutlass_runtime_patches() -> None:
             return compiled
 
         compiled = original_compile(self, func, *args, **kwargs)
-        try:
+        with suppress(Exception):
             _store_cute_compile_to_disk(cache_key, compiled)
-        except Exception:
-            pass
         return compiled
 
     BaseDSL.print_warning = patched_print_warning
     BaseDSL.print_warning_once = patched_print_warning_once
     CompileCallable._compile = patched_compile
-    _patch_cutlass_sm120_blockscaled_arch_check()
     _PATCHED = True

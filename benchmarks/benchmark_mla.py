@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import os
 import pathlib
 import statistics
 import sys
@@ -15,7 +16,11 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import torch
 
-from b12x.attention.mla.split import select_sparse_mla_split_decode_config
+from b12x.attention.mla.split import (
+    run_sparse_mla_split_decode_forward,
+    run_sparse_mla_split_decode_merge,
+    select_sparse_mla_split_decode_config,
+)
 from b12x.attention.nsa_indexer.reference import (
     sparse_nsa_extend_logits_reference,
     sparse_nsa_paged_logits_reference,
@@ -30,14 +35,26 @@ from b12x.integration.mla import (
     sparse_mla_decode_forward,
     sparse_mla_extend_forward,
 )
+from b12x.attention.nsa_indexer.extend_kernel import (
+    _PREFILL512_BLOCK_K,
+    _PREFILL512_BLOCK_Q,
+    _PREFILL_BLOCK_Q,
+)
+from b12x.attention.nsa_indexer.tiled_topk import run_tiled_supertile_topk
+from b12x.attention.nsa_indexer.persistent_topk import (
+    run_persistent_topk2048,
+    supports_persistent_topk2048,
+)
 from b12x.integration.nsa_indexer import (
     NSAIndexerExtendLogitsMetadata,
     NSAIndexerPagedDecodeMetadata,
     clear_nsa_indexer_caches,
     get_paged_mqa_logits_metadata,
     pack_nsa_index_k_cache_reference,
+    resolve_sparse_nsa_extend_prefill_block_k,
     sparse_nsa_index_decode_logits_paged,
     sparse_nsa_index_extend_logits,
+    sparse_nsa_index_extend_tiled_topk,
     uses_paged_mqa_schedule_metadata,
 )
 
@@ -65,17 +82,25 @@ except Exception:  # pragma: no cover - optional dependency
 
 MODEL_PATH = pathlib.Path("/data/models/GLM-5.1-NVFP4")
 DEFAULT_BATCH_SIZES = (1, 2, 4, 8)
-DEFAULT_CACHE_LENS = (1024, 32768, 131072)
-DEFAULT_PREFILL_Q_LENS = (16384,)
+DEFAULT_CACHE_LENS = (1024, 32768, 65536, 131072)
+DEFAULT_PREFILL_Q_LENS = (2048, 16384)
 DEFAULT_DECODE_ROW_PATTERN = "uniform"
 DEFAULT_TP_SIZE = 8
 DEFAULT_TP_RANK = 0
 DEFAULT_POOL_FACTOR = 6
 DEFAULT_GRAPH_WIDTH = 8192
+TARGET_PREFILL64K_BS1_PRESET = "target-prefill64k-bs1"
 MLA_MAX_ABS_TOL = 0.10
 MLA_RMSE_TOL = 0.005
 MLA_COS_TOL = 0.9995
 _RAGGED_TOPK_CHUNK = 4096
+_MLA_STRATEGY_ENV = "B12X_MLA_PREFILL_STRATEGY"
+_MLA_FORCE_SINGLE_PASS_ENV = "B12X_MLA_FORCE_SINGLE_PASS"
+_MLA_FORCE_SPLIT_ENV = "B12X_MLA_FORCE_SPLIT"
+_NSA_PREFILL_BLOCK_K_ENV = "B12X_NSA_EXTEND_PREFILL_BLOCK_K"
+_NSA_DECODE_TOPK_BACKEND_ENV = "B12X_NSA_DECODE_TOPK_BACKEND"
+_MLA_SINGLE_PASS_TARGET_Q_ROWS = 2048
+_MLA_SINGLE_PASS_TARGET_TOPK = 2048
 
 
 def _align_up(value: int, multiple: int) -> int:
@@ -167,10 +192,18 @@ class CaseReport:
     metadata_us: float = 0.0
     replay_us: float = 0.0
     indexer_us: float = 0.0
+    indexer_logits_us: float = 0.0
+    indexer_topk_us: float = 0.0
     mla_us: float = 0.0
+    mla_forward_us: float = 0.0
+    mla_merge_us: float = 0.0
     split_enabled: bool = False
     chunk_size: int = 0
     num_chunks: int = 0
+    indexer_logits_fill: bool = True
+    indexer_tiled_topk: bool = False
+    indexer_topk_path: str = ""
+    indexer_prefill_block_k: int | None = None
     mla_sanity: SanityMetrics = field(
         default_factory=lambda: SanityMetrics(max_abs=0.0, rmse=0.0, cos=1.0)
     )
@@ -221,6 +254,80 @@ def _load_glm_contract_config(*, tp_size: int, tp_rank: int) -> GLMDecodeContrac
 
 def _parse_csv_ints(value: str) -> list[int]:
     return [int(part) for part in value.split(",") if part]
+
+
+def _format_csv_ints(values: tuple[int, ...]) -> str:
+    return ",".join(str(value) for value in values)
+
+
+def _apply_benchmark_preset(args: argparse.Namespace) -> argparse.Namespace:
+    if args.preset == "none":
+        return args
+    if args.preset != TARGET_PREFILL64K_BS1_PRESET:
+        raise ValueError(f"unknown preset {args.preset!r}")
+
+    args.modes = "prefill"
+    args.batch_sizes = "1"
+    args.cache_lens = "65536"
+    args.verify_q_lens = "2048"
+    args.topk_cap = 2048
+    args.graph_width = 65536
+    return args
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _resolve_mla_prefill_strategy() -> str:
+    if _env_flag(_MLA_FORCE_SINGLE_PASS_ENV):
+        return "single"
+    if _env_flag(_MLA_FORCE_SPLIT_ENV):
+        return "split"
+    value = os.environ.get(_MLA_STRATEGY_ENV, "auto").strip().lower()
+    if value in ("auto", ""):
+        return "auto"
+    if value in ("single", "single-pass", "nonsplit", "onepass"):
+        return "single"
+    if value == "split":
+        return "split"
+    raise ValueError(
+        f"{_MLA_STRATEGY_ENV} must be auto, split, or single-pass/nonsplit; got {value!r}"
+    )
+
+
+def _apply_benchmark_mla_split_strategy(
+    *,
+    split_cfg,
+    workspace_mode: str,
+    cache_seqlens: torch.Tensor,
+    device: torch.device,
+    max_batch: int,
+    q_rows: int,
+    topk_width: int,
+):
+    if split_cfg is None:
+        return None
+    strategy = _resolve_mla_prefill_strategy()
+    if strategy == "single":
+        return None
+    if strategy == "split":
+        return split_cfg
+    if (
+        workspace_mode in ("extend", "verify", "draft_extend")
+        and max_batch == 1
+        and q_rows >= _MLA_SINGLE_PASS_TARGET_Q_ROWS
+        and topk_width >= _MLA_SINGLE_PASS_TARGET_TOPK
+    ):
+        return None
+    if (
+        workspace_mode in ("extend", "verify", "draft_extend")
+        and not (device.type == "cuda" and torch.cuda.is_current_stream_capturing())
+    ):
+        max_cache_seqlens = int(cache_seqlens.max())
+        if max_cache_seqlens <= 4096:
+            return None
+    return split_cfg
 
 
 def _resolve_topk(*, cache_len: int, topk_cap: int) -> int:
@@ -364,9 +471,32 @@ def _select_paged_topk_from_logits(
     topk: int,
     cu_seqlens_q: torch.Tensor | None = None,
     query_row_to_batch: torch.Tensor | None = None,
+    backend: str = "auto",
 ) -> torch.Tensor:
+    backend = backend.replace("_", "-")
+    if backend not in {"auto", "sgl", "torch", "cute-persistent"}:
+        raise ValueError(f"unsupported decode topk backend {backend!r}")
+
     if (
-        _sgl_fast_topk_transform_fused is not None
+        backend == "cute-persistent"
+        and query_row_to_batch is None
+        and supports_persistent_topk2048(
+            logits,
+            seqlens.reshape(-1),
+            topk=topk,
+            page_table_1=page_table_1,
+        )
+    ):
+        return run_persistent_topk2048(
+            logits,
+            seqlens.reshape(-1),
+            page_table_1=page_table_1,
+            max_seq_len=logits.shape[1],
+        )
+
+    if (
+        backend in {"auto", "sgl"}
+        and _sgl_fast_topk_transform_fused is not None
         and logits.is_cuda
         and topk == 2048
         and cu_seqlens_q is not None
@@ -380,7 +510,11 @@ def _select_paged_topk_from_logits(
                 topk=topk,
             )
         except Exception:
-            pass
+            if backend == "sgl":
+                raise
+
+    if backend == "sgl":
+        raise RuntimeError("SGL fused topk backend is unavailable for this decode topk call")
 
     rows = logits.shape[0]
     output = torch.full((rows, topk), -1, dtype=torch.int32, device=logits.device)
@@ -733,6 +867,8 @@ def _run_decode_case(
     pool_factor: int,
     graph_width: int,
     l2_flush,
+    skip_indexer_logits_fill: bool,
+    decode_topk_backend: str,
 ) -> CaseReport:
     if pool_factor <= 0:
         raise ValueError(f"pool_factor must be positive, got {pool_factor}")
@@ -799,6 +935,13 @@ def _run_decode_case(
     )
     graph_cache_seqlens = torch.empty_like(full_cache_seqlens)
     graph_nsa_cache_seqlens = torch.empty_like(nsa_cache_seqlens)
+    graph_active_width_override = None
+    if case.batch_size == 1 and case.q_len == 1 and case.cache_len == aligned_graph_width:
+        graph_active_width_override = torch.tensor(
+            [aligned_graph_width],
+            dtype=torch.int32,
+            device=device,
+        )
     use_graph_schedule_metadata = uses_paged_mqa_schedule_metadata(
         q_rows=case.batch_size,
         max_pages=graph_real_page_table.shape[1],
@@ -830,6 +973,12 @@ def _run_decode_case(
         cache_seqlens_int32=graph_cache_seqlens,
         paged_mqa_schedule_metadata=graph_schedule_metadata,
     )
+    preinitialize_indexer_logits = not (
+        skip_indexer_logits_fill
+        and case.batch_size == 1
+        and case.q_len == 1
+        and case.cache_len == aligned_graph_width
+    )
 
     def run_indexer():
         logits = sparse_nsa_index_decode_logits_paged(
@@ -838,16 +987,31 @@ def _run_decode_case(
             index_k_cache=index_k_cache,
             metadata=indexer_metadata,
             page_size=cfg.page_size,
+            preinitialize_invalid_logits=preinitialize_indexer_logits,
+            active_width_override=graph_active_width_override,
         )
         return _select_paged_topk_from_logits(
             logits=logits,
             page_table_1=graph_candidate_page_table,
             seqlens=graph_cache_seqlens,
             topk=case.topk,
+            backend=decode_topk_backend,
+        )
+
+    def run_indexer_logits():
+        return sparse_nsa_index_decode_logits_paged(
+            q_fp8=q_fp8,
+            weights=weights,
+            index_k_cache=index_k_cache,
+            metadata=indexer_metadata,
+            page_size=cfg.page_size,
+            preinitialize_invalid_logits=preinitialize_indexer_logits,
+            active_width_override=graph_active_width_override,
         )
 
     clear_nsa_indexer_caches()
     actual_topk = run_indexer()
+    logits_for_topk = run_indexer_logits()
     expected_logits = sparse_nsa_paged_logits_reference(
         q_fp8=q_fp8,
         weights=weights,
@@ -862,6 +1026,7 @@ def _run_decode_case(
         page_table_1=graph_candidate_page_table,
         seqlens=graph_cache_seqlens,
         topk=case.topk,
+        backend="torch",
     )
     torch.cuda.synchronize()
     _assert_decode_contract_match(
@@ -908,29 +1073,32 @@ def _run_decode_case(
         )
 
     def run_step():
-            topk_indices = _select_paged_topk_from_logits(
-                logits=sparse_nsa_index_decode_logits_paged(
-                    q_fp8=q_fp8,
-                    weights=weights,
-                    index_k_cache=index_k_cache,
-                    metadata=indexer_metadata,
-                    page_size=cfg.page_size,
-                ),
-                page_table_1=graph_candidate_page_table,
-                seqlens=graph_cache_seqlens,
-                topk=case.topk,
-            )
-            return sparse_mla_decode_forward(
-                q_all=q_all,
+        topk_indices = _select_paged_topk_from_logits(
+            logits=sparse_nsa_index_decode_logits_paged(
+                q_fp8=q_fp8,
+                weights=weights,
+                index_k_cache=index_k_cache,
+                metadata=indexer_metadata,
+                page_size=cfg.page_size,
+                preinitialize_invalid_logits=preinitialize_indexer_logits,
+                active_width_override=graph_active_width_override,
+            ),
+            page_table_1=graph_candidate_page_table,
+            seqlens=graph_cache_seqlens,
+            topk=case.topk,
+            backend=decode_topk_backend,
+        )
+        return sparse_mla_decode_forward(
+            q_all=q_all,
             kv_cache=kv_cache,
-                metadata=MLASparseDecodeMetadata(
-                    page_table_1=topk_indices,
-                    cache_seqlens_int32=graph_cache_seqlens,
-                    nsa_cache_seqlens_int32=graph_nsa_cache_seqlens,
-                    max_seq_len_k=aligned_graph_width,
-                ),
-                workspace=mla_workspace,
-                sm_scale=cfg.sm_scale,
+            metadata=MLASparseDecodeMetadata(
+                page_table_1=topk_indices,
+                cache_seqlens_int32=graph_cache_seqlens,
+                nsa_cache_seqlens_int32=graph_nsa_cache_seqlens,
+                max_seq_len_k=aligned_graph_width,
+            ),
+            workspace=mla_workspace,
+            sm_scale=cfg.sm_scale,
             v_head_dim=cfg.kv_lora_rank,
         )
 
@@ -974,6 +1142,34 @@ def _run_decode_case(
     )
     indexer_us = statistics.median(indexer_stats["replay_us"])
 
+    clear_nsa_indexer_caches()
+    indexer_logits_stats = _capture_and_bench_cuda_graph(
+        run_indexer_logits,
+        warmup=warmup,
+        replays=replays,
+        prepare=prepare_decode_graph,
+        l2_flush=l2_flush,
+    )
+    indexer_logits_us = statistics.median(indexer_logits_stats["replay_us"])
+
+    def run_indexer_topk():
+        return _select_paged_topk_from_logits(
+            logits=logits_for_topk,
+            page_table_1=graph_candidate_page_table,
+            seqlens=graph_cache_seqlens,
+            topk=case.topk,
+            backend=decode_topk_backend,
+        )
+
+    indexer_topk_stats = _capture_and_bench_cuda_graph(
+        run_indexer_topk,
+        warmup=warmup,
+        replays=replays,
+        prepare=prepare_decode_graph,
+        l2_flush=l2_flush,
+    )
+    indexer_topk_us = statistics.median(indexer_topk_stats["replay_us"])
+
     clear_mla_caches()
     prepare_decode_graph()
     mla_stats = _capture_and_bench_cuda_graph(
@@ -993,17 +1189,20 @@ def _run_decode_case(
         prepare=prepare_decode_graph,
         l2_flush=l2_flush,
     )
-
     return CaseReport(
         case=case,
         graph_width=graph_width,
         metadata_us=statistics.median(step_stats["metadata_us"]),
         replay_us=statistics.median(step_stats["replay_us"]),
         indexer_us=indexer_us,
+        indexer_logits_us=indexer_logits_us,
+        indexer_topk_us=indexer_topk_us,
         mla_us=mla_us,
         split_enabled=split_cfg is not None,
         chunk_size=0 if split_cfg is None else split_cfg.chunk_size,
         num_chunks=0 if split_cfg is None else split_cfg.num_chunks,
+        indexer_logits_fill=preinitialize_indexer_logits,
+        indexer_topk_path=decode_topk_backend.replace("_", "-"),
         mla_sanity=mla_sanity,
     )
 
@@ -1019,6 +1218,8 @@ def _run_prefill_or_verify_case(
     pool_factor: int,
     graph_width: int,
     l2_flush,
+    skip_indexer_logits_fill: bool,
+    use_tiled_topk: bool,
 ) -> CaseReport:
     if pool_factor <= 0:
         raise ValueError(f"pool_factor must be positive, got {pool_factor}")
@@ -1172,14 +1373,17 @@ def _run_prefill_or_verify_case(
             paged_mqa_schedule_metadata=graph_schedule_metadata,
         )
 
-        def run_indexer():
-            logits = sparse_nsa_index_decode_logits_paged(
+        def run_indexer_logits():
+            return sparse_nsa_index_decode_logits_paged(
                 q_fp8=q_fp8,
                 weights=weights,
                 index_k_cache=index_k_cache,
                 metadata=indexer_metadata,
                 page_size=cfg.page_size,
             )
+
+        def run_indexer():
+            logits = run_indexer_logits()
             return _select_paged_topk_from_logits(
                 logits=logits,
                 page_table_1=base_candidate_page_table,
@@ -1191,6 +1395,7 @@ def _run_prefill_or_verify_case(
 
         clear_nsa_indexer_caches()
         actual_topk = run_indexer()
+        logits_for_topk = run_indexer_logits()
         expected_logits = sparse_nsa_paged_logits_reference(
             q_fp8=q_fp8,
             weights=weights,
@@ -1230,16 +1435,78 @@ def _run_prefill_or_verify_case(
             k_start=graph_extend_k_start,
             k_end=graph_extend_k_start + graph_extend_lengths,
         )
+        preinitialize_indexer_logits = not skip_indexer_logits_fill
 
-        def run_indexer():
-            logits = sparse_nsa_index_extend_logits(
+        _prefill_block_k = resolve_sparse_nsa_extend_prefill_block_k(
+            valid_q_rows=case.total_q,
+            k_rows=int(extend_kv_fp8[0].shape[0]),
+            num_heads=cfg.index_n_heads,
+        )
+        _use_tiled_output = use_tiled_topk
+        if _use_tiled_output and _prefill_block_k is None:
+            raise BenchmarkFailure(case, "tiled topk requires the prefill indexer path")
+        _block_q = _PREFILL512_BLOCK_Q if _prefill_block_k == _PREFILL512_BLOCK_K else _PREFILL_BLOCK_Q
+
+        _tiled_tile_logits = [None]  # mutable holder for the tiled output
+        if _use_tiled_output:
+            num_q_tiles = (case.total_q + _block_q - 1) // _block_q
+            num_k_tiles = (int(extend_kv_fp8[0].shape[0]) + _prefill_block_k - 1) // _prefill_block_k
+            tile_size = _block_q * _prefill_block_k
+            _tiled_tile_logits[0] = torch.empty(
+                (num_q_tiles * num_k_tiles * tile_size,),
+                dtype=torch.float32,
+                device=device,
+            )
+
+        def run_indexer_logits():
+            result = sparse_nsa_index_extend_logits(
                 q_fp8=q_fp8,
                 weights=weights,
                 kv_fp8=extend_kv_fp8,
                 metadata=extend_indexer_metadata,
+                preinitialize_invalid_logits=preinitialize_indexer_logits,
+                tile_logits=_tiled_tile_logits[0] if _use_tiled_output else None,
             )
+            if _use_tiled_output:
+                _tiled_tile_logits[0] = result
+            return result
+
+        def _run_tiled_topk(tile_logits_result=None):
+            tl = tile_logits_result if tile_logits_result is not None else _tiled_tile_logits[0]
+            topk_val = min(case.topk, case.cache_len)
+            _, topk_indices = run_tiled_supertile_topk(
+                tile_logits=tl,
+                k_start=graph_extend_k_start,
+                k_end=graph_extend_k_start + graph_extend_lengths,
+                topk=topk_val,
+                block_q=_block_q,
+                block_k=_prefill_block_k,
+            )
+            return topk_indices
+
+        def run_indexer_topk():
+            if _use_tiled_output:
+                return _run_tiled_topk(logits_for_topk)
+            else:
+                return _select_ragged_topk_from_logits(
+                    logits=logits_for_topk,
+                    k_start=graph_extend_k_start,
+                    lengths=graph_extend_lengths,
+                    topk=case.topk,
+                )
+
+        def run_indexer():
+            if _use_tiled_output:
+                return sparse_nsa_index_extend_tiled_topk(
+                    q_fp8=q_fp8,
+                    weights=weights,
+                    kv_fp8=extend_kv_fp8,
+                    metadata=extend_indexer_metadata,
+                    topk=case.topk,
+                )
+            result = run_indexer_logits()
             return _select_ragged_topk_from_logits(
-                logits=logits,
+                logits=result,
                 k_start=graph_extend_k_start,
                 lengths=graph_extend_lengths,
                 topk=case.topk,
@@ -1247,6 +1514,20 @@ def _run_prefill_or_verify_case(
 
         clear_nsa_indexer_caches()
         actual_topk = run_indexer()
+        logits_for_topk = run_indexer_logits()
+        if skip_indexer_logits_fill and not _use_tiled_output:
+            # In tiled mode, there's no -inf scatter matrix to validate
+            torch.cuda.synchronize()
+            sample_rows = sorted({0, logits_for_topk.shape[0] // 2, logits_for_topk.shape[0] - 1})
+            for sample_row in sample_rows:
+                row_start = int(graph_extend_k_start[sample_row].item())
+                row_end = int((graph_extend_k_start[sample_row] + graph_extend_lengths[sample_row]).item())
+                if row_start > 0 and not torch.isneginf(logits_for_topk[sample_row, :row_start]).all():
+                    raise BenchmarkFailure(case, f"no-fill logits prefix was not -inf for row {sample_row}")
+                if row_end < logits_for_topk.shape[1] and not torch.isneginf(
+                    logits_for_topk[sample_row, row_end:]
+                ).all():
+                    raise BenchmarkFailure(case, f"no-fill logits suffix was not -inf for row {sample_row}")
         if not use_runtime_ragged_topk:
             expected_logits = sparse_nsa_extend_logits_reference(
                 q_fp8=q_fp8,
@@ -1303,6 +1584,15 @@ def _run_prefill_or_verify_case(
         page_table_1=mla_selected_indices,
         output_dtype=q_all.dtype,
         v_head_dim=cfg.kv_lora_rank,
+    )
+    split_cfg = _apply_benchmark_mla_split_strategy(
+        split_cfg=split_cfg,
+        workspace_mode=mla_workspace_mode,
+        cache_seqlens=graph_batch_cache_seqlens,
+        device=device,
+        max_batch=case.batch_size,
+        q_rows=case.total_q,
+        topk_width=int(mla_selected_indices.shape[1]),
     )
 
     def run_mla():
@@ -1375,6 +1665,47 @@ def _run_prefill_or_verify_case(
     )
     indexer_us = statistics.median(indexer_stats["replay_us"])
 
+    clear_nsa_indexer_caches()
+    indexer_logits_stats = _capture_and_bench_cuda_graph(
+        run_indexer_logits,
+        warmup=warmup,
+        replays=replays,
+        prepare=prepare_verify_graph,
+        l2_flush=l2_flush,
+    )
+    indexer_logits_us = statistics.median(indexer_logits_stats["replay_us"])
+
+    if case.mode == "verify":
+        def run_indexer_topk():
+            return _select_paged_topk_from_logits(
+                logits=logits_for_topk,
+                page_table_1=base_candidate_page_table,
+                seqlens=graph_expanded_cache_seqlens,
+                topk=case.topk,
+                cu_seqlens_q=cu_seqlens_q,
+                query_row_to_batch=query_row_to_batch,
+            )
+    elif _use_tiled_output:
+        def run_indexer_topk():
+            return _run_tiled_topk()
+    else:
+        def run_indexer_topk():
+            return _select_ragged_topk_from_logits(
+                logits=logits_for_topk,
+                k_start=graph_extend_k_start,
+                lengths=graph_extend_lengths,
+                topk=case.topk,
+            )
+
+    indexer_topk_stats = _capture_and_bench_cuda_graph(
+        run_indexer_topk,
+        warmup=warmup,
+        replays=replays,
+        prepare=prepare_verify_graph,
+        l2_flush=l2_flush,
+    )
+    indexer_topk_us = statistics.median(indexer_topk_stats["replay_us"])
+
     clear_mla_caches()
     prepare_verify_graph()
     mla_stats = _capture_and_bench_cuda_graph(
@@ -1384,6 +1715,84 @@ def _run_prefill_or_verify_case(
         l2_flush=l2_flush,
     )
     mla_us = statistics.median(mla_stats["replay_us"])
+    mla_forward_us = 0.0
+    mla_merge_us = 0.0
+    if split_cfg is not None:
+        sm_scale_tensor = torch.empty((1,), dtype=torch.float32, device=device)
+        sm_scale_tensor[0] = cfg.sm_scale
+        if mla_workspace.tmp_output is None or mla_workspace.tmp_lse is None:
+            raise RuntimeError("workspace is missing split MLA buffers")
+        if mla_workspace.kv_chunk_size_ptr is None or mla_workspace.num_chunks_ptr is None:
+            raise RuntimeError("workspace is missing split MLA chunk pointers")
+        launch_num_chunks = (
+            mla_workspace.max_chunks_per_row
+            if (mla_workspace.fixed_capacity or mla_workspace.use_cuda_graph)
+            else split_cfg.num_chunks
+        )
+        split_output = torch.empty(
+            (q_all.shape[0], q_all.shape[1], cfg.kv_lora_rank),
+            dtype=q_all.dtype,
+            device=q_all.device,
+        )
+
+        def prepare_mla_components() -> None:
+            prepare_verify_graph()
+            mla_workspace.prepare_extend(
+                mla_selected_indices,
+                graph_batch_cache_seqlens,
+                graph_nsa_cache_seqlens,
+            )
+            mla_workspace.set_split_chunk_config(
+                kv_chunk_size=split_cfg.chunk_size,
+                num_chunks=split_cfg.num_chunks,
+            )
+
+        prepare_mla_components()
+
+        def run_mla_forward_component():
+            run_sparse_mla_split_decode_forward(
+                q_all=q_all,
+                kv_cache=mla_kv_cache,
+                page_table_1=mla_selected_indices,
+                active_token_counts=graph_nsa_cache_seqlens,
+                sm_scale=sm_scale_tensor,
+                kv_chunk_size_ptr=mla_workspace.kv_chunk_size_ptr,
+                num_chunks_ptr=mla_workspace.num_chunks_ptr,
+                tmp_output=mla_workspace.tmp_output,
+                tmp_lse=mla_workspace.tmp_lse,
+                launch_num_chunks=launch_num_chunks,
+                workspace=mla_workspace,
+            )
+
+        def run_mla_merge_component():
+            run_sparse_mla_split_decode_merge(
+                tmp_output=mla_workspace.tmp_output,
+                tmp_lse=mla_workspace.tmp_lse,
+                num_chunks_ptr=mla_workspace.num_chunks_ptr,
+                output=split_output,
+                workspace=mla_workspace,
+            )
+
+        run_mla_forward_component()
+        torch.cuda.synchronize()
+        mla_forward_stats = _capture_and_bench_cuda_graph(
+            run_mla_forward_component,
+            warmup=warmup,
+            replays=replays,
+            prepare=prepare_mla_components,
+            l2_flush=l2_flush,
+        )
+        mla_forward_us = statistics.median(mla_forward_stats["replay_us"])
+        run_mla_forward_component()
+        torch.cuda.synchronize()
+        mla_merge_stats = _capture_and_bench_cuda_graph(
+            run_mla_merge_component,
+            warmup=warmup,
+            replays=replays,
+            prepare=prepare_mla_components,
+            l2_flush=l2_flush,
+        )
+        mla_merge_us = statistics.median(mla_merge_stats["replay_us"])
 
     clear_nsa_indexer_caches()
     clear_mla_caches()
@@ -1394,6 +1803,13 @@ def _run_prefill_or_verify_case(
         prepare=prepare_verify_graph,
         l2_flush=l2_flush,
     )
+    indexer_prefill_block_k = None
+    if case.mode == "prefill":
+        indexer_prefill_block_k = resolve_sparse_nsa_extend_prefill_block_k(
+            valid_q_rows=case.total_q,
+            k_rows=int(extend_kv_fp8[0].shape[0]),
+            num_heads=cfg.index_n_heads,
+        )
 
     return CaseReport(
         case=case,
@@ -1401,10 +1817,18 @@ def _run_prefill_or_verify_case(
         metadata_us=statistics.median(step_stats["metadata_us"]),
         replay_us=statistics.median(step_stats["replay_us"]),
         indexer_us=indexer_us,
+        indexer_logits_us=indexer_logits_us,
+        indexer_topk_us=indexer_topk_us,
         mla_us=mla_us,
+        mla_forward_us=mla_forward_us,
+        mla_merge_us=mla_merge_us,
         split_enabled=split_cfg is not None,
         chunk_size=0 if split_cfg is None else split_cfg.chunk_size,
         num_chunks=0 if split_cfg is None else split_cfg.num_chunks,
+        indexer_logits_fill=True if case.mode == "verify" else not skip_indexer_logits_fill,
+        indexer_tiled_topk=_use_tiled_output if case.mode == "prefill" else False,
+        indexer_topk_path="tiled" if _use_tiled_output and case.mode == "prefill" else "scatter",
+        indexer_prefill_block_k=indexer_prefill_block_k,
         mla_sanity=mla_sanity,
     )
 
@@ -1414,6 +1838,8 @@ def collect_case_reports(
     *,
     device: torch.device | None = None,
 ) -> list[CaseReport]:
+    if getattr(args, "nsa_prefill_block_k", None) is not None:
+        os.environ[_NSA_PREFILL_BLOCK_K_ENV] = args.nsa_prefill_block_k
     cfg = _load_glm_contract_config(tp_size=args.tp_size, tp_rank=args.tp_rank)
     device = require_sm120() if device is None else device
     l2_flush = make_l2_flush_fn(args.flush_l2, args.l2_flush_bytes)
@@ -1440,6 +1866,8 @@ def collect_case_reports(
                 pool_factor=args.pool_factor,
                 graph_width=args.graph_width,
                 l2_flush=l2_flush,
+                skip_indexer_logits_fill=args.skip_indexer_logits_fill,
+                decode_topk_backend=args.decode_topk_backend,
             )
             if case.mode == "decode"
             else _run_prefill_or_verify_case(
@@ -1452,6 +1880,8 @@ def collect_case_reports(
                 pool_factor=args.pool_factor,
                 graph_width=args.graph_width,
                 l2_flush=l2_flush,
+                skip_indexer_logits_fill=args.skip_indexer_logits_fill,
+                use_tiled_topk=args.use_tiled_topk,
             )
         )
         case_seed += 17
@@ -1460,6 +1890,12 @@ def collect_case_reports(
 
 def _render_case_line(report: CaseReport) -> str:
     split_flag = "on" if report.split_enabled else "off"
+    fill_flag = "fill" if report.indexer_logits_fill else "skipfill"
+    topk_path = report.indexer_topk_path or ("tiled" if report.indexer_tiled_topk else "scatter")
+    if report.indexer_prefill_block_k is not None:
+        idx_bk = str(report.indexer_prefill_block_k)
+    else:
+        idx_bk = "decode" if report.case.mode == "prefill" else "paged"
     row_ctx_desc = ""
     if report.case.mode == "decode" and report.case.is_heterogeneous_decode:
         row_ctx_desc = (
@@ -1475,7 +1911,14 @@ def _render_case_line(report: CaseReport) -> str:
         f"meta={report.metadata_us:8.2f} us | "
         f"replay={report.replay_us:8.2f} us | "
         f"indexer={report.indexer_us:8.2f} us | "
-        f"mla={report.mla_us:8.2f} us"
+        f"idx_logits={report.indexer_logits_us:8.2f} us | "
+        f"idx_topk={report.indexer_topk_us:8.2f} us | "
+        f"mla={report.mla_us:8.2f} us | "
+        f"mla_fwd={report.mla_forward_us:8.2f} us | "
+        f"mla_merge={report.mla_merge_us:8.2f} us | "
+        f"idx_bk={idx_bk} "
+        f"idx_init={fill_flag} "
+        f"idx_topk_path={topk_path}"
     )
 
 
@@ -1484,7 +1927,11 @@ def _render_summary_lines(reports: list[CaseReport]) -> list[str]:
     metadata_geo = _geomean([report.metadata_us for report in reports])
     replay_geo = _geomean([report.replay_us for report in reports])
     indexer_geo = _geomean([report.indexer_us for report in reports])
+    indexer_logits_geo = _geomean([report.indexer_logits_us for report in reports])
+    indexer_topk_geo = _geomean([report.indexer_topk_us for report in reports])
     mla_geo = _geomean([report.mla_us for report in reports])
+    mla_forward_geo = _geomean([report.mla_forward_us for report in reports])
+    mla_merge_geo = _geomean([report.mla_merge_us for report in reports])
     return [
         "Summary",
         f"  cases: {len(reports)}",
@@ -1494,11 +1941,25 @@ def _render_summary_lines(reports: list[CaseReport]) -> list[str]:
         f"  step geo:    {total_geo:.2f} us",
         f"  meta geo:    {metadata_geo:.2f} us",
         f"  replay geo:  {replay_geo:.2f} us",
+        f"  idx logits:  {indexer_logits_geo:.2f} us",
+        f"  idx topk:    {indexer_topk_geo:.2f} us",
+        f"  mla fwd:     {mla_forward_geo:.2f} us",
+        f"  mla merge:   {mla_merge_geo:.2f} us",
     ]
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--preset",
+        choices=("none", TARGET_PREFILL64K_BS1_PRESET),
+        default="none",
+        help=(
+            "shape preset; target-prefill64k-bs1 maps to "
+            "--modes prefill --batch-sizes 1 --cache-lens 65536 "
+            "--verify-q-lens 2048 --topk-cap 2048 --graph-width 65536"
+        ),
+    )
     parser.add_argument(
         "--modes",
         default="decode,prefill",
@@ -1506,13 +1967,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--batch-sizes",
-        default="1,2,4,8",
+        default=_format_csv_ints(DEFAULT_BATCH_SIZES),
         help=f"decode batch sizes, default {','.join(str(v) for v in DEFAULT_BATCH_SIZES)}",
     )
     parser.add_argument(
         "--cache-lens",
         default="1024,32768,131072",
-        help=f"decode cache lengths, default {','.join(str(v) for v in DEFAULT_CACHE_LENS)}",
+        help="decode cache lengths, default 1024,32768,131072",
     )
     parser.add_argument(
         "--decode-row-pattern",
@@ -1527,9 +1988,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--prefill-q-lens",
         dest="verify_q_lens",
         default="16384",
-        help=f"prefill/verify chunk q lengths, default {','.join(str(v) for v in DEFAULT_PREFILL_Q_LENS)}",
+        help="prefill/verify chunk q lengths, default 16384",
     )
     parser.add_argument("--topk-cap", type=int, default=2048)
+    parser.add_argument(
+        "--decode-topk-backend",
+        choices=("auto", "sgl", "torch", "cute-persistent"),
+        default=os.getenv(_NSA_DECODE_TOPK_BACKEND_ENV, "auto").replace("_", "-"),
+        help=(
+            "decode topk selector backend; cute-persistent enables the experimental "
+            "large-N CuTe persistent TopK=2048 path"
+        ),
+    )
     parser.add_argument("--tp-size", type=int, default=DEFAULT_TP_SIZE)
     parser.add_argument("--tp-rank", type=int, default=DEFAULT_TP_RANK)
     parser.add_argument("--warmup", type=int, default=10)
@@ -1550,7 +2020,36 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=0,
         help="L2 eviction size in bytes; default is 2x detected L2 capacity.",
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--skip-indexer-logits-fill",
+        action="store_true",
+        default=True,
+        help=(
+            "skip the prefill NSA logits -inf initialization when the logits are consumed "
+            "only by ragged topk; the benchmark validates sampled invalid logits regions"
+        ),
+    )
+    parser.add_argument(
+        "--keep-indexer-logits-fill",
+        action="store_false",
+        dest="skip_indexer_logits_fill",
+        help="preserve the legacy prefill NSA logits -inf initialization.",
+    )
+    parser.add_argument(
+        "--use-tiled-topk",
+        action="store_true",
+        help="benchmark prefill with tiled indexer output consumed directly by the CuTe topk kernel.",
+    )
+    parser.add_argument(
+        "--nsa-prefill-block-k",
+        choices=("auto", "256", "512"),
+        default=None,
+        help=(
+            "override B12X_NSA_EXTEND_PREFILL_BLOCK_K for extend/prefill NSA logits; "
+            "default preserves the existing environment"
+        ),
+    )
+    return _apply_benchmark_preset(parser.parse_args(argv))
 
 
 def main(argv: list[str] | None = None) -> int:

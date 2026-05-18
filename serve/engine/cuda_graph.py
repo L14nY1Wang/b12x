@@ -23,7 +23,7 @@ from serve.engine.runner import _shared_attn_workspace_key
 from serve.engine.step_state import StepState
 from serve.model.attention import B12xPagedAttention
 from serve.model.ops import rms_norm
-from serve.model.workspaces import get_b12x_moe_workspace_pool
+from serve.model.workspaces import get_b12x_execution_lane
 
 
 def _graph_debug_enabled() -> bool:
@@ -78,7 +78,8 @@ class CapturedGraph:
         # Per-graph workspaces.
         self._attn_workspaces = []
         shared_attn_workspaces: dict[tuple[object, ...], dict[str, object]] = {}
-        self._moe_workspace = get_b12x_moe_workspace_pool(device)
+        self._execution_lane = get_b12x_execution_lane(device)
+        self._moe_workspace = self._execution_lane.moe_workspace_pool
 
         # Per-layer output buffers for b12x kernels.
         layer_types = getattr(cfg, 'layer_types', None)

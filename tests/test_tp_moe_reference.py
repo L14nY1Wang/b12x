@@ -102,10 +102,10 @@ def _moe_reference_f32(
         blocked = vals_f32.reshape(n_blocks, block_size)
         block_max = blocked.abs().amax(dim=-1)
 
-        raw_scale = (block_max / (6.0 * global_scale)).clamp(max=fp8_e4m3_max)
+        raw_scale = (block_max * global_scale / 6.0).clamp(max=fp8_e4m3_max)
         sf_e4m3 = raw_scale.to(torch.float8_e4m3fn).to(torch.float32)
 
-        sf_times_gs = sf_e4m3.unsqueeze(-1).expand(n_blocks, block_size).reshape(cols) * global_scale
+        sf_times_gs = sf_e4m3.unsqueeze(-1).expand(n_blocks, block_size).reshape(cols) / global_scale
         scaled = vals_f32 / sf_times_gs.clamp(min=1e-30)
         quant = fp4_quantize_values_torch(scaled)
         sf_only = sf_e4m3.unsqueeze(-1).expand(n_blocks, block_size).reshape(cols)
@@ -197,10 +197,10 @@ def _moe_reference_nvfp4(
         blocked = vals_f32.reshape(n_blocks, block_size)
         block_max = blocked.abs().amax(dim=-1)
 
-        raw_scale = (block_max / (6.0 * global_scale)).clamp(max=fp8_e4m3_max)
+        raw_scale = (block_max * global_scale / 6.0).clamp(max=fp8_e4m3_max)
         sf_e4m3 = raw_scale.to(torch.float8_e4m3fn).to(torch.float32)
 
-        sf_times_gs = sf_e4m3.unsqueeze(-1).expand(n_blocks, block_size).reshape(cols) * global_scale
+        sf_times_gs = sf_e4m3.unsqueeze(-1).expand(n_blocks, block_size).reshape(cols) / global_scale
         scaled = vals_f32 / sf_times_gs.clamp(min=1e-30)
         quant = fp4_quantize_values_torch(scaled)
         sf_only = sf_e4m3.unsqueeze(-1).expand(n_blocks, block_size).reshape(cols)

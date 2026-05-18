@@ -16,12 +16,15 @@ import torch
 
 from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
 from b12x.attention.reference import paged_attention_reference
-from b12x.attention.paged.tuning import get_decode_graph_policy
 from b12x.integration.attention import (
     PagedAttentionWorkspace,
     clear_attention_caches,
 )
-from b12x.attention.paged.planner import create_paged_plan
+from b12x.attention.paged.planner import (
+    create_paged_plan,
+    decode_chunk_pages_for_graph,
+    resolve_decode_graph_ctas_per_sm,
+)
 
 
 def require_sm120() -> None:
@@ -57,49 +60,7 @@ def _bench_graph(
         graph.replay()
         ends[idx].record()
     torch.cuda.synchronize()
-    return [start.elapsed_time(end) for start, end in zip(starts, ends)]
-
-
-def _mean_ci(
-    times_ms: list[float],
-    *,
-    ci_level: float,
-) -> tuple[float, float, float]:
-    if not times_ms:
-        raise ValueError("mean CI inputs must be non-empty")
-    n = len(times_ms)
-    mean = statistics.fmean(times_ms)
-    if n == 1:
-        return mean, mean, 0.0
-    stdev = statistics.stdev(times_ms)
-    sem = stdev / (n**0.5)
-    alpha = (1.0 - ci_level) / 2.0
-    z = statistics.NormalDist().inv_cdf(1.0 - alpha)
-    half_width = z * sem
-    return mean - half_width, mean + half_width, sem
-
-
-def _ratio_mean_ci(
-    numerator_mean: float,
-    numerator_sem: float,
-    denominator_mean: float,
-    denominator_sem: float,
-    *,
-    ci_level: float,
-) -> tuple[float, float]:
-    if numerator_mean <= 0.0 or denominator_mean <= 0.0:
-        return float("nan"), float("nan")
-    alpha = (1.0 - ci_level) / 2.0
-    z = statistics.NormalDist().inv_cdf(1.0 - alpha)
-    ratio = numerator_mean / denominator_mean
-    relative_var = 0.0
-    if numerator_sem > 0.0:
-        relative_var += (numerator_sem / numerator_mean) ** 2
-    if denominator_sem > 0.0:
-        relative_var += (denominator_sem / denominator_mean) ** 2
-    ratio_sem = ratio * (relative_var**0.5)
-    half_width = z * ratio_sem
-    return ratio - half_width, ratio + half_width
+    return [start.elapsed_time(end) for start, end in zip(starts, ends, strict=True)]
 
 
 def _dtype_from_name(name: str) -> torch.dtype:
@@ -136,6 +97,67 @@ def _parse_csv_ints(value: str) -> list[int]:
     return [int(part) for part in value.split(",") if part]
 
 
+BENCHMARK_PROFILES: dict[str, dict[str, object]] = {
+    "qwen-gqa": {
+        "mode": "decode-graph-buckets",
+        "batch": 8,
+        "batch_buckets": "1,2,4,8,12,16",
+        "decode_contexts": "128,16384,32768,65536,131072",
+        "capture_context": 0,
+        "q_seqlens": "1",
+        "cache_seqlens": "64,512,2048,8192",
+        "page_size": 64,
+        "q_heads": 8,
+        "kv_heads": 1,
+        "head_dim": 256,
+        "dtype": "bf16",
+        "kv_dtype": "same",
+    },
+    "minimax-m2.7": {
+        "mode": "decode-graph-buckets",
+        "batch": 8,
+        "batch_buckets": "1,2,4,8,12,16",
+        "decode_contexts": "128,16384,32768,65536,131072",
+        "capture_context": 0,
+        "q_seqlens": "1",
+        "cache_seqlens": "64,512,2048,8192",
+        "page_size": 64,
+        "q_heads": 24,
+        "kv_heads": 4,
+        "head_dim": 128,
+        "dtype": "bf16",
+        "kv_dtype": "same",
+    },
+}
+BENCHMARK_PROFILE_ALIASES = {
+    "minimax-m2": "minimax-m2.7",
+    "mimimax-m2.7": "minimax-m2.7",
+}
+
+
+def _canonical_profile_name(name: str) -> str:
+    return BENCHMARK_PROFILE_ALIASES.get(name, name)
+
+
+def _profile_choices() -> list[str]:
+    return sorted((*BENCHMARK_PROFILES.keys(), *BENCHMARK_PROFILE_ALIASES.keys()))
+
+
+def _preparse_profile(argv: list[str]) -> str:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--profile", choices=_profile_choices(), default="qwen-gqa")
+    args, _ = parser.parse_known_args(argv)
+    return _canonical_profile_name(args.profile)
+
+
+def _gqa_group_size(*, q_heads: int, kv_heads: int) -> int:
+    if q_heads <= 0 or kv_heads <= 0:
+        raise ValueError("q_heads and kv_heads must be positive")
+    if q_heads % kv_heads != 0:
+        raise ValueError("q_heads must be divisible by kv_heads")
+    return q_heads // kv_heads
+
+
 def _import_flashinfer():
     try:
         import flashinfer
@@ -163,10 +185,6 @@ class ShapeCase:
 class CaseMetrics:
     backend: str
     mean_us: float
-    min_us: float
-    ci_low_us: float
-    ci_high_us: float
-    sem_us: float
 
 
 @dataclass(frozen=True)
@@ -464,6 +482,11 @@ def _build_decode_replay_cases(
     ]
 
 
+def _next_power_of_two(value: int) -> int:
+    value = max(int(value), 1)
+    return 1 << (value - 1).bit_length()
+
+
 @dataclass(frozen=True)
 class DecodeGraphBucketPolicy:
     batch: int
@@ -479,70 +502,84 @@ class DecodeGraphBucketPolicy:
         return _decode_effective_cache_tokens(context_tokens=self.capture_context_tokens)
 
 
-def _dtype_tuning_key(dtype: torch.dtype) -> str:
-    if dtype == torch.bfloat16:
-        return "bf16"
-    if dtype == torch.float16:
-        return "fp16"
-    if dtype == torch.float8_e4m3fn:
-        return "fp8_e4m3fn"
-    raise ValueError(f"unsupported tuning dtype {dtype}")
-
-
 def _resolve_decode_graph_bucket_policy(
     *,
     batch: int,
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype,
     page_size: int,
+    q_heads: int,
+    kv_heads: int,
+    head_dim: int,
     decode_contexts: list[int],
     capture_context_override: int,
     fixed_split_pages_override: int,
     graph_ctas_per_sm_override: int,
 ) -> DecodeGraphBucketPolicy:
-    tuned_policy = None
-    if q_dtype == torch.bfloat16 and page_size == 64:
-        try:
-            tuned_policy = get_decode_graph_policy(
-                kv_dtype=_dtype_tuning_key(kv_dtype),
-                regime="decode",
-                batch=batch,
-            )
-        except KeyError:
-            tuned_policy = None
-
     if capture_context_override > 0:
         capture_context_tokens = int(capture_context_override)
         source = "manual"
-    elif tuned_policy is not None and tuned_policy.capture_page_count is not None:
-        capture_context_tokens = int(tuned_policy.capture_page_count * page_size - 1)
-        source = "tuning"
     else:
-        capture_context_tokens = int(max(decode_contexts))
-        source = "fallback"
+        requested_capture_pages = (
+            int(_decode_effective_cache_tokens(context_tokens=max(decode_contexts))) + page_size - 1
+        ) // page_size
+        capture_context_tokens = int(_next_power_of_two(requested_capture_pages) * page_size - 1)
+        source = "heuristic"
 
     if capture_context_tokens < max(decode_contexts):
         raise ValueError("decode graph capture context must cover the largest replay context")
+    capture_page_count = (
+        int(_decode_effective_cache_tokens(context_tokens=capture_context_tokens)) + page_size - 1
+    ) // page_size
 
     if fixed_split_pages_override > 0:
         capture_fixed_split_pages = int(fixed_split_pages_override)
         replay_fixed_split_pages = int(fixed_split_pages_override)
         source = "manual"
     else:
-        capture_fixed_split_pages = None if tuned_policy is None else tuned_policy.capture_fixed_split_pages
+        graph_ctas_hint = resolve_decode_graph_ctas_per_sm(
+            kv_dtype=kv_dtype,
+            batch=batch,
+            page_size=page_size,
+            head_dim_qk=head_dim,
+            head_dim_vo=head_dim,
+            gqa_group_size=_gqa_group_size(q_heads=q_heads, kv_heads=kv_heads),
+            graph_ctas_per_sm=graph_ctas_per_sm_override if graph_ctas_per_sm_override > 0 else None,
+        )
+        max_chunks_per_req = None
+        if torch.cuda.is_available():
+            num_sms = int(torch.cuda.get_device_properties("cuda").multi_processor_count)
+            max_chunks_per_req = max((num_sms * graph_ctas_hint) // max(int(batch), 1), 1)
+        capture_fixed_split_pages = decode_chunk_pages_for_graph(
+            q_dtype=q_dtype,
+            kv_dtype=kv_dtype,
+            batch=batch,
+            page_size=page_size,
+            head_dim_qk=head_dim,
+            head_dim_vo=head_dim,
+            gqa_group_size=_gqa_group_size(q_heads=q_heads, kv_heads=kv_heads),
+            max_effective_kv_pages=capture_page_count,
+            max_chunks_per_req=max_chunks_per_req,
+        )
         replay_fixed_split_pages = None
 
     if graph_ctas_per_sm_override > 0:
         graph_ctas_per_sm = int(graph_ctas_per_sm_override)
         source = "manual"
     else:
-        graph_ctas_per_sm = None if tuned_policy is None else tuned_policy.graph_ctas_per_sm
+        graph_ctas_per_sm = resolve_decode_graph_ctas_per_sm(
+            kv_dtype=kv_dtype,
+            batch=batch,
+            page_size=page_size,
+            head_dim_qk=head_dim,
+            head_dim_vo=head_dim,
+            gqa_group_size=_gqa_group_size(q_heads=q_heads, kv_heads=kv_heads),
+        )
 
     return DecodeGraphBucketPolicy(
         batch=int(batch),
         capture_context_tokens=int(capture_context_tokens),
-        capture_page_count=(int(_decode_effective_cache_tokens(context_tokens=capture_context_tokens)) + page_size - 1)
-        // page_size,
+        capture_page_count=capture_page_count,
         capture_fixed_split_pages=capture_fixed_split_pages,
         replay_fixed_split_pages=replay_fixed_split_pages,
         graph_ctas_per_sm=graph_ctas_per_sm,
@@ -762,7 +799,6 @@ def _capture_backend_graph(
     k_descale: torch.Tensor | None,
     v_descale: torch.Tensor | None,
     warmup: int,
-    b12x_attn_mode: str,
     graph_ctas_per_sm: int | None,
 ) -> BackendCapture:
     output = torch.empty_like(q)
@@ -773,7 +809,6 @@ def _capture_backend_graph(
         k_cache=k_cache,
         v_cache=v_cache,
         use_cuda_graph=False,
-        attn_mode=b12x_attn_mode,
     )
     replay_plan = _build_backend_graph_plan(
         workspace=workspace,
@@ -972,7 +1007,6 @@ def _capture_b12x_decode_graph_bucket(
     capture_fixed_split_pages: int | None,
     replay_fixed_split_pages: int | None,
     warmup: int,
-    b12x_attn_mode: str,
     graph_ctas_per_sm: int | None,
 ) -> B12xDecodeGraphBucket:
     workspace = PagedAttentionWorkspace.for_tensors(
@@ -981,7 +1015,6 @@ def _capture_b12x_decode_graph_bucket(
         k_cache=shared.k_cache,
         v_cache=shared.v_cache,
         use_cuda_graph=False,
-        attn_mode=b12x_attn_mode,
     )
     capture_plan = _build_backend_graph_plan(
         workspace=workspace,
@@ -1154,7 +1187,6 @@ def _run_legacy_matrix(args: argparse.Namespace) -> None:
             "fixed_split_pages": args.fixed_split_pages,
             "capture_cache_seqlen": args.capture_cache_seqlen,
             "graph_ctas_per_sm": args.graph_ctas_per_sm,
-            "b12x_attn_mode": args.b12x_attn_mode,
             "replays": args.replays,
             "flashinfer_fa2": args.compare_fa2,
             "l2_flush": args.flush_l2,
@@ -1208,7 +1240,6 @@ def _run_legacy_matrix(args: argparse.Namespace) -> None:
             k_descale=k_descale,
             v_descale=v_descale,
             warmup=args.warmup,
-            b12x_attn_mode=args.b12x_attn_mode,
             graph_ctas_per_sm=args.graph_ctas_per_sm if args.graph_ctas_per_sm > 0 else None,
         )
         backend_times_ms = _bench_graph(
@@ -1216,17 +1247,9 @@ def _run_legacy_matrix(args: argparse.Namespace) -> None:
             replays=args.replays,
             l2_flush=l2_flush,
         )
-        backend_ci_low_ms, backend_ci_high_ms, backend_sem_ms = _mean_ci(
-            backend_times_ms,
-            ci_level=args.ci_level,
-        )
         backend_metrics = CaseMetrics(
             backend="b12x",
             mean_us=statistics.fmean(backend_times_ms) * 1000.0,
-            min_us=min(backend_times_ms) * 1000.0,
-            ci_low_us=backend_ci_low_ms * 1000.0,
-            ci_high_us=backend_ci_high_ms * 1000.0,
-            sem_us=backend_sem_ms * 1000.0,
         )
 
         flashinfer_metrics: CaseMetrics | None = None
@@ -1257,17 +1280,9 @@ def _run_legacy_matrix(args: argparse.Namespace) -> None:
                 replays=args.replays,
                 l2_flush=l2_flush,
             )
-            flashinfer_ci_low_ms, flashinfer_ci_high_ms, flashinfer_sem_ms = _mean_ci(
-                flashinfer_times_ms,
-                ci_level=args.ci_level,
-            )
             flashinfer_metrics = CaseMetrics(
                 backend="flashinfer-fa2",
                 mean_us=statistics.fmean(flashinfer_times_ms) * 1000.0,
-                min_us=min(flashinfer_times_ms) * 1000.0,
-                ci_low_us=flashinfer_ci_low_ms * 1000.0,
-                ci_high_us=flashinfer_ci_high_ms * 1000.0,
-                sem_us=flashinfer_sem_ms * 1000.0,
             )
             speedups.append(flashinfer_metrics.mean_us / backend_metrics.mean_us)
 
@@ -1283,26 +1298,14 @@ def _run_legacy_matrix(args: argparse.Namespace) -> None:
             f"q={case.q_seqlen:2d} "
             f"k={case.cache_seqlen:5d} "
             f"{backend_capture.plan_desc:>17s} "
-            f"| {backend_metrics.backend} mean={backend_metrics.mean_us:8.1f} us "
-            f"min={backend_metrics.min_us:8.1f} us "
-            f"{int(args.ci_level * 100)}%CI=[{backend_metrics.ci_low_us:8.1f},{backend_metrics.ci_high_us:8.1f}] us"
+            f"| {backend_metrics.backend} mean={backend_metrics.mean_us:8.1f} us"
         )
         if flashinfer_metrics is not None:
             ratio = flashinfer_metrics.mean_us / backend_metrics.mean_us
-            ratio_ci_low, ratio_ci_high = _ratio_mean_ci(
-                flashinfer_metrics.mean_us,
-                flashinfer_metrics.sem_us,
-                backend_metrics.mean_us,
-                backend_metrics.sem_us,
-                ci_level=args.ci_level,
-            )
             line += (
                 f" | fa2 mean={flashinfer_metrics.mean_us:8.1f} us "
-                f"min={flashinfer_metrics.min_us:8.1f} us "
-                f" {int(args.ci_level * 100)}%CI=[{flashinfer_metrics.ci_low_us:8.1f},{flashinfer_metrics.ci_high_us:8.1f}] us "
                 f"| fa2/{backend_metrics.backend}="
                 f"{ratio:6.3f}x"
-                f" {int(args.ci_level * 100)}%CI=[{ratio_ci_low:5.3f},{ratio_ci_high:5.3f}]"
             )
         print(line + check_suffix)
 
@@ -1327,6 +1330,7 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
     print(
         "decode graph buckets:",
         {
+            "profile": args.profile,
             "mode": args.mode,
             "batch_buckets": sorted(dict.fromkeys(batch_buckets)),
             "decode_context_tokens": sorted(dict.fromkeys(decode_contexts)),
@@ -1339,7 +1343,6 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
             "kv_dtype": str(kv_dtype),
             "fixed_split_pages": args.fixed_split_pages,
             "graph_ctas_per_sm": args.graph_ctas_per_sm,
-            "b12x_attn_mode": args.b12x_attn_mode,
             "replays": args.replays,
             "flashinfer_fa2": args.compare_fa2,
             "l2_flush": args.flush_l2,
@@ -1353,6 +1356,9 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
             q_dtype=dtype,
             kv_dtype=kv_dtype,
             page_size=args.page_size,
+            q_heads=args.q_heads,
+            kv_heads=args.kv_heads,
+            head_dim=args.head_dim,
             decode_contexts=decode_contexts,
             capture_context_override=int(args.capture_context),
             fixed_split_pages_override=int(args.fixed_split_pages),
@@ -1376,7 +1382,6 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
                 capture_fixed_split_pages=bucket_policy.capture_fixed_split_pages,
                 replay_fixed_split_pages=bucket_policy.replay_fixed_split_pages,
                 warmup=args.warmup,
-                b12x_attn_mode=args.b12x_attn_mode,
                 graph_ctas_per_sm=bucket_policy.graph_ctas_per_sm,
             )
         except Exception as exc:
@@ -1393,7 +1398,6 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
                 capture_fixed_split_pages=bucket_policy.capture_fixed_split_pages,
                 replay_fixed_split_pages=bucket_policy.replay_fixed_split_pages,
                 warmup=args.warmup,
-                b12x_attn_mode=args.b12x_attn_mode,
                 graph_ctas_per_sm=bucket_policy.graph_ctas_per_sm,
             )
         print(
@@ -1448,17 +1452,9 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
                 replays=args.replays,
                 l2_flush=l2_flush,
             )
-            backend_ci_low_ms, backend_ci_high_ms, backend_sem_ms = _mean_ci(
-                backend_times_ms,
-                ci_level=args.ci_level,
-            )
             backend_metrics = CaseMetrics(
                 backend="b12x",
                 mean_us=statistics.fmean(backend_times_ms) * 1000.0,
-                min_us=min(backend_times_ms) * 1000.0,
-                ci_low_us=backend_ci_low_ms * 1000.0,
-                ci_high_us=backend_ci_high_ms * 1000.0,
-                sem_us=backend_sem_ms * 1000.0,
             )
 
             flashinfer_metrics: CaseMetrics | None = None
@@ -1470,17 +1466,9 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
                     replays=args.replays,
                     l2_flush=l2_flush,
                 )
-                flashinfer_ci_low_ms, flashinfer_ci_high_ms, flashinfer_sem_ms = _mean_ci(
-                    flashinfer_times_ms,
-                    ci_level=args.ci_level,
-                )
                 flashinfer_metrics = CaseMetrics(
                     backend="flashinfer-fa2",
                     mean_us=statistics.fmean(flashinfer_times_ms) * 1000.0,
-                    min_us=min(flashinfer_times_ms) * 1000.0,
-                    ci_low_us=flashinfer_ci_low_ms * 1000.0,
-                    ci_high_us=flashinfer_ci_high_ms * 1000.0,
-                    sem_us=flashinfer_sem_ms * 1000.0,
                 )
                 flashinfer_output = fa2_bucket.output_view
                 speedups.append(flashinfer_metrics.mean_us / backend_metrics.mean_us)
@@ -1513,26 +1501,14 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
                 f"kv={case.effective_cache_tokens:6d} "
                 f"cap={bucket_policy.capture_context_tokens:6d} "
                 f"{b12x_bucket.current_plan_desc:>17s} "
-                f"| {backend_metrics.backend} mean={backend_metrics.mean_us:8.1f} us "
-                f"min={backend_metrics.min_us:8.1f} us "
-                f"{int(args.ci_level * 100)}%CI=[{backend_metrics.ci_low_us:8.1f},{backend_metrics.ci_high_us:8.1f}] us"
+                f"| {backend_metrics.backend} mean={backend_metrics.mean_us:8.1f} us"
             )
             if flashinfer_metrics is not None:
                 ratio = flashinfer_metrics.mean_us / backend_metrics.mean_us
-                ratio_ci_low, ratio_ci_high = _ratio_mean_ci(
-                    flashinfer_metrics.mean_us,
-                    flashinfer_metrics.sem_us,
-                    backend_metrics.mean_us,
-                    backend_metrics.sem_us,
-                    ci_level=args.ci_level,
-                )
                 line += (
                     f" | fa2 mean={flashinfer_metrics.mean_us:8.1f} us "
-                    f"min={flashinfer_metrics.min_us:8.1f} us "
-                    f" {int(args.ci_level * 100)}%CI=[{flashinfer_metrics.ci_low_us:8.1f},{flashinfer_metrics.ci_high_us:8.1f}] us "
                     f"| fa2/{backend_metrics.backend}="
                     f"{ratio:6.3f}x"
-                    f" {int(args.ci_level * 100)}%CI=[{ratio_ci_low:5.3f},{ratio_ci_high:5.3f}]"
                 )
             print(line + check_suffix)
 
@@ -1545,8 +1521,17 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
         print(f"geomean fa2/b12x: {statistics.geometric_mean(speedups):.3f}x")
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    argv = sys.argv[1:] if argv is None else argv
+    profile_name = _preparse_profile(argv)
+
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--profile",
+        choices=_profile_choices(),
+        default=profile_name,
+        help="Shape preset. Explicit CLI shape flags override preset defaults.",
+    )
     parser.add_argument(
         "--mode",
         choices=["legacy-matrix", "decode-graph-buckets"],
@@ -1570,8 +1555,7 @@ def main() -> None:
     parser.add_argument("--fixed-split-pages", type=int, default=0)
     parser.add_argument("--capture-cache-seqlen", type=int, default=0)
     parser.add_argument("--graph-ctas-per-sm", type=int, default=0)
-    parser.add_argument("--b12x-attn-mode", choices=["default", "turbo"], default="default")
-    parser.add_argument("--ci-level", type=float, default=0.95)
+    parser.add_argument("--ci-level", type=float, default=0.95, help=argparse.SUPPRESS)
     parser.add_argument("--compare-fa2", action="store_true", default=True)
     parser.add_argument("--no-compare-fa2", action="store_false", dest="compare_fa2")
     parser.add_argument("--check", action="store_true")
@@ -1583,13 +1567,14 @@ def main() -> None:
         default=0,
         help="L2 eviction size in bytes; default is 2x detected L2 capacity.",
     )
-    args = parser.parse_args()
+    parser.set_defaults(**BENCHMARK_PROFILES[profile_name])
+    args = parser.parse_args(argv)
+    args.profile = _canonical_profile_name(args.profile)
 
     require_sm120()
     if args.replays < 100:
         raise ValueError("--replays must be at least 100 for graph-replay benchmarking")
-    if not 0.0 < args.ci_level < 1.0:
-        raise ValueError("--ci-level must be between 0 and 1")
+    _gqa_group_size(q_heads=args.q_heads, kv_heads=args.kv_heads)
     l2_flush_bytes = resolve_l2_flush_bytes(args.l2_flush_bytes)
     flush_desc = (
         f"on ({l2_flush_bytes / (1 << 20):.1f} MiB per launch)"

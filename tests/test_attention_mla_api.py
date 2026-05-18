@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 
@@ -8,6 +10,7 @@ from b12x.integration.mla import (
     MLASparseExtendMetadata,
     B12XAttentionWorkspace,
     sparse_mla_decode_forward,
+    sparse_mla_decode_forward_with_lse,
     sparse_mla_extend_forward,
 )
 from b12x.attention.mla import kernel as mla_kernel
@@ -82,6 +85,65 @@ def test_sparse_mla_decode_keeps_query_head_shape(monkeypatch) -> None:
     assert captured["d_v"] == 256
     assert workspace.page_table_1 is not page_table_1
     assert torch.equal(workspace.page_table_1, page_table_1)
+
+
+def test_sparse_mla_decode_with_lse_reduces_split_chunks(monkeypatch) -> None:
+    workspace = _make_workspace(mode="decode")
+
+    def fake_select_split(**kwargs):
+        del kwargs
+        from b12x.attention.mla.split import SparseMLASplitDecodeConfig
+
+        return SparseMLASplitDecodeConfig(chunk_size=2, num_chunks=2)
+
+    def fake_run_split_decode(**kwargs):
+        output = kwargs["output"]
+        output.zero_()
+        tmp_lse = kwargs["tmp_lse"]
+        tmp_lse.fill_(float("-inf"))
+        tmp_lse[:2, :8, 0] = torch.tensor(
+            [[0.0] * 8, [float("-inf")] * 8],
+            dtype=tmp_lse.dtype,
+        )
+        tmp_lse[:2, :8, 1] = torch.tensor(
+            [[1.0] * 8, [2.0] * 8],
+            dtype=tmp_lse.dtype,
+        )
+
+    monkeypatch.setattr(
+        "b12x.attention.mla.api.select_sparse_mla_split_decode_config",
+        fake_select_split,
+    )
+    monkeypatch.setattr(
+        "b12x.attention.mla.api.run_sparse_mla_split_decode",
+        fake_run_split_decode,
+    )
+
+    q_all = torch.ones((2, 8, 256), dtype=torch.bfloat16)
+    kv_cache = torch.zeros((16, 1, 656), dtype=torch.uint8)
+    page_table_1 = torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.int32)
+    cache_seqlens = torch.tensor([8, 8], dtype=torch.int32)
+    metadata = MLASparseDecodeMetadata(
+        page_table_1=page_table_1,
+        cache_seqlens_int32=cache_seqlens,
+        nsa_cache_seqlens_int32=cache_seqlens,
+        max_seq_len_k=8,
+    )
+
+    output, lse_base2 = sparse_mla_decode_forward_with_lse(
+        q_all=q_all,
+        kv_cache=kv_cache,
+        metadata=metadata,
+        workspace=workspace,
+        sm_scale=0.5,
+        v_head_dim=256,
+    )
+
+    assert output.shape == (2, 8, 256)
+    assert lse_base2.shape == (2, 8)
+    expected_row0 = math.log2(3.0)
+    assert torch.allclose(lse_base2[0], torch.full((8,), expected_row0))
+    assert torch.allclose(lse_base2[1], torch.full((8,), 2.0))
 
 
 def test_sparse_mla_extend_uses_bound_metadata(monkeypatch) -> None:
@@ -173,7 +235,9 @@ def test_workspace_ragged_kv_gather_reuses_fixed_capacity_buffer() -> None:
     )
 
     assert gathered.shape == (16, 1, 656)
-    assert torch.equal(gathered[:4], kv_cache[torch.tensor([2, 5, 7, 11], dtype=torch.long)])
+    assert torch.equal(
+        gathered[:4], kv_cache[torch.tensor([2, 5, 7, 11], dtype=torch.long)]
+    )
     assert workspace._contract_kv_rows is not None
     assert workspace._contract_kv_scales is not None
 
@@ -184,7 +248,9 @@ def test_workspace_ragged_kv_gather_reuses_fixed_capacity_buffer() -> None:
     )
 
     assert gathered_again.data_ptr() == data_ptr
-    assert torch.equal(gathered_again[:2], kv_cache[torch.tensor([1, 3], dtype=torch.long)])
+    assert torch.equal(
+        gathered_again[:2], kv_cache[torch.tensor([1, 3], dtype=torch.long)]
+    )
 
 
 def test_workspace_ragged_kv_contracts_do_not_leak_to_paged_cache() -> None:
@@ -224,14 +290,20 @@ def test_workspace_ragged_kv_contracts_do_not_leak_to_paged_cache() -> None:
         del dtype, assumed_align
         return tensor
 
-    def fake_build_sparse_mla_split_forward_kernel(traits, launch_num_chunks, head_tiles):
+    def fake_build_sparse_mla_split_forward_kernel(
+        traits, launch_num_chunks, head_tiles
+    ):
         del traits, launch_num_chunks, head_tiles
         return object()
 
     monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(mla_split, "_run_cached_host_launcher", fake_run_cached_host_launcher)
+    monkeypatch.setattr(
+        mla_split, "_run_cached_host_launcher", fake_run_cached_host_launcher
+    )
     monkeypatch.setattr(mla_split, "_to_kernel_tensor", identity_to_kernel_tensor)
-    monkeypatch.setattr(mla_split, "select_sparse_mla_traits", lambda **kwargs: object())
+    monkeypatch.setattr(
+        mla_split, "select_sparse_mla_traits", lambda **kwargs: object()
+    )
     monkeypatch.setattr(
         mla_split,
         "_build_sparse_mla_split_forward_kernel",
@@ -268,14 +340,20 @@ def test_workspace_ragged_kv_contracts_do_not_leak_to_paged_cache() -> None:
     finally:
         monkeypatch.undo()
 
-    full_kv_rows_u32, full_kv_scales = mla_kernel._extract_packed_kv_runtime_views(full_kv_cache)
+    full_kv_rows_u32, full_kv_scales = mla_kernel._extract_packed_kv_runtime_views(
+        full_kv_cache
+    )
     assert len(captured_cache_keys) == 2
     assert captured_cache_keys[0][1] == mla_kernel._tensor_meta_key(full_kv_rows_u32)
     assert captured_cache_keys[0][2] == mla_kernel._tensor_meta_key(full_kv_scales)
     assert workspace._contract_kv_rows is not None
     assert workspace._contract_kv_scales is not None
-    assert captured_cache_keys[1][1] == mla_kernel._tensor_meta_key(workspace._contract_kv_rows)
-    assert captured_cache_keys[1][2] == mla_kernel._tensor_meta_key(workspace._contract_kv_scales)
+    assert captured_cache_keys[1][1] == mla_kernel._tensor_meta_key(
+        workspace._contract_kv_rows
+    )
+    assert captured_cache_keys[1][2] == mla_kernel._tensor_meta_key(
+        workspace._contract_kv_scales
+    )
 
 
 def test_sparse_mla_verify_prefers_split_path(monkeypatch) -> None:
@@ -294,6 +372,7 @@ def test_sparse_mla_verify_prefers_split_path(monkeypatch) -> None:
         output.zero_()
 
     def fail_run_sparse_mla_kernel(**kwargs):
+        del kwargs
         raise AssertionError("verify path should not use generic sparse MLA kernel")
 
     monkeypatch.setattr(
@@ -355,7 +434,10 @@ def test_sparse_mla_extend_prefers_split_path(monkeypatch) -> None:
         output.zero_()
 
     def fail_run_sparse_mla_kernel(**kwargs):
-        raise AssertionError("extend split path should not use generic sparse MLA kernel")
+        del kwargs
+        raise AssertionError(
+            "extend split path should not use generic sparse MLA kernel"
+        )
 
     monkeypatch.setattr(
         "b12x.attention.mla.api.select_sparse_mla_split_decode_config",
@@ -397,6 +479,83 @@ def test_sparse_mla_extend_prefers_split_path(monkeypatch) -> None:
     )
 
     assert output.shape == (5, 8, 256)
+    assert torch.equal(captured["active_token_counts"], nsa_cache_seqlens)
+
+
+def test_sparse_mla_large_bs1_extend_prefers_single_pass(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+    q_rows = 2048
+    workspace = B12XAttentionWorkspace.for_fixed_capacity(
+        mode="extend",
+        device="cpu",
+        dtype=torch.bfloat16,
+        kv_dtype=torch.uint8,
+        num_q_heads=8,
+        head_dim=256,
+        v_head_dim=256,
+        topk=2048,
+        max_total_q=q_rows,
+        max_batch=1,
+    )
+
+    def fake_select_split(**kwargs):
+        del kwargs
+        from b12x.attention.mla.split import SparseMLASplitDecodeConfig
+
+        return SparseMLASplitDecodeConfig(chunk_size=32, num_chunks=64)
+
+    def fail_run_split_decode(**kwargs):
+        del kwargs
+        raise AssertionError("large bs=1 extend should prefer the single-pass kernel")
+
+    def fake_run_sparse_mla_kernel(**kwargs):
+        captured["active_token_counts"] = kwargs["active_token_counts"].clone()
+        kwargs["output"].zero_()
+
+    monkeypatch.setattr(
+        "b12x.attention.mla.api.select_sparse_mla_split_decode_config",
+        fake_select_split,
+    )
+    monkeypatch.setattr(
+        "b12x.attention.mla.api.supports_sparse_mla_kernel",
+        lambda **kwargs: True,
+    )
+    monkeypatch.setattr(
+        "b12x.attention.mla.api.run_sparse_mla_split_decode",
+        fail_run_split_decode,
+    )
+    monkeypatch.setattr(
+        "b12x.attention.mla.api.run_sparse_mla_kernel",
+        fake_run_sparse_mla_kernel,
+    )
+
+    q_all = torch.ones((q_rows, 8, 256), dtype=torch.bfloat16)
+    kv_cache = torch.zeros((32, 1, 656), dtype=torch.uint8)
+    page_table_1 = torch.zeros((q_rows, 2048), dtype=torch.int32)
+    cache_seqlens = torch.full((1,), 2048, dtype=torch.int32)
+    nsa_cache_seqlens = torch.full((q_rows,), 2048, dtype=torch.int32)
+    nsa_cu = torch.tensor([0, q_rows], dtype=torch.int32)
+    metadata = MLASparseExtendMetadata(
+        selected_token_offsets=page_table_1,
+        cache_seqlens_int32=cache_seqlens,
+        nsa_cache_seqlens_int32=nsa_cache_seqlens,
+        nsa_cu_seqlens_q=nsa_cu,
+        nsa_cu_seqlens_k=nsa_cu,
+        max_seq_len_q=q_rows,
+        max_seq_len_k=2048,
+        mode="extend",
+    )
+
+    output = sparse_mla_extend_forward(
+        q_all=q_all,
+        kv_cache=kv_cache,
+        metadata=metadata,
+        workspace=workspace,
+        sm_scale=1.0,
+        v_head_dim=256,
+    )
+
+    assert output.shape == (q_rows, 8, 256)
     assert torch.equal(captured["active_token_counts"], nsa_cache_seqlens)
 
 

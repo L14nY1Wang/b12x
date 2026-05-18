@@ -68,11 +68,11 @@ def _run_once(
 ) -> torch.Tensor:
     return b12x_moe_fp4(
         a=x,
-        a1_gscale=weights.w13_input_scale,
+        a1_gscale=weights.w13_input_scale_quant,
         w1_fp4=weights.w13_weight,
         w1_blockscale=weights.w13_blockscale_swizzled,
         w1_alphas=weights.g1_alphas,
-        a2_gscale=weights.w2_input_scale,
+        a2_gscale=weights.w2_input_scale_quant,
         w2_fp4=weights.w2_weight,
         w2_blockscale=weights.w2_blockscale_swizzled,
         w2_alphas=weights.g2_alphas,
@@ -94,11 +94,11 @@ def _launch_with_alias_consumer(
     with torch.cuda.stream(stream):
         alias = b12x_moe_fp4(
             a=x,
-            a1_gscale=weights.w13_input_scale,
+            a1_gscale=weights.w13_input_scale_quant,
             w1_fp4=weights.w13_weight,
             w1_blockscale=weights.w13_blockscale_swizzled,
             w1_alphas=weights.g1_alphas,
-            a2_gscale=weights.w2_input_scale,
+            a2_gscale=weights.w2_input_scale_quant,
             w2_fp4=weights.w2_weight,
             w2_blockscale=weights.w2_blockscale_swizzled,
             w2_alphas=weights.g2_alphas,
@@ -128,11 +128,12 @@ def test_b12x_supports_overlapping_stream_launches() -> None:
     spec = _make_spec()
     weights_a = load_expert_weights(MODEL_PATH, spec, layer_idx=0)
     weights_b = load_expert_weights(MODEL_PATH, spec, layer_idx=1)
-    # Keep this on the compact-static path. The purpose of this test is shared
-    # pool safety across overlapping streams, not dynamic-path accuracy drift.
+    # Keep this on the compact-static path. The purpose of this test is explicit
+    # lane safety across overlapping streams, not dynamic-path accuracy drift.
     xa, ida, wa = _make_inputs(spec, batch_size=1, seed=123, device=device)
     xb, idb, wb = _make_inputs(spec, batch_size=1, seed=456, device=device)
-    shared_workspace_pool = allocate_tp_moe_workspace_pool()
+    lane_a_workspace_pool = allocate_tp_moe_workspace_pool()
+    lane_b_workspace_pool = allocate_tp_moe_workspace_pool()
 
     torch.cuda.synchronize(device)
     ref_a = _run_once(
@@ -140,14 +141,14 @@ def test_b12x_supports_overlapping_stream_launches() -> None:
         topk_ids=ida,
         topk_weights=wa,
         weights=weights_a,
-        workspace=shared_workspace_pool,
+        workspace=lane_a_workspace_pool,
     )
     ref_b = _run_once(
         x=xb,
         topk_ids=idb,
         topk_weights=wb,
         weights=weights_b,
-        workspace=shared_workspace_pool,
+        workspace=lane_b_workspace_pool,
     )
     torch.cuda.synchronize(device)
 
@@ -159,7 +160,7 @@ def test_b12x_supports_overlapping_stream_launches() -> None:
             topk_ids=ida,
             topk_weights=wa,
             weights=weights_a,
-            workspace=shared_workspace_pool,
+            workspace=lane_a_workspace_pool,
         )
     with torch.cuda.stream(stream_b):
         out_b = _run_once(
@@ -167,7 +168,7 @@ def test_b12x_supports_overlapping_stream_launches() -> None:
             topk_ids=idb,
             topk_weights=wb,
             weights=weights_b,
-            workspace=shared_workspace_pool,
+            workspace=lane_b_workspace_pool,
         )
     torch.cuda.synchronize(device)
 
@@ -179,7 +180,7 @@ def test_b12x_supports_overlapping_stream_launches() -> None:
         topk_ids=ida,
         topk_weights=wa,
         weights=weights_a,
-        workspace=shared_workspace_pool,
+        workspace=lane_a_workspace_pool,
     )
     sink_b = _launch_with_alias_consumer(
         stream=stream_d,
@@ -187,7 +188,7 @@ def test_b12x_supports_overlapping_stream_launches() -> None:
         topk_ids=idb,
         topk_weights=wb,
         weights=weights_b,
-        workspace=shared_workspace_pool,
+        workspace=lane_b_workspace_pool,
     )
     torch.cuda.synchronize(device)
 
@@ -195,4 +196,5 @@ def test_b12x_supports_overlapping_stream_launches() -> None:
     _assert_matches(out_b, ref_b)
     _assert_matches(sink_a, ref_a)
     _assert_matches(sink_b, ref_b)
-    assert len(shared_workspace_pool.workspaces) >= 4
+    assert len(lane_a_workspace_pool.workspaces) == 1
+    assert len(lane_b_workspace_pool.workspaces) == 1

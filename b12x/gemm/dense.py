@@ -58,8 +58,7 @@ from b12x.cute.utils import (
 from b12x.runtime_control import raise_if_kernel_resolution_frozen
 
 
-# Workaround for nvidia-cutlass-dsl 4.4.1 bug:
-# @dsl_user_op on PersistentTileSchedulerParams.__init__ renames attributes
+# @dsl_user_op on PersistentTileSchedulerParams.__init__ can rename attributes
 # (e.g. raster_along_m -> _raster_along_m, cluster_shape_major_fdd ->
 # cluster_shape_m_fdd) but __extract_mlir_values__ (used by TVM-FFI)
 # still references the original names.

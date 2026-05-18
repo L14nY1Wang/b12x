@@ -171,16 +171,16 @@ def _pack_experts(
     w13_blockscale_swizzled = swizzle_block_scale(w13_sf)
     w2_blockscale_swizzled = swizzle_block_scale(down_sf)
 
-    # Per-expert input scales and alphas.
+    # Per-expert reciprocal input scales and fused alphas.
     g1_alphas = (gate_is * gate_gs).to(torch.float32)
     g2_alphas = (down_is * down_gs).to(torch.float32)
 
     return B12XFP4ExpertWeights(
-        a1_gscale=gate_is.to(torch.float32),
+        a1_gscale=(1.0 / gate_is).to(torch.float32).contiguous(),
         w1_fp4=w13,
         w1_blockscale=w13_blockscale_swizzled,
         w1_alphas=g1_alphas,
-        a2_gscale=down_is.to(torch.float32),
+        a2_gscale=(1.0 / down_is).to(torch.float32).contiguous(),
         w2_fp4=down_w.contiguous(),
         w2_blockscale=w2_blockscale_swizzled,
         w2_alphas=g2_alphas,

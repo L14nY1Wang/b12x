@@ -17,8 +17,10 @@ from b12x.integration.nsa_indexer import (
     clear_nsa_indexer_caches,
     get_paged_mqa_logits_metadata,
     pack_nsa_index_k_cache_reference,
+    resolve_sparse_nsa_extend_prefill_block_k,
     sparse_nsa_index_decode_logits_paged,
     sparse_nsa_index_extend_logits,
+    sparse_nsa_index_extend_tiled_topk,
     uses_paged_mqa_schedule_metadata,
 )
 
@@ -138,6 +140,73 @@ def test_uses_paged_mqa_schedule_metadata_only_for_long_rows() -> None:
     assert uses_paged_mqa_schedule_metadata(q_rows=1, max_pages=2048)
     assert uses_paged_mqa_schedule_metadata(q_rows=2, max_pages=2048)
     assert uses_paged_mqa_schedule_metadata(q_rows=8, max_pages=2048)
+
+
+def test_sparse_nsa_extend_prefill_block_k_auto_targets_long_bs1_prefill(monkeypatch) -> None:
+    monkeypatch.delenv("B12X_NSA_EXTEND_PREFILL_THRESHOLD", raising=False)
+    monkeypatch.delenv("B12X_NSA_EXTEND_PREFILL_BLOCK_K", raising=False)
+
+    assert (
+        resolve_sparse_nsa_extend_prefill_block_k(
+            valid_q_rows=2048,
+            k_rows=65536,
+            num_heads=32,
+        )
+        == 512
+    )
+    assert (
+        resolve_sparse_nsa_extend_prefill_block_k(
+            valid_q_rows=512,
+            k_rows=65536,
+            num_heads=64,
+        )
+        == 256
+    )
+    assert (
+        resolve_sparse_nsa_extend_prefill_block_k(
+            valid_q_rows=128,
+            k_rows=65536,
+            num_heads=64,
+        )
+        is None
+    )
+
+
+def test_sparse_nsa_extend_prefill_block_k_env_overrides(monkeypatch) -> None:
+    monkeypatch.delenv("B12X_NSA_EXTEND_PREFILL_THRESHOLD", raising=False)
+    monkeypatch.setenv("B12X_NSA_EXTEND_PREFILL_BLOCK_K", "256")
+    assert (
+        resolve_sparse_nsa_extend_prefill_block_k(
+            valid_q_rows=2048,
+            k_rows=65536,
+            num_heads=32,
+        )
+        == 256
+    )
+
+    monkeypatch.setenv("B12X_NSA_EXTEND_PREFILL_BLOCK_K", "512")
+    assert (
+        resolve_sparse_nsa_extend_prefill_block_k(
+            valid_q_rows=2048,
+            k_rows=65536,
+            num_heads=32,
+        )
+        == 512
+    )
+    with pytest.raises(ValueError, match="unsupported"):
+        resolve_sparse_nsa_extend_prefill_block_k(
+            valid_q_rows=512,
+            k_rows=65536,
+            num_heads=64,
+        )
+
+    monkeypatch.setenv("B12X_NSA_EXTEND_PREFILL_BLOCK_K", "bad")
+    with pytest.raises(ValueError, match="auto, 256, or 512"):
+        resolve_sparse_nsa_extend_prefill_block_k(
+            valid_q_rows=2048,
+            k_rows=65536,
+            num_heads=64,
+        )
 
 
 def test_sparse_nsa_index_decode_logits_paged_matches_reference_cpu() -> None:
@@ -518,3 +587,279 @@ def test_sparse_nsa_index_extend_logits_cuda_matches_reference_for_large_head_co
     assert torch.isneginf(actual[0, 33:192]).all()
     assert torch.isneginf(actual[1, :192]).all()
     assert torch.isneginf(actual[6, 1:]).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for extend kernel coverage")
+@pytest.mark.parametrize(
+    "q_rows, k_rows",
+    [
+        (256, 4096),   # shortest prefill q, >2048 k — crosses the K-tile budget.
+        (512, 8192),   # multi-Q-tile prefill over long context.
+        (1024, 3072),  # many Q-tiles, mid-length K.
+    ],
+)
+def test_sparse_nsa_index_extend_logits_cuda_matches_reference_for_long_prefill(
+    q_rows: int, k_rows: int
+) -> None:
+    device = torch.device("cuda")
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(72_200 + q_rows * 17 + k_rows)
+
+    num_heads = 64
+    q_fp8 = (
+        torch.randn((q_rows, num_heads, 128), generator=gen, dtype=torch.float32).to(device=device) / 2
+    ).to(torch.float8_e4m3fn)
+    weights = torch.randn((q_rows, num_heads), generator=gen, dtype=torch.float32).to(device=device)
+    k = torch.randn((k_rows, 128), generator=gen, dtype=torch.float32).to(device=device) / 3
+    kv_fp8 = _quantize_rows_to_kv_fp8(k)
+
+    # Causal ragged ranges: row q sees k ∈ [0, q+1). Spans the full k_rows range
+    # for tail rows and exercises per-row sparse-range liveness for early rows.
+    positions = torch.arange(q_rows, dtype=torch.int32, device=device)
+    k_start = torch.zeros(q_rows, dtype=torch.int32, device=device)
+    k_end = torch.clamp(positions + 1, max=k_rows).to(torch.int32)
+
+    actual = sparse_nsa_index_extend_logits(
+        q_fp8=q_fp8,
+        weights=weights,
+        kv_fp8=kv_fp8,
+        metadata=NSAIndexerExtendLogitsMetadata(
+            k_start=k_start,
+            k_end=k_end,
+        ),
+    )
+    actual_no_fill = sparse_nsa_index_extend_logits(
+        q_fp8=q_fp8,
+        weights=weights,
+        kv_fp8=kv_fp8,
+        metadata=NSAIndexerExtendLogitsMetadata(
+            k_start=k_start,
+            k_end=k_end,
+        ),
+        preinitialize_invalid_logits=False,
+    )
+    expected = sparse_nsa_extend_logits_reference(
+        q_fp8=q_fp8,
+        weights=weights,
+        kv_fp8=kv_fp8,
+        k_start=k_start,
+        k_end=k_end,
+    )
+
+    torch.cuda.synchronize(device)
+    _assert_logits_close(actual, expected)
+    _assert_logits_close(actual_no_fill, expected)
+    # Out-of-range positions must stay -inf all the way out to k_rows.
+    for q in (0, q_rows // 2, q_rows - 1):
+        ke = min(q + 1, k_rows)
+        if ke < k_rows:
+            assert torch.isneginf(actual[q, ke:]).all(), f"row {q} leaked non-neginf beyond k_end={ke}"
+            assert torch.isneginf(actual_no_fill[q, ke:]).all(), (
+                f"no-fill row {q} leaked non-neginf beyond k_end={ke}"
+            )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for extend kernel coverage")
+@pytest.mark.parametrize(
+    "q_rows, k_rows",
+    [
+        (256, 3072),   # slightly over the old hardcoded 2048 K-tile budget.
+        (256, 8192),   # well past it — exercises full K-grid scaling.
+    ],
+)
+def test_sparse_nsa_index_extend_logits_cuda_matches_reference_for_dense_long_prefill(
+    q_rows: int, k_rows: int
+) -> None:
+    """Dense (non-causal) long-K prefill: every q row sees every k row.
+
+    Exercises the K-tile grid scaling — with a fixed K_GROUPS=4 launcher and a fixed
+    inner K-tile loop of 4, the kernel can only cover 2048 K-rows per Q-tile; anything
+    beyond that silently stays at -inf and this test catches it.
+    """
+    device = torch.device("cuda")
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(72_400 + q_rows * 31 + k_rows)
+
+    num_heads = 64
+    q_fp8 = (
+        torch.randn((q_rows, num_heads, 128), generator=gen, dtype=torch.float32).to(device=device) / 2
+    ).to(torch.float8_e4m3fn)
+    weights = torch.randn((q_rows, num_heads), generator=gen, dtype=torch.float32).to(device=device)
+    k = torch.randn((k_rows, 128), generator=gen, dtype=torch.float32).to(device=device) / 3
+    kv_fp8 = _quantize_rows_to_kv_fp8(k)
+    k_start = torch.zeros(q_rows, dtype=torch.int32, device=device)
+    k_end = torch.full((q_rows,), k_rows, dtype=torch.int32, device=device)
+
+    actual = sparse_nsa_index_extend_logits(
+        q_fp8=q_fp8,
+        weights=weights,
+        kv_fp8=kv_fp8,
+        metadata=NSAIndexerExtendLogitsMetadata(k_start=k_start, k_end=k_end),
+    )
+    expected = sparse_nsa_extend_logits_reference(
+        q_fp8=q_fp8,
+        weights=weights,
+        kv_fp8=kv_fp8,
+        k_start=k_start,
+        k_end=k_end,
+    )
+    torch.cuda.synchronize(device)
+    _assert_logits_close(actual, expected)
+    # No position should have silently fallen back to -inf.
+    assert torch.isfinite(actual).all(), "kernel left finite positions as -inf"
+
+
+def test_sparse_nsa_index_extend_tiled_topk_cpu_matches_reference() -> None:
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(72_610)
+
+    q_rows = 4
+    num_heads = 3
+    k_rows = 17
+    topk = 6
+    q_fp8 = (torch.randn((q_rows, num_heads, 128), generator=gen, dtype=torch.float32) / 2).to(
+        torch.float8_e4m3fn
+    )
+    weights = torch.randn((q_rows, num_heads), generator=gen, dtype=torch.float32)
+    k = torch.randn((k_rows, 128), generator=gen, dtype=torch.float32) / 3
+    kv_fp8 = _quantize_rows_to_kv_fp8(k)
+    k_start = torch.tensor([0, 2, 7, 16], dtype=torch.int32)
+    k_end = torch.tensor([9, 12, 17, 17], dtype=torch.int32)
+    metadata = NSAIndexerExtendLogitsMetadata(k_start=k_start, k_end=k_end)
+    lengths = torch.empty((q_rows,), dtype=torch.int32)
+    output_indices = torch.empty((q_rows, topk), dtype=torch.int32)
+
+    actual = sparse_nsa_index_extend_tiled_topk(
+        q_fp8=q_fp8,
+        weights=weights,
+        kv_fp8=kv_fp8,
+        metadata=metadata,
+        topk=topk,
+        lengths=lengths,
+        output_indices=output_indices,
+    )
+    logits = sparse_nsa_index_extend_logits(
+        q_fp8=q_fp8,
+        weights=weights,
+        kv_fp8=kv_fp8,
+        metadata=metadata,
+    )
+    topk_pos = torch.argsort(logits, dim=1, descending=True, stable=True)[:, :topk]
+    topk_values = torch.gather(logits, 1, topk_pos)
+    expected = torch.where(
+        torch.isfinite(topk_values),
+        topk_pos.to(torch.int32),
+        torch.full_like(topk_pos, -1, dtype=torch.int32),
+    )
+
+    assert actual.data_ptr() == output_indices.data_ptr()
+    assert torch.equal(actual, expected)
+    assert torch.equal(lengths, k_end - k_start)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for tiled topk coverage")
+def test_sparse_nsa_index_extend_tiled_topk_matches_scatter_logits(monkeypatch) -> None:
+    monkeypatch.setenv("B12X_NSA_EXTEND_TOPK_SUPERTILE_K", "3072")
+
+    device = torch.device("cuda")
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(72_620)
+
+    q_rows = 256
+    num_heads = 8
+    k_rows = 4096
+    topk = 2048
+    q_fp8 = (
+        torch.randn((q_rows, num_heads, 128), generator=gen, dtype=torch.float32).to(device=device)
+        / 2
+    ).to(torch.float8_e4m3fn)
+    weights = torch.randn((q_rows, num_heads), generator=gen, dtype=torch.float32).to(device=device)
+    k = torch.randn((k_rows, 128), generator=gen, dtype=torch.float32).to(device=device) / 3
+    kv_fp8 = _quantize_rows_to_kv_fp8(k)
+    k_start = torch.zeros(q_rows, dtype=torch.int32, device=device)
+    k_end = torch.full((q_rows,), k_rows, dtype=torch.int32, device=device)
+    metadata = NSAIndexerExtendLogitsMetadata(k_start=k_start, k_end=k_end)
+
+    actual = sparse_nsa_index_extend_tiled_topk(
+        q_fp8=q_fp8,
+        weights=weights,
+        kv_fp8=kv_fp8,
+        metadata=metadata,
+        topk=topk,
+    )
+    logits = sparse_nsa_index_extend_logits(
+        q_fp8=q_fp8,
+        weights=weights,
+        kv_fp8=kv_fp8,
+        metadata=metadata,
+        preinitialize_invalid_logits=False,
+    )
+    expected = torch.topk(logits, k=topk, dim=1, largest=True, sorted=False).indices.to(torch.int32)
+
+    torch.cuda.synchronize(device)
+    assert actual.shape == (q_rows, topk)
+    assert torch.equal(torch.sort(actual, dim=1).values, torch.sort(expected, dim=1).values)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for BK512 prefill coverage")
+def test_sparse_nsa_index_extend_logits_cuda_prefill512_sampled_logits(monkeypatch) -> None:
+    monkeypatch.setenv("B12X_NSA_EXTEND_PREFILL_BLOCK_K", "512")
+
+    device = torch.device("cuda")
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(72_512)
+
+    q_rows = 1024
+    k_rows = 32768
+    num_heads = 32
+    q_fp8 = (
+        torch.randn((q_rows, num_heads, 128), generator=gen, dtype=torch.float32).to(device=device) / 2
+    ).to(torch.float8_e4m3fn)
+    weights = torch.randn((q_rows, num_heads), generator=gen, dtype=torch.float32).to(device=device)
+    k = torch.randn((k_rows, 128), generator=gen, dtype=torch.float32).to(device=device) / 3
+    kv_fp8 = _quantize_rows_to_kv_fp8(k)
+
+    k_start = torch.zeros(q_rows, dtype=torch.int32, device=device)
+    k_end = torch.zeros(q_rows, dtype=torch.int32, device=device)
+    ranges = {
+        0: (0, k_rows),
+        31: (256, 1024),
+        32: (512, 1536),
+        255: (8192, 12288),
+        512: (16384, k_rows),
+        1023: (k_rows - 1024, k_rows),
+    }
+    for q_idx, (start, end) in ranges.items():
+        k_start[q_idx] = start
+        k_end[q_idx] = end
+
+    actual = sparse_nsa_index_extend_logits(
+        q_fp8=q_fp8,
+        weights=weights,
+        kv_fp8=kv_fp8,
+        metadata=NSAIndexerExtendLogitsMetadata(k_start=k_start, k_end=k_end),
+    )
+    torch.cuda.synchronize(device)
+
+    k_quant, k_scale = kv_fp8
+
+    def assert_sampled_logits(q_idx: int, cols: list[int]) -> None:
+        k_cols = torch.tensor(cols, dtype=torch.long, device=device)
+        scores = torch.matmul(q_fp8[q_idx].to(torch.float32), k_quant[k_cols].to(torch.float32).T)
+        expected = (torch.relu(scores) * weights[q_idx].unsqueeze(1)).sum(dim=0) * k_scale[k_cols]
+        torch.testing.assert_close(actual[q_idx, k_cols], expected, atol=1e-4, rtol=1e-4)
+
+    assert_sampled_logits(0, [0, 255, 256, 511, 512, 8191, 16384, 32767])
+    assert_sampled_logits(31, [256, 511, 512, 1023])
+    assert_sampled_logits(32, [512, 1024, 1535])
+    assert_sampled_logits(255, [8192, 8193, 12287])
+    assert_sampled_logits(512, [16384, 32767])
+    assert_sampled_logits(1023, [31744, 32767])
+
+    assert torch.isneginf(actual[31, torch.tensor([0, 1024], device=device)]).all()
+    assert torch.isneginf(actual[32, torch.tensor([511, 1536], device=device)]).all()
+    assert torch.isneginf(actual[255, torch.tensor([8191, 12288], device=device)]).all()
+    assert torch.isneginf(actual[512, torch.tensor([0, 16383], device=device)]).all()
+    assert torch.isneginf(actual[1023, torch.tensor([31743], device=device)]).all()
+    assert torch.isneginf(actual[1]).all()
+    assert torch.isneginf(actual[64]).all()

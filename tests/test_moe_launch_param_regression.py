@@ -1,4 +1,4 @@
-"""Regression tests for Parameter-backed tp_moe launch arguments."""
+"""Regression tests for tp_moe launch arguments."""
 
 from __future__ import annotations
 
@@ -16,14 +16,20 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from benchmarks.benchmark_moe import MODEL_PATH, TP_RANK, TP_SIZE, ModelSpec
 
 
-def _skip_if_unavailable() -> None:
+def _skip_if_no_sm120() -> None:
     if not torch.cuda.is_available():
         pytest.skip("No CUDA")
     major, minor = torch.cuda.get_device_capability()
     if major != 12 or minor not in (0, 1):
         pytest.skip(f"Requires SM120 or SM121, got sm_{major}{minor}")
+
+
+def _skip_if_unavailable() -> None:
+    _skip_if_no_sm120()
     if not MODEL_PATH.exists():
         pytest.skip(f"Model not found at {MODEL_PATH}")
+    if not (MODEL_PATH / "model.safetensors.index.json").exists():
+        pytest.skip(f"Indexed model weights not found at {MODEL_PATH}")
 
 
 def _make_spec() -> ModelSpec:
@@ -72,8 +78,8 @@ def _run_parameter_launch_case(case: str) -> subprocess.CompletedProcess[str]:
         weights = load_expert_weights(pathlib.Path({str(MODEL_PATH)!r}), spec)
         x, topk_ids, topk_weights = make_routed_inputs(spec, 8, seed=123, device=device)
 
-        a1_gscale = weights.w13_input_scale_per_expert.clone()
-        a2_gscale = weights.w2_input_scale_per_expert.clone()
+        a1_gscale = weights.w13_input_scale_quant_per_expert.clone()
+        a2_gscale = weights.w2_input_scale_quant_per_expert.clone()
         w1_alphas = weights.g1_alphas_per_expert.clone()
         w2_alphas = weights.g2_alphas_per_expert.clone()
 
@@ -109,7 +115,6 @@ def _run_parameter_launch_case(case: str) -> subprocess.CompletedProcess[str]:
             topk_ids,
             workspace=workspace,
             output=out,
-            input_scales_are_reciprocal=True,
             input_scales_static=True,
         )
         torch.cuda.synchronize()
@@ -126,6 +131,45 @@ def _run_parameter_launch_case(case: str) -> subprocess.CompletedProcess[str]:
         text=True,
         capture_output=True,
     )
+
+
+def _direct_micro_launchable(
+    quant_mode: str,
+    m: int,
+    n: int,
+    *,
+    weight_E: int = 256,
+    k: int = 4096,
+    num_topk: int = 10,
+) -> bool:
+    from b12x.integration.tp_moe import (
+        _DIRECT_MICRO_BLOCK_DIM,
+        _compiled_direct_micro_accepts_block_dim,
+        _get_micro_kernel,
+        clear_tp_moe_caches,
+    )
+
+    clear_tp_moe_caches()
+    torch.empty(1, device="cuda")
+    compiled, _ = _get_micro_kernel(
+        weight_E,
+        m,
+        k,
+        n,
+        num_topk,
+        topk_ids_dtype=torch.int32,
+        fast_math=True,
+        activation="silu",
+        quant_mode=quant_mode,
+        device=torch.device("cuda"),
+    )
+    return _compiled_direct_micro_accepts_block_dim(compiled, _DIRECT_MICRO_BLOCK_DIM)
+
+
+def test_nvfp4_direct_micro_resource_gate_rejects_qwen_bs8_shape() -> None:
+    _skip_if_no_sm120()
+
+    assert not _direct_micro_launchable("nvfp4", 8, 256, weight_E=512)
 
 
 @pytest.mark.parametrize("case", ["alphas", "scales"])

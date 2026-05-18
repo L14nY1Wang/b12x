@@ -53,11 +53,11 @@ def _make_spec() -> ModelSpec:
 
 def _pack_experts(weights) -> B12XFP4ExpertWeights:
     return B12XFP4ExpertWeights(
-        a1_gscale=weights.w13_input_scale_per_expert,
+        a1_gscale=weights.w13_input_scale_quant_per_expert,
         w1_fp4=weights.w13_weight,
         w1_blockscale=weights.w13_blockscale_swizzled,
         w1_alphas=weights.g1_alphas_per_expert,
-        a2_gscale=weights.w2_input_scale_per_expert,
+        a2_gscale=weights.w2_input_scale_quant_per_expert,
         w2_fp4=weights.w2_weight,
         w2_blockscale=weights.w2_blockscale_swizzled,
         w2_alphas=weights.g2_alphas_per_expert,
@@ -154,9 +154,9 @@ def main() -> None:
             _, topk_ids, topk_weights = _manual_route(hidden_states, gate_weight, spec.top_k)
             workspace = allocate_tp_moe_workspace(
                 hidden_states,
-                weights.w13_input_scale_per_expert,
+                weights.w13_input_scale_quant_per_expert,
                 weights.w13_weight,
-                weights.w2_input_scale_per_expert,
+                weights.w2_input_scale_quant_per_expert,
                 weights.w2_weight,
                 topk_ids,
                 input_scales_static=True,
@@ -208,11 +208,11 @@ def main() -> None:
             def tp_only() -> torch.Tensor:
                 return b12x_moe_fp4(
                     hidden_states,
-                    weights.w13_input_scale_per_expert,
+                    weights.w13_input_scale_quant_per_expert,
                     weights.w13_weight,
                     weights.w13_blockscale_swizzled,
                     weights.g1_alphas_per_expert,
-                    weights.w2_input_scale_per_expert,
+                    weights.w2_input_scale_quant_per_expert,
                     weights.w2_weight,
                     weights.w2_blockscale_swizzled,
                     weights.g2_alphas_per_expert,
@@ -227,11 +227,11 @@ def main() -> None:
                 manual_route_only()
                 return b12x_moe_fp4(
                     hidden_states,
-                    weights.w13_input_scale_per_expert,
+                    weights.w13_input_scale_quant_per_expert,
                     weights.w13_weight,
                     weights.w13_blockscale_swizzled,
                     weights.g1_alphas_per_expert,
-                    weights.w2_input_scale_per_expert,
+                    weights.w2_input_scale_quant_per_expert,
                     weights.w2_weight,
                     weights.w2_blockscale_swizzled,
                     weights.g2_alphas_per_expert,

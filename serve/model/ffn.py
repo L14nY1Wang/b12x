@@ -126,7 +126,6 @@ class MoEFFN(nn.Module):
             gate_bias=self.gate_bias,
             renormalize_topk=self.renormalize_topk,
             output=getattr(self, '_moe_output_buffer', None),
-            input_scales_are_reciprocal=True,
             input_scales_static=True,
         )
 

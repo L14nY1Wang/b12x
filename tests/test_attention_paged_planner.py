@@ -9,23 +9,9 @@ from b12x.attention.paged.planner import (
     create_paged_plan,
     decode_chunk_pages_for_graph,
     infer_paged_mode,
-)
-from b12x.attention.paged.tuning.registry import (
-    DECODE_GRAPH_POLICY,
-    register_decode_graph_policy,
+    resolve_decode_graph_ctas_per_sm,
 )
 from b12x.integration.attention import PagedAttentionWorkspace
-
-
-@pytest.fixture(autouse=True)
-def _isolate_decode_graph_policy_registry():
-    snapshot = {key: value.copy() for key, value in DECODE_GRAPH_POLICY.items()}
-    DECODE_GRAPH_POLICY.clear()
-    try:
-        yield
-    finally:
-        DECODE_GRAPH_POLICY.clear()
-        DECODE_GRAPH_POLICY.update({key: value.copy() for key, value in snapshot.items()})
 
 
 def _make_inputs(
@@ -186,26 +172,9 @@ def test_paged_short_extend_plan_uses_cta_tile_q_16(
 def test_paged_verify_plan_uses_decode_style_split_kv(
     kv_dtype: torch.dtype,
 ) -> None:
-    kv_key = "bf16" if kv_dtype == torch.bfloat16 else "fp8_e4m3fn"
-    register_decode_graph_policy(
-        kv_dtype=kv_key,
-        regime="decode",
-        batch=1,
-        graph_ctas_per_sm=5,
-        page_size=64,
-        chunk_ladder=((64, 7), (4096, 11)),
-    )
-    register_decode_graph_policy(
-        kv_dtype=kv_key,
-        regime="decode",
-        batch=4,
-        graph_ctas_per_sm=9,
-        page_size=64,
-        chunk_ladder=((64, 13), (4096, 17)),
-    )
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[4],
-        cache_seqlens=[4096],
+        cache_seqlens=[65536],
         kv_dtype=kv_dtype,
     )
     plan = create_paged_plan(
@@ -223,8 +192,8 @@ def test_paged_verify_plan_uses_decode_style_split_kv(
     assert plan.mode == "verify"
     assert plan.cta_tile_q == 16
     assert plan.split_kv is True
-    assert plan.kv_chunk_size == 13 * 64
-    assert plan.graph_ctas_per_sm == 9
+    assert plan.kv_chunk_size == 22 * 64
+    assert plan.graph_ctas_per_sm == 2
     assert plan.total_num_partial_rows > 0
     assert plan.new_batch_size > 2
 
@@ -383,18 +352,8 @@ def test_paged_extend_plan_rejects_fixed_split_smaller_than_full_span() -> None:
         )
 
 
-def test_paged_graph_mode_uses_registered_decode_graph_policy() -> None:
+def test_paged_graph_mode_uses_decode_graph_heuristic() -> None:
     batch = 7
-    register_decode_graph_policy(
-        kv_dtype="bf16",
-        regime="decode",
-        batch=batch,
-        graph_ctas_per_sm=6,
-        capture_fixed_split_pages=4,
-        capture_page_count=4096,
-        page_size=64,
-        chunk_ladder=((127, 1), (4096, 9)),
-    )
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[1] * batch,
         cache_seqlens=[8192] * batch,
@@ -410,24 +369,13 @@ def test_paged_graph_mode_uses_registered_decode_graph_policy() -> None:
         enable_cuda_graph=True,
         graph_chunk_policy=True,
     )
-    expected_budget = int(torch.cuda.get_device_properties("cuda").multi_processor_count) * 6
-    assert plan.graph_ctas_per_sm == 6
+    expected_budget = int(torch.cuda.get_device_properties("cuda").multi_processor_count) * 2
+    assert plan.graph_ctas_per_sm == 2
     assert plan.max_batch_size_if_split == expected_budget
-    assert plan.kv_chunk_size == 9 * 64
+    assert plan.kv_chunk_size == 5 * 64
 
 
-def test_decode_graph_chunk_pages_for_graph_uses_registered_policy() -> None:
-    register_decode_graph_policy(
-        kv_dtype="bf16",
-        regime="decode",
-        batch=4,
-        graph_ctas_per_sm=6,
-        capture_fixed_split_pages=4,
-        capture_page_count=4096,
-        page_size=64,
-        chunk_ladder=((127, 1), (1024, 7), (4096, 9)),
-    )
-
+def test_decode_graph_chunk_pages_for_graph_uses_heuristic() -> None:
     assert (
         decode_chunk_pages_for_graph(
             q_dtype=torch.bfloat16,
@@ -452,36 +400,103 @@ def test_decode_graph_chunk_pages_for_graph_uses_registered_policy() -> None:
             gqa_group_size=8,
             max_effective_kv_pages=256,
         )
-        == 7
+        == 6
+    )
+    assert (
+        decode_chunk_pages_for_graph(
+            q_dtype=torch.bfloat16,
+            kv_dtype=torch.bfloat16,
+            batch=8,
+            page_size=64,
+            head_dim_qk=192,
+            head_dim_vo=128,
+            gqa_group_size=16,
+            max_effective_kv_pages=256,
+        )
+        == 32
     )
 
 
-def test_build_decode_chunk_pages_lut_uses_registered_policy() -> None:
-    register_decode_graph_policy(
-        kv_dtype="bf16",
-        regime="decode",
-        batch=3,
-        graph_ctas_per_sm=5,
-        capture_fixed_split_pages=4,
-        capture_page_count=4096,
-        page_size=64,
-        chunk_ladder=((4, 1), (8, 2), (16, 3)),
+def test_decode_graph_chunk_pages_uses_finer_fp8_minimax_bs1_splits() -> None:
+    assert (
+        decode_chunk_pages_for_graph(
+            q_dtype=torch.bfloat16,
+            kv_dtype=torch.float8_e4m3fn,
+            batch=1,
+            page_size=64,
+            head_dim_qk=128,
+            head_dim_vo=128,
+            gqa_group_size=6,
+            max_effective_kv_pages=257,
+        )
+        == 6
+    )
+    assert (
+        decode_chunk_pages_for_graph(
+            q_dtype=torch.bfloat16,
+            kv_dtype=torch.float8_e4m3fn,
+            batch=2,
+            page_size=64,
+            head_dim_qk=128,
+            head_dim_vo=128,
+            gqa_group_size=6,
+            max_effective_kv_pages=257,
+        )
+        == 9
     )
 
+
+def test_decode_graph_ctas_per_sm_uses_smaller_minimax_bs1_to_bs4_budget() -> None:
+    for kv_dtype in (torch.bfloat16, torch.float8_e4m3fn):
+        assert (
+            resolve_decode_graph_ctas_per_sm(
+                kv_dtype=kv_dtype,
+                batch=1,
+                page_size=64,
+                head_dim_qk=128,
+                head_dim_vo=128,
+                gqa_group_size=6,
+            )
+            == 1
+        )
+        assert (
+            resolve_decode_graph_ctas_per_sm(
+                kv_dtype=kv_dtype,
+                batch=2,
+                page_size=64,
+                head_dim_qk=128,
+                head_dim_vo=128,
+                gqa_group_size=6,
+            )
+            == 1
+        )
+        assert (
+            resolve_decode_graph_ctas_per_sm(
+                kv_dtype=kv_dtype,
+                batch=5,
+                page_size=64,
+                head_dim_qk=128,
+                head_dim_vo=128,
+                gqa_group_size=6,
+            )
+            == 2
+        )
+
+
+def test_build_decode_chunk_pages_lut_uses_heuristic() -> None:
     lut = build_decode_chunk_pages_lut(
         q_dtype=torch.bfloat16,
         kv_dtype=torch.bfloat16,
-        batch=3,
+        batch=8,
         page_size=64,
-        head_dim_qk=256,
-        head_dim_vo=256,
-        gqa_group_size=8,
+        head_dim_qk=192,
+        head_dim_vo=128,
+        gqa_group_size=16,
         max_effective_kv_pages=16,
     )
 
-    assert lut[:4] == (1, 1, 1, 1)
-    assert lut[4:8] == (2, 2, 2, 2)
-    assert lut[8:] == (3, 3, 3, 3, 3, 3, 3, 3)
+    assert lut[:8] == (1, 1, 1, 1, 1, 1, 1, 1)
+    assert lut[8:] == (2, 2, 2, 2, 2, 2, 2, 2)
 
 
 @pytest.mark.parametrize(

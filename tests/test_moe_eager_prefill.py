@@ -26,6 +26,8 @@ from .helpers import require_sm120
 def _require_model_weights() -> None:
     if not MODEL_PATH.exists():
         pytest.skip(f"Model not found at {MODEL_PATH}")
+    if not (MODEL_PATH / "model.safetensors.index.json").exists():
+        pytest.skip(f"Indexed model weights not found at {MODEL_PATH}")
 
 
 def _make_spec() -> ModelSpec:

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 
 _FP8_E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
 _FP8_E4M3_MIN = float(torch.finfo(torch.float8_e4m3fn).min)
+_LN2 = math.log(2.0)
 _MLA_NOPE_DIM = 512
 _MLA_ROPE_DIM = 64
 _MLA_GROUP_SIZE = 128
@@ -21,7 +24,9 @@ def _as_2d_cache(x: torch.Tensor, expected_dim: int, name: str) -> torch.Tensor:
     if x.ndim != 2:
         raise ValueError(f"{name} must be rank-2 or rank-3, got {tuple(x.shape)}")
     if x.shape[1] != expected_dim:
-        raise ValueError(f"{name} last dimension must be {expected_dim}, got {x.shape[1]}")
+        raise ValueError(
+            f"{name} last dimension must be {expected_dim}, got {x.shape[1]}"
+        )
     return x.contiguous()
 
 
@@ -34,12 +39,19 @@ def pack_mla_kv_cache_reference(
     """Pack MLA KV cache into the FP8+scale+rope byte layout used by NSA."""
 
     if group_size != _MLA_GROUP_SIZE:
-        raise ValueError(f"Only group_size={_MLA_GROUP_SIZE} is supported in the reference.")
+        raise ValueError(
+            f"Only group_size={_MLA_GROUP_SIZE} is supported in the reference."
+        )
 
     k_nope_2d = _as_2d_cache(k_nope, _MLA_NOPE_DIM, "k_nope")
     k_rope_2d = _as_2d_cache(k_rope, _MLA_ROPE_DIM, "k_rope")
     if k_nope_2d.shape[0] != k_rope_2d.shape[0]:
         raise ValueError("k_nope and k_rope must have the same token count")
+    if k_rope_2d.dtype != torch.bfloat16:
+        raise ValueError(
+            "k_rope must have dtype torch.bfloat16 because the packed MLA layout "
+            f"stores raw BF16 rope bytes, got {k_rope_2d.dtype}"
+        )
 
     quant_bytes: list[torch.Tensor] = []
     scale_bytes: list[torch.Tensor] = []
@@ -52,7 +64,9 @@ def pack_mla_kv_cache_reference(
         quant_bytes.append(quant.view(torch.uint8).reshape(block.shape[0], group_size))
         scale_bytes.append(scale.view(torch.uint8).reshape(block.shape[0], 4))
 
-    rope_bytes = k_rope_2d.view(torch.uint8).reshape(k_rope_2d.shape[0], _MLA_ROPE_DIM * 2)
+    rope_bytes = k_rope_2d.view(torch.uint8).reshape(
+        k_rope_2d.shape[0], _MLA_ROPE_DIM * 2
+    )
     packed = torch.cat(
         [torch.cat(quant_bytes, dim=1), torch.cat(scale_bytes, dim=1), rope_bytes],
         dim=1,
@@ -68,7 +82,9 @@ def unpack_mla_kv_cache_reference(
     """Unpack the NSA MLA byte layout back into dequantized K tensors."""
 
     if group_size != _MLA_GROUP_SIZE:
-        raise ValueError(f"Only group_size={_MLA_GROUP_SIZE} is supported in the reference.")
+        raise ValueError(
+            f"Only group_size={_MLA_GROUP_SIZE} is supported in the reference."
+        )
 
     packed = _as_2d_cache(kv_cache, _MLA_PACKED_DIM, "kv_cache").view(torch.uint8)
     num_tokens = packed.shape[0]
@@ -117,7 +133,8 @@ def sparse_mla_reference(
     active_token_counts: torch.Tensor | None = None,
     sm_scale: float,
     v_head_dim: int,
-) -> torch.Tensor:
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Reference attention using the packed NSA MLA cache layout."""
 
     kv = unpack_mla_kv_cache_reference(kv_cache).squeeze(1).to(torch.float32)
@@ -128,6 +145,7 @@ def sparse_mla_reference(
         page_table_1=page_table_1,
         active_token_counts=active_token_counts,
         sm_scale=sm_scale,
+        return_lse=return_lse,
     )
 
 
@@ -139,17 +157,23 @@ def _sparse_attention_reference(
     page_table_1: torch.Tensor,
     active_token_counts: torch.Tensor | None = None,
     sm_scale: float,
-) -> torch.Tensor:
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     if q_all.ndim != 3:
         raise ValueError(f"q_all must be rank-3, got {tuple(q_all.shape)}")
     if page_table_1.ndim != 2:
-        raise ValueError(f"page_table_1 must be rank-2, got {tuple(page_table_1.shape)}")
+        raise ValueError(
+            f"page_table_1 must be rank-2, got {tuple(page_table_1.shape)}"
+        )
     if page_table_1.shape[0] != q_all.shape[0]:
         raise ValueError(
             f"page_table_1 rows {page_table_1.shape[0]} do not match q rows {q_all.shape[0]}"
         )
     if active_token_counts is not None:
-        if active_token_counts.ndim != 1 or active_token_counts.shape[0] != q_all.shape[0]:
+        if (
+            active_token_counts.ndim != 1
+            or active_token_counts.shape[0] != q_all.shape[0]
+        ):
             raise ValueError(
                 "active_token_counts must be rank-1 with one entry per query row, "
                 f"got {tuple(active_token_counts.shape)}"
@@ -160,23 +184,58 @@ def _sparse_attention_reference(
         dtype=torch.float32,
         device=q_all.device,
     )
+    lse_base2 = torch.full(
+        (q_all.shape[0], q_all.shape[1]),
+        float("-inf"),
+        dtype=torch.float32,
+        device=q_all.device,
+    )
     q_all_f = q_all.to(torch.float32)
     num_kv = k_all.shape[0]
+    width = page_table_1.shape[1]
+    if num_kv == 0 or width == 0:
+        output = out.to(q_all.dtype)
+        return (output, lse_base2) if return_lse else output
+
+    positions = torch.arange(width, dtype=torch.long, device=q_all.device)
+    tiny = torch.finfo(torch.float32).tiny
 
     for row in range(q_all.shape[0]):
-        valid = page_table_1[row]
+        selected = page_table_1[row].to(torch.long)
+        active_mask = torch.ones((width,), dtype=torch.bool, device=q_all.device)
         if active_token_counts is not None:
-            token_end = int(active_token_counts[row].item())
-            token_end = max(0, min(token_end, valid.shape[0]))
-            valid = valid[:token_end]
-        valid = valid[(valid >= 0) & (valid < num_kv)]
-        if valid.numel() == 0:
-            continue
+            token_end = active_token_counts[row].to(torch.long).clamp(min=0, max=width)
+            active_mask = positions < token_end
+        valid_mask = active_mask & (selected >= 0) & (selected < num_kv)
+        safe_selected = selected.clamp(0, num_kv - 1)
 
-        k_sel = k_all.index_select(0, valid.to(torch.long))
-        v_sel = v_all.index_select(0, valid.to(torch.long))
+        k_sel = k_all.index_select(0, safe_selected)
+        v_sel = v_all.index_select(0, safe_selected)
         scores = torch.matmul(q_all_f[row], k_sel.transpose(0, 1)) * float(sm_scale)
-        probs = torch.softmax(scores, dim=-1)
+        scores = torch.where(
+            valid_mask.unsqueeze(0),
+            scores,
+            torch.full_like(scores, float("-inf")),
+        )
+        row_max = scores.amax(dim=-1, keepdim=True)
+        finite_row = torch.isfinite(row_max)
+        safe_row_max = torch.where(finite_row, row_max, torch.zeros_like(row_max))
+        exp_scores = torch.where(
+            valid_mask.unsqueeze(0),
+            torch.exp(scores - safe_row_max),
+            torch.zeros_like(scores),
+        )
+        denom = exp_scores.sum(dim=-1, keepdim=True)
+        probs = exp_scores / denom.clamp_min(tiny)
         out[row] = torch.matmul(probs, v_sel)
+        if return_lse:
+            row_lse = torch.log(denom) + safe_row_max
+            row_lse = torch.where(
+                finite_row,
+                row_lse,
+                torch.full_like(row_lse, float("-inf")),
+            )
+            lse_base2[row] = row_lse.squeeze(-1) / _LN2
 
-    return out.to(q_all.dtype)
+    output = out.to(q_all.dtype)
+    return (output, lse_base2) if return_lse else output

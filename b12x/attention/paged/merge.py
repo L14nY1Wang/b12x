@@ -23,11 +23,11 @@ import cutlass.cute as cute
 import torch
 from cutlass._mlir.dialects import llvm
 
-from cutlass import Float32, Int32, const_expr
+from cutlass import Float32, Int32, Uint32, const_expr
 from cutlass.cutlass_dsl import Int64, T, dsl_user_op
 
 from b12x.attention import utils as attention_utils
-from b12x.cute.fp4 import get_ptr_as_int64, shared_ptr_to_u32
+from b12x.cute.fp4 import get_ptr_as_int64, pack_f32x2_to_bfloat2, shared_ptr_to_u32
 
 
 @dsl_user_op
@@ -40,6 +40,30 @@ def _cp_async_load_128b(smem_addr: Int32, gmem_addr: Int64, *, loc=None, ip=None
         ],
         "cp.async.cg.shared.global.L2::128B [$0], [$1], 16;",
         "r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def _st_global_v2_u32(
+    base_ptr: Int64,
+    v0: Uint32,
+    v1: Uint32,
+    *,
+    loc=None,
+    ip=None,
+):
+    llvm.inline_asm(
+        None,
+        [
+            Int64(base_ptr).ir_value(loc=loc, ip=ip),
+            Uint32(v0).ir_value(loc=loc, ip=ip),
+            Uint32(v1).ir_value(loc=loc, ip=ip),
+        ],
+        "st.global.v2.u32 [$0], {$1, $2};",
+        "l,r,r",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -224,6 +248,7 @@ def _merge_async_slot(
     vec_size: cutlass.Constexpr[int],
     bdx: cutlass.Constexpr[int],
     bdy: cutlass.Constexpr[int],
+    bytes_per_vec: cutlass.Constexpr[int],
     num_smem_stages: cutlass.Constexpr[int],
     s_stage_partial: cute.Tensor,
     s_stage_lse: cute.Tensor,
@@ -268,17 +293,36 @@ def _merge_async_slot(
 
         cute.arch.sync_threads()
         next_linear_idx = (cur_iter + num_smem_stages) * bdy + ty
-        smem_addr = shared_ptr_to_u32(
-            s_stage_partial.iterator
-            + Int32(((cur_iter % num_smem_stages) * bdy + ty) * head_dim + base_k)
-        )
-        if next_linear_idx < num_index_sets:
-            partial_idx = start_idx + next_linear_idx
-            gmem_addr = get_ptr_as_int64(
-                mV_partial,
-                (Int64(partial_idx) * Int64(num_heads) + Int64(head_idx)) * Int64(head_dim) + Int64(base_k),
+        if const_expr(bytes_per_vec == 8):
+            load_base_k = tx * (vec_size * 2)
+            smem_addr = shared_ptr_to_u32(
+                s_stage_partial.iterator
+                + Int32(
+                    ((cur_iter % num_smem_stages) * bdy + ty) * head_dim
+                    + load_base_k
+                )
             )
-            _cp_async_load_128b(smem_addr, gmem_addr)
+            if tx < bdx // 2 and next_linear_idx < num_index_sets:
+                partial_idx = start_idx + next_linear_idx
+                gmem_addr = get_ptr_as_int64(
+                    mV_partial,
+                    (Int64(partial_idx) * Int64(num_heads) + Int64(head_idx)) * Int64(head_dim)
+                    + Int64(load_base_k),
+                )
+                _cp_async_load_128b(smem_addr, gmem_addr)
+        else:
+            smem_addr = shared_ptr_to_u32(
+                s_stage_partial.iterator
+                + Int32(((cur_iter % num_smem_stages) * bdy + ty) * head_dim + base_k)
+            )
+            if next_linear_idx < num_index_sets:
+                partial_idx = start_idx + next_linear_idx
+                gmem_addr = get_ptr_as_int64(
+                    mV_partial,
+                    (Int64(partial_idx) * Int64(num_heads) + Int64(head_idx)) * Int64(head_dim)
+                    + Int64(base_k),
+                )
+                _cp_async_load_128b(smem_addr, gmem_addr)
         cute.arch.cp_async_commit_group()
     return state_m, state_d
 
@@ -308,6 +352,7 @@ class PagedPersistentMergeKernel:
         persistent_ctas: int | None = None,
         direct_grid: bool = False,
         regular_decode_graph: bool = False,
+        pair_bf16_partial_loads: bool = False,
     ):
         self.dtype = dtype
         self.dtype_partial = dtype_partial
@@ -321,6 +366,7 @@ class PagedPersistentMergeKernel:
         )
         self.direct_grid = bool(direct_grid)
         self.regular_decode_graph = bool(regular_decode_graph)
+        self.pair_bf16_partial_loads = bool(pair_bf16_partial_loads)
 
     @staticmethod
     def can_implement(
@@ -498,9 +544,7 @@ class PagedPersistentMergeKernel:
                 head_idx = work_linear_idx % num_heads
             if const_expr(self.regular_decode_graph):
                 start_idx = row_idx * max_chunks_per_req
-                kv_chunk_size = mKvChunkSizePtr[0]
-                cache_len = mCacheSeqlens[row_idx]
-                num_index_sets = (cache_len + kv_chunk_size - 1) // kv_chunk_size
+                num_index_sets = mMergeIndptr[row_idx + 1] - mMergeIndptr[row_idx]
                 end_idx = start_idx + num_index_sets
             else:
                 start_idx = mMergeIndptr[row_idx]
@@ -508,8 +552,20 @@ class PagedPersistentMergeKernel:
                 num_index_sets = end_idx - start_idx
 
             if num_index_sets == 0:
-                for vec_idx in cutlass.range_constexpr(self.vec_size):
-                    mO[row_idx, head_idx, base_k + vec_idx] = self.dtype(0.0)
+                if const_expr(self.dtype is cutlass.BFloat16 and self.vec_size == 4):
+                    _st_global_v2_u32(
+                        get_ptr_as_int64(
+                            mO,
+                            (Int64(row_idx) * Int64(num_heads) + Int64(head_idx))
+                            * Int64(head_dim)
+                            + Int64(base_k),
+                        ),
+                        Uint32(0),
+                        Uint32(0),
+                    )
+                else:
+                    for vec_idx in cutlass.range_constexpr(self.vec_size):
+                        mO[row_idx, head_idx, base_k + vec_idx] = self.dtype(0.0)
                 if tx == 0 and ty == 0:
                     mLSE[head_idx, row_idx] = -Float32.inf
             elif num_index_sets == 1:
@@ -526,22 +582,48 @@ class PagedPersistentMergeKernel:
                 )
                 state_m, state_d = _state_init(state_o)
                 bytes_per_vec = self.vec_size * self.dtype_partial.width // 8
-                can_stage_async = bytes_per_vec == 16
-                if can_stage_async:
+                can_stage_async = bytes_per_vec == 16 or (
+                    bytes_per_vec == 8
+                    and self.dtype_partial is cutlass.BFloat16
+                    and self.pair_bf16_partial_loads
+                )
+                if can_stage_async and (
+                    bytes_per_vec == 16 or num_index_sets >= Int32(8)
+                ):
                     for stage_idx in cutlass.range_constexpr(self.num_smem_stages):
                         staged_linear_idx = stage_idx * self.bdy + ty
-                        smem_addr = shared_ptr_to_u32(
-                            s_stage_partial.iterator
-                            + Int32((stage_idx * self.bdy + ty) * head_dim + base_k)
-                        )
-                        if staged_linear_idx < num_index_sets:
-                            partial_idx = start_idx + staged_linear_idx
-                            gmem_addr = get_ptr_as_int64(
-                                mV_partial,
-                                (Int64(partial_idx) * Int64(num_heads) + Int64(head_idx)) * Int64(head_dim)
-                                + Int64(base_k),
+                        if const_expr(bytes_per_vec == 8):
+                            load_base_k = tx * (self.vec_size * 2)
+                            smem_addr = shared_ptr_to_u32(
+                                s_stage_partial.iterator
+                                + Int32(
+                                    (stage_idx * self.bdy + ty) * head_dim
+                                    + load_base_k
+                                )
                             )
-                            _cp_async_load_128b(smem_addr, gmem_addr)
+                            if tx < self.bdx // 2 and staged_linear_idx < num_index_sets:
+                                partial_idx = start_idx + staged_linear_idx
+                                gmem_addr = get_ptr_as_int64(
+                                    mV_partial,
+                                    (Int64(partial_idx) * Int64(num_heads) + Int64(head_idx))
+                                    * Int64(head_dim)
+                                    + Int64(load_base_k),
+                                )
+                                _cp_async_load_128b(smem_addr, gmem_addr)
+                        else:
+                            smem_addr = shared_ptr_to_u32(
+                                s_stage_partial.iterator
+                                + Int32((stage_idx * self.bdy + ty) * head_dim + base_k)
+                            )
+                            if staged_linear_idx < num_index_sets:
+                                partial_idx = start_idx + staged_linear_idx
+                                gmem_addr = get_ptr_as_int64(
+                                    mV_partial,
+                                    (Int64(partial_idx) * Int64(num_heads) + Int64(head_idx))
+                                    * Int64(head_dim)
+                                    + Int64(base_k),
+                                )
+                                _cp_async_load_128b(smem_addr, gmem_addr)
                         cute.arch.cp_async_commit_group()
 
                     num_stage_iters = (num_index_sets + self.bdy - 1) // self.bdy
@@ -559,6 +641,7 @@ class PagedPersistentMergeKernel:
                             vec_size=self.vec_size,
                             bdx=self.bdx,
                             bdy=self.bdy,
+                            bytes_per_vec=bytes_per_vec,
                             num_smem_stages=self.num_smem_stages,
                             s_stage_partial=s_stage_partial,
                             s_stage_lse=s_stage_lse,
@@ -581,6 +664,7 @@ class PagedPersistentMergeKernel:
                             vec_size=self.vec_size,
                             bdx=self.bdx,
                             bdy=self.bdy,
+                            bytes_per_vec=bytes_per_vec,
                             num_smem_stages=self.num_smem_stages,
                             s_stage_partial=s_stage_partial,
                             s_stage_lse=s_stage_lse,
@@ -603,6 +687,7 @@ class PagedPersistentMergeKernel:
                             vec_size=self.vec_size,
                             bdx=self.bdx,
                             bdy=self.bdy,
+                            bytes_per_vec=bytes_per_vec,
                             num_smem_stages=self.num_smem_stages,
                             s_stage_partial=s_stage_partial,
                             s_stage_lse=s_stage_lse,
@@ -625,6 +710,7 @@ class PagedPersistentMergeKernel:
                             vec_size=self.vec_size,
                             bdx=self.bdx,
                             bdy=self.bdy,
+                            bytes_per_vec=bytes_per_vec,
                             num_smem_stages=self.num_smem_stages,
                             s_stage_partial=s_stage_partial,
                             s_stage_lse=s_stage_lse,
@@ -669,8 +755,20 @@ class PagedPersistentMergeKernel:
                     bdy=self.bdy,
                 )
                 _state_normalize(state_o, state_d)
-                for vec_idx in cutlass.range_constexpr(self.vec_size):
-                    mO[row_idx, head_idx, base_k + vec_idx] = state_o[vec_idx].to(self.dtype)
+                if const_expr(self.dtype is cutlass.BFloat16 and self.vec_size == 4):
+                    _st_global_v2_u32(
+                        get_ptr_as_int64(
+                            mO,
+                            (Int64(row_idx) * Int64(num_heads) + Int64(head_idx))
+                            * Int64(head_dim)
+                            + Int64(base_k),
+                        ),
+                        pack_f32x2_to_bfloat2(state_o[0], state_o[1]),
+                        pack_f32x2_to_bfloat2(state_o[2], state_o[3]),
+                    )
+                else:
+                    for vec_idx in cutlass.range_constexpr(self.vec_size):
+                        mO[row_idx, head_idx, base_k + vec_idx] = state_o[vec_idx].to(self.dtype)
                 if tx == 0 and ty == 0:
                     mLSE[head_idx, row_idx] = _state_get_lse_base2(state_m, state_d)
             if const_expr(self.direct_grid):

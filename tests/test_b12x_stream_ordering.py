@@ -71,7 +71,6 @@ def _run_b12x(
         topk_weights=topk_weights,
         topk_ids=topk_ids,
         workspace=workspace,
-        input_scales_are_reciprocal=True,
     )
 
 

@@ -51,12 +51,26 @@ class _FakePool:
         page_indices: torch.Tensor,
         seq_len_sum: int,
         max_seq_len: int,
+        k_out: torch.Tensor | None = None,
+        s_out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         del layer_id, max_seq_len
         page_size = self.page_size
         data_bytes = page_size * 128
-        k_bytes = torch.empty((seq_len_sum, 128), dtype=torch.uint8, device=self._index_k_cache.device)
-        scale_bytes = torch.empty((seq_len_sum, 4), dtype=torch.uint8, device=self._index_k_cache.device)
+        k_bytes = (
+            k_out[:seq_len_sum]
+            if k_out is not None
+            else torch.empty(
+                (seq_len_sum, 128), dtype=torch.uint8, device=self._index_k_cache.device
+            )
+        )
+        scale_bytes = (
+            s_out[:seq_len_sum]
+            if s_out is not None
+            else torch.empty(
+                (seq_len_sum, 4), dtype=torch.uint8, device=self._index_k_cache.device
+            )
+        )
         write_row = 0
         for batch_row in range(page_indices.shape[0]):
             seq_len = int(seq_len_tensor[batch_row].item())
@@ -96,11 +110,65 @@ class _FakeExtendMode:
     def is_extend_without_speculative(self) -> bool:
         return True
 
+    def is_target_verify(self) -> bool:
+        return False
+
+    def is_draft_extend(self, include_v2: bool = False) -> bool:
+        del include_v2
+        return False
+
 
 class _FakeAttnBackend:
-    def __init__(self, *, impl_name: str) -> None:
+    def __init__(
+        self,
+        *,
+        impl_name: str,
+        device: torch.device,
+        topk: int,
+        num_heads: int,
+        v_head_dim: int = 512,
+    ) -> None:
         self.nsa_decode_impl = impl_name
         self.nsa_prefill_impl = impl_name
+        self.device = device
+        self.topk = int(topk)
+        self.num_heads = int(num_heads)
+        self.model_v_head_dim = int(v_head_dim)
+        self._workspaces: dict[tuple[str, torch.device], object] = {}
+
+    def _get_b12x_workspace(self, *, mode: str, v_head_dim: int):
+        from b12x.integration.mla import B12XAttentionWorkspace
+
+        normalized_mode = "verify" if mode == "target_verify" else mode
+        key = (normalized_mode, self.device)
+        workspace = self._workspaces.get(key)
+        if workspace is not None:
+            return workspace
+        max_total_q = 64 if normalized_mode != "decode" else 32
+        workspace = B12XAttentionWorkspace.for_fixed_capacity(
+            mode=normalized_mode,
+            device=self.device,
+            dtype=torch.bfloat16,
+            kv_dtype=torch.uint8,
+            num_q_heads=self.num_heads,
+            indexer_num_q_heads=self.num_heads,
+            head_dim=576,
+            v_head_dim=int(v_head_dim),
+            topk=self.topk,
+            max_page_table_width=max(self.topk, 1),
+            max_total_q=max_total_q,
+            max_batch=32,
+            max_paged_q_rows=32 if normalized_mode == "decode" else max_total_q,
+            max_kv_rows=4096 if normalized_mode != "decode" else 0,
+            page_size=64,
+            use_cuda_graph=True,
+        )
+        self._workspaces[key] = workspace
+        return workspace
+
+    def get_b12x_indexer_paged_workspace(self, *, forward_batch):
+        del forward_batch
+        return self._get_b12x_workspace(mode="decode", v_head_dim=self.model_v_head_dim)
 
 
 class _FakePagedMetadata:
@@ -142,7 +210,9 @@ class _FakePagedMetadata:
         gather_k = min(topk, logits.shape[1], self._page_table_1.shape[1])
         if gather_k == 0:
             return output
-        topk_pos = torch.argsort(logits, dim=1, descending=True, stable=True)[:, :gather_k]
+        topk_pos = torch.argsort(logits, dim=1, descending=True, stable=True)[
+            :, :gather_k
+        ]
         topk_values = torch.gather(logits, 1, topk_pos)
         gathered = torch.gather(self._page_table_1[:rows], 1, topk_pos.to(torch.long))
         output[:, :gather_k] = torch.where(
@@ -174,7 +244,9 @@ class _FakeRaggedMetadata:
         self._k_start = k_start
         self._k_end = k_end
         self._token_to_batch_idx = token_to_batch_idx
-        self.attn_metadata = type("_FakeAttnMetadata", (), {"topk_indices_offset": None})()
+        self.attn_metadata = type(
+            "_FakeAttnMetadata", (), {"topk_indices_offset": None}
+        )()
 
     def get_page_table_1(self) -> torch.Tensor:
         return self._page_table_1
@@ -197,6 +269,12 @@ class _FakeRaggedMetadata:
     def get_indexer_seq_len_cpu(self) -> torch.Tensor:
         return self._indexer_seq_lens.cpu()
 
+    def get_indexer_seq_lens_sum(self) -> int:
+        return int(self._indexer_seq_lens.sum().item())
+
+    def get_indexer_max_seq_len(self) -> int:
+        return int(self._indexer_seq_lens.max().item())
+
     def get_token_to_batch_idx(self) -> torch.Tensor:
         return self._token_to_batch_idx
 
@@ -213,17 +291,29 @@ class _FakeRaggedMetadata:
         del cu_seqlens_q, batch_idx_list, topk_indices_offset_override
         if ks is None:
             raise RuntimeError("ragged topk_transform requires ks")
-        lengths = ke_offset if ke_offset is not None else self._seqlens_expanded[: logits.shape[0]]
-        output = torch.full((logits.shape[0], topk), -1, dtype=torch.int32, device=logits.device)
+        lengths = (
+            ke_offset
+            if ke_offset is not None
+            else self._seqlens_expanded[: logits.shape[0]]
+        )
+        output = torch.full(
+            (logits.shape[0], topk), -1, dtype=torch.int32, device=logits.device
+        )
         gather_k = min(topk, logits.shape[1])
         if gather_k == 0:
             return output
-        positions = torch.arange(logits.shape[1], device=logits.device, dtype=torch.int32).unsqueeze(0)
+        positions = torch.arange(
+            logits.shape[1], device=logits.device, dtype=torch.int32
+        ).unsqueeze(0)
         row_start = ks.unsqueeze(1)
         row_end = row_start + lengths.unsqueeze(1)
         valid = (positions >= row_start) & (positions < row_end)
-        masked_logits = torch.where(valid, logits, torch.full_like(logits, float("-inf")))
-        topk_pos = torch.argsort(masked_logits, dim=1, descending=True, stable=True)[:, :gather_k]
+        masked_logits = torch.where(
+            valid, logits, torch.full_like(logits, float("-inf"))
+        )
+        topk_pos = torch.argsort(masked_logits, dim=1, descending=True, stable=True)[
+            :, :gather_k
+        ]
         topk_values = torch.gather(masked_logits, 1, topk_pos)
         output[:, :gather_k] = torch.where(
             torch.isfinite(topk_values),
@@ -271,9 +361,15 @@ def _make_paged_candidate_tables(
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     rows = len(seqlens)
-    page_table_1 = torch.full((rows, width_blocks * 64), -1, dtype=torch.int32, device=device)
-    real_page_table = torch.full((rows, width_blocks), -1, dtype=torch.int32, device=device)
-    for row_idx, (page_start, seq_len) in enumerate(zip(page_starts, seqlens, strict=True)):
+    page_table_1 = torch.full(
+        (rows, width_blocks * 64), -1, dtype=torch.int32, device=device
+    )
+    real_page_table = torch.full(
+        (rows, width_blocks), -1, dtype=torch.int32, device=device
+    )
+    for row_idx, (page_start, seq_len) in enumerate(
+        zip(page_starts, seqlens, strict=True)
+    ):
         block_count = (int(seq_len) + 63) // 64
         if block_count == 0:
             continue
@@ -327,7 +423,12 @@ def test_sglang_b12x_nsa_indexer_paged_boundary_matches_b12x_reference() -> None
         {
             "forward_mode": _FakeDecodeMode(),
             "token_to_kv_pool": _FakePool(index_k_cache),
-            "attn_backend": _FakeAttnBackend(impl_name=_get_b12x_impl_name(module)),
+            "attn_backend": _FakeAttnBackend(
+                impl_name=_get_b12x_impl_name(module),
+                device=torch.device("cpu"),
+                topk=topk,
+                num_heads=num_heads,
+            ),
             "seq_lens": seqlens,
         },
     )()
@@ -396,7 +497,12 @@ def test_sglang_b12x_nsa_indexer_paged_boundary_respects_active_decode_rows() ->
         {
             "forward_mode": _FakeDecodeMode(),
             "token_to_kv_pool": _FakePool(index_k_cache),
-            "attn_backend": _FakeAttnBackend(impl_name=_get_b12x_impl_name(module)),
+            "attn_backend": _FakeAttnBackend(
+                impl_name=_get_b12x_impl_name(module),
+                device=torch.device("cpu"),
+                topk=topk,
+                num_heads=num_heads,
+            ),
             "seq_lens": seqlens,
         },
     )()
@@ -467,7 +573,12 @@ def test_sglang_b12x_nsa_indexer_ragged_boundary_matches_b12x_reference() -> Non
         {
             "forward_mode": _FakeExtendMode(),
             "token_to_kv_pool": _FakePool(index_k_cache),
-            "attn_backend": _FakeAttnBackend(impl_name=_get_b12x_impl_name(module)),
+            "attn_backend": _FakeAttnBackend(
+                impl_name=_get_b12x_impl_name(module),
+                device=torch.device("cpu"),
+                topk=topk,
+                num_heads=num_heads,
+            ),
             "seq_lens": seq_lens,
         },
     )()
@@ -491,12 +602,14 @@ def test_sglang_b12x_nsa_indexer_ragged_boundary_matches_b12x_reference() -> Non
         weights,
         metadata,
     )
-    k_fp8_bytes, k_scale_bytes = fake_forward_batch.token_to_kv_pool.get_index_k_scale_buffer(
-        0,
-        seq_lens,
-        real_page_table,
-        int(seq_lens.sum().item()),
-        int(seq_lens.max().item()),
+    k_fp8_bytes, k_scale_bytes = (
+        fake_forward_batch.token_to_kv_pool.get_index_k_scale_buffer(
+            0,
+            seq_lens,
+            real_page_table,
+            int(seq_lens.sum().item()),
+            int(seq_lens.max().item()),
+        )
     )
     kv_fp8 = (
         k_fp8_bytes.view(torch.float8_e4m3fn),
@@ -518,7 +631,9 @@ def test_sglang_b12x_nsa_indexer_ragged_boundary_matches_b12x_reference() -> Non
     assert torch.equal(actual, padded_expected)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture coverage")
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA required for graph capture coverage"
+)
 def test_sglang_b12x_nsa_indexer_paged_boundary_cuda_graph_capture() -> None:
     module = _import_sglang_nsa_indexer()
     device = torch.device("cuda")
@@ -535,12 +650,20 @@ def test_sglang_b12x_nsa_indexer_paged_boundary_cuda_graph_capture() -> None:
     active_rows = 3
 
     index_k_cache = pack_nsa_index_k_cache_reference(
-        torch.randn((num_tokens, 128), generator=gen, dtype=torch.float32).to(device=device) / 3
+        torch.randn((num_tokens, 128), generator=gen, dtype=torch.float32).to(
+            device=device
+        )
+        / 3
     )
     q_fp8 = (
-        torch.randn((q_rows, num_heads, 128), generator=gen, dtype=torch.float32).to(device=device) / 2
+        torch.randn((q_rows, num_heads, 128), generator=gen, dtype=torch.float32).to(
+            device=device
+        )
+        / 2
     ).to(torch.float8_e4m3fn)
-    weights = torch.randn((q_rows, num_heads, 1), generator=gen, dtype=torch.float32).to(device=device)
+    weights = torch.randn(
+        (q_rows, num_heads, 1), generator=gen, dtype=torch.float32
+    ).to(device=device)
     page_table_1, real_page_table = _make_paged_candidate_tables(
         page_starts=page_starts,
         seqlens=seqlens.tolist(),
@@ -555,7 +678,12 @@ def test_sglang_b12x_nsa_indexer_paged_boundary_cuda_graph_capture() -> None:
         {
             "forward_mode": _FakeDecodeMode(),
             "token_to_kv_pool": _FakePool(index_k_cache),
-            "attn_backend": _FakeAttnBackend(impl_name=_get_b12x_impl_name(module)),
+            "attn_backend": _FakeAttnBackend(
+                impl_name=_get_b12x_impl_name(module),
+                device=device,
+                topk=topk,
+                num_heads=num_heads,
+            ),
             "seq_lens": seqlens,
         },
     )()

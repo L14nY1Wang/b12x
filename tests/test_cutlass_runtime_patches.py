@@ -1,21 +1,31 @@
 from __future__ import annotations
 
+import ctypes
+import inspect
 import warnings
 
-import b12x
+import b12x  # noqa: F401 - importing b12x applies the runtime patches under test.
+import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass.base_dsl.dsl import BaseDSL
+from cutlass.base_dsl.jit_executor import ExecutionArgs
+from cutlass.cute.nvgpu.warp import mma
 
 import b12x.cute.runtime_patches as runtime_patches
-from b12x.cute.runtime_patches import _build_compile_disk_cache_key, _structural_cache_key
+from b12x.cute.runtime_patches import (
+    _build_compile_disk_cache_key,
+    _structural_cache_key,
+)
 from b12x.cute.utils import make_ptr
 
 
 def test_compile_only_cache_warning_is_suppressed() -> None:
     with warnings.catch_warnings(record=True) as captured:
         warnings.simplefilter("always")
-        BaseDSL.print_warning(object(), "Cache is disabled as user wants to compile only.")
+        BaseDSL.print_warning(
+            object(), "Cache is disabled as user wants to compile only."
+        )
 
     assert captured == []
 
@@ -27,6 +37,27 @@ def test_other_cutlass_warnings_still_emit() -> None:
 
     assert len(captured) == 1
     assert str(captured[0].message) == "some other warning"
+
+
+def test_cutlass_45_provides_sm121a_blockscaled_mma() -> None:
+    archs = {str(arch) for arch in mma.MmaSM120BlockScaledOp.admissible_archs}
+
+    assert "sm_121a" in archs
+    assert not hasattr(mma.MmaSM120BlockScaledOp, "_b12x_sm121a_patch")
+
+
+def test_cutlass_45_adapts_cuda_stream_handles() -> None:
+    def kernel(stream: cuda.CUstream) -> None:
+        pass
+
+    stream = cuda.CUstream(123)
+    execution_args = ExecutionArgs(inspect.signature(kernel), kernel.__name__)
+    exe_args, adapted_args = execution_args.generate_execution_args((stream,), {})
+
+    assert len(adapted_args) == 1
+    assert exe_args == [stream.getPtr()]
+    stream_handle = ctypes.cast(exe_args[0], ctypes.POINTER(ctypes.c_void_p)).contents
+    assert stream_handle.value == 123
 
 
 def test_b12x_pointer_cache_key_is_structural() -> None:
@@ -89,7 +120,7 @@ def test_compile_disk_cache_key_changes_with_toolchain_key(monkeypatch) -> None:
     monkeypatch.setattr(
         runtime_patches,
         "_runtime_toolchain_key",
-        lambda: (("cutlass_dsl", "4.4.1"),),
+        lambda: (("cutlass_dsl", "4.5.0"),),
     )
     key_a = _build_compile_disk_cache_key(
         compile_callable,
@@ -101,7 +132,7 @@ def test_compile_disk_cache_key_changes_with_toolchain_key(monkeypatch) -> None:
     monkeypatch.setattr(
         runtime_patches,
         "_runtime_toolchain_key",
-        lambda: (("cutlass_dsl", "4.4.2"),),
+        lambda: (("cutlass_dsl", "4.5.1"),),
     )
     key_b = _build_compile_disk_cache_key(
         compile_callable,
@@ -137,7 +168,12 @@ def test_structural_cache_key_handles_symbolic_fake_compact_tensor_dims() -> Non
     key = _structural_cache_key(fake)
 
     assert key[0] == "fake_compact_tensor"
-    assert key[2][0] == ("symbolic_dim", FakeSymInt.__module__, FakeSymInt.__qualname__, "s0")
+    assert key[2][0] == (
+        "symbolic_dim",
+        FakeSymInt.__module__,
+        FakeSymInt.__qualname__,
+        "s0",
+    )
 
 
 def test_structural_cache_key_distinguishes_unnamed_cutlass_symbolic_dims() -> None:

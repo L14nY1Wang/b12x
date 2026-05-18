@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
 from b12x.cute.fp4 import fp4_quantize_values_torch
 
 
@@ -34,17 +33,26 @@ class MoERouteTrace:
     int_dequant: torch.Tensor
     down_out: torch.Tensor
     routed_out: torch.Tensor
+    routed_out_accum: torch.Tensor
 
 
 def compare_to_reference(actual: torch.Tensor, reference: torch.Tensor) -> OracleMetrics:
     actual_fp32 = actual.float()
     reference_fp32 = reference.float()
     diff = actual_fp32 - reference_fp32
-    cos = F.cosine_similarity(
-        actual_fp32.reshape(actual_fp32.shape[0], -1),
-        reference_fp32.reshape(reference_fp32.shape[0], -1),
-        dim=1,
-    ).mean().item()
+    actual_rows = actual_fp32.reshape(actual_fp32.shape[0], -1)
+    reference_rows = reference_fp32.reshape(reference_fp32.shape[0], -1)
+    dot = (actual_rows * reference_rows).sum(dim=1)
+    actual_norm = actual_rows.norm(dim=1)
+    reference_norm = reference_rows.norm(dim=1)
+    denom = actual_norm * reference_norm
+    both_zero = (actual_norm <= 1e-12) & (reference_norm <= 1e-12)
+    cos_rows = torch.where(
+        both_zero,
+        torch.ones_like(dot),
+        torch.where(denom > 1e-24, dot / denom, torch.zeros_like(dot)),
+    )
+    cos = cos_rows.mean().item()
     return OracleMetrics(
         max_abs=diff.abs().max().item(),
         rmse=diff.square().mean().sqrt().item(),
@@ -126,10 +134,10 @@ def _quantize_vec_to_fp4_dequant(
     blocked = vals_f32.reshape(n_blocks, block_size)
     block_max = blocked.abs().amax(dim=-1)
 
-    raw_scale = (block_max / (6.0 * global_scale)).clamp(max=fp8_e4m3_max)
+    raw_scale = (block_max * global_scale / 6.0).clamp(max=fp8_e4m3_max)
     sf_e4m3 = raw_scale.to(torch.float8_e4m3fn).to(torch.float32)
 
-    sf_times_gs = sf_e4m3.unsqueeze(-1).expand(n_blocks, block_size).reshape(cols) * global_scale
+    sf_times_gs = sf_e4m3.unsqueeze(-1).expand(n_blocks, block_size).reshape(cols) / global_scale
     scaled = vals_f32 / sf_times_gs.clamp(min=1e-30)
     quant = fp4_quantize_values_torch(scaled)
     sf_only = sf_e4m3.unsqueeze(-1).expand(n_blocks, block_size).reshape(cols)
@@ -215,8 +223,10 @@ def _trace_nvfp4_route(
         I_tp,
         block_size=block_size,
     )
-    down_out = ((down_dequant @ int_dequant) * alpha_fc2).to(torch.bfloat16)
+    down_out_f32 = (down_dequant @ int_dequant) * alpha_fc2
+    down_out = down_out_f32.to(torch.bfloat16)
     routed_out = (router_weight * down_out.float()).to(torch.bfloat16)
+    routed_out_accum = down_out_f32 * router_weight
     return MoERouteTrace(
         token_idx=token_idx,
         route_idx=route_idx,
@@ -235,6 +245,7 @@ def _trace_nvfp4_route(
         int_dequant=int_dequant,
         down_out=down_out,
         routed_out=routed_out,
+        routed_out_accum=routed_out_accum,
     )
 
 
@@ -340,10 +351,10 @@ def moe_reference_f32(
         blocked = vals_f32.reshape(n_blocks, block_size)
         block_max = blocked.abs().amax(dim=-1)
 
-        raw_scale = (block_max / (6.0 * global_scale)).clamp(max=fp8_e4m3_max)
+        raw_scale = (block_max * global_scale / 6.0).clamp(max=fp8_e4m3_max)
         sf_e4m3 = raw_scale.to(torch.float8_e4m3fn).to(torch.float32)
 
-        sf_times_gs = sf_e4m3.unsqueeze(-1).expand(n_blocks, block_size).reshape(cols) * global_scale
+        sf_times_gs = sf_e4m3.unsqueeze(-1).expand(n_blocks, block_size).reshape(cols) / global_scale
         scaled = vals_f32 / sf_times_gs.clamp(min=1e-30)
         quant = fp4_quantize_values_torch(scaled)
         sf_only = sf_e4m3.unsqueeze(-1).expand(n_blocks, block_size).reshape(cols)
@@ -419,8 +430,7 @@ def moe_reference_nvfp4(
     _validate_reference_inputs(w1_fp4, I_tp, activation)
     m = x.shape[0]
     top_k = topk_ids.shape[1]
-    output = torch.zeros(m, K, dtype=torch.bfloat16, device=x.device)
-    contribs: list[list[tuple[int, torch.Tensor]]] = [[] for _ in range(E)]
+    output = torch.zeros(m, K, dtype=torch.float32, device=x.device)
 
     for t in range(m):
         for k_idx in range(top_k):
@@ -445,10 +455,6 @@ def moe_reference_nvfp4(
                 activation=activation,
             )
             assert trace.expert_idx == eid
-            contribs[eid].append((t, trace.routed_out))
+            output[t] += trace.routed_out_accum
 
-    for eid in range(E):
-        for t, contrib in contribs[eid]:
-            output[t] = (output[t].float() + contrib.float()).to(torch.bfloat16)
-
-    return output
+    return output.to(torch.bfloat16)
