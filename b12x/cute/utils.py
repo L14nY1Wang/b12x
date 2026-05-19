@@ -28,19 +28,19 @@ from cutlass._mlir import ir
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.cute.typing import AddressSpace, Numeric, Pointer, Type
 
-
+# 上取整除法
 def ceil_div(a: int, b: int) -> int:
     """Ceiling division."""
     return (a + b - 1) // b
 
-
+# 检查 CuTe DSL 是否可用（即 cutlass 和 cutlass.cute 模块是否存在）
 def is_cute_dsl_available() -> bool:
     return (
         importlib.util.find_spec("cutlass") is not None
         and importlib.util.find_spec("cutlass.cute") is not None
     )
 
-
+# 获取 CuTe DSL 对应的数据类型
 def get_cutlass_dtype(dtype: str) -> cutlass.dtype:
     dtype_map = {
         "float16": cutlass.Float16,
@@ -53,7 +53,7 @@ def get_cutlass_dtype(dtype: str) -> cutlass.dtype:
     }
     return dtype_map[dtype]
 
-
+# 获取 torch 对应的数据类型
 def cutlass_to_torch_dtype(cutlass_dtype):
     """
     Return the corresponding torch.dtype per the given DSL type
@@ -77,23 +77,24 @@ def cutlass_to_torch_dtype(cutlass_dtype):
         raise TypeError(f"{cutlass_dtype} is not supported by torch")
     return torch_dtype
 
-
+# 获取设备的 SM 数量，并缓存结果以避免重复查询
 @functools.cache
 def get_num_sm(device: torch.device) -> int:
     # get the compute capability of the device, which would be cached
     return torch.cuda.get_device_properties(device).multi_processor_count
 
-
+# 获取当前 CUDA 流的驱动级别句柄
 @torch._dynamo.disable
 def current_cuda_stream() -> cuda.CUstream:
     """Return the current Torch CUDA stream as a CUDA driver stream handle."""
     return cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
 
-# Cache for HardwareInfo - it's expensive to create on every call
+# todo 这里可以尝试改为funtools.cache
+# 缓存硬件信息 “”用来延迟解析
 _hardware_info_cache: "cutlass.utils.HardwareInfo | None" = None
 
-
+# 获取硬件信息，并缓存结果以避免重复查询
 def get_hardware_info() -> "cutlass.utils.HardwareInfo":
     """Get cached HardwareInfo singleton.
 
@@ -105,7 +106,7 @@ def get_hardware_info() -> "cutlass.utils.HardwareInfo":
         _hardware_info_cache = cutlass.utils.HardwareInfo()
     return _hardware_info_cache
 
-
+# 获取给定 cluster size 的最大活跃 cluster 数量，并缓存结果以避免重复查询
 @functools.cache
 def get_max_active_clusters(cluster_size: int) -> int:
     """Get max active clusters for a given cluster size (cached).
@@ -119,7 +120,7 @@ def get_max_active_clusters(cluster_size: int) -> int:
     return get_hardware_info().get_max_active_clusters(cluster_size)
 
 
-# Compatibility wrapper around CuTe DSL runtime pointers.
+# CuTe DSL 运行时指针的兼容性封装
 class _Pointer(Pointer):
     """Runtime representation of a pointer that can inter-operate with
     various data structures, including numpy arrays and device memory.
@@ -146,7 +147,7 @@ class _Pointer(Pointer):
         pointer,
         dtype,
         mem_space: _cute_ir.AddressSpace = _cute_ir.AddressSpace.generic,
-        assumed_align=None,
+        assumed_align=None, #强制对齐
     ):
         self._pointer = pointer
         self._dtype = dtype
@@ -215,7 +216,7 @@ class _Pointer(Pointer):
     def __repr__(self):
         return self.__str__()
 
-
+# 创建指针
 def make_ptr(
     dtype: Type[Numeric],
     value: Union[int, ctypes._Pointer],
