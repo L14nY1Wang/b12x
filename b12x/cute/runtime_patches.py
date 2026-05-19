@@ -21,11 +21,11 @@ def _cute_compile_disk_cache_enabled() -> bool:
     raw = os.environ.get("B12X_CUTE_COMPILE_DISK_CACHE", "1")
     return raw.lower() not in {"0", "false", "no", ""}
 
-
+# 解析编译缓存目录
 def _cute_compile_cache_dir() -> Path:
     root = os.environ.get("B12X_CUTE_COMPILE_CACHE_DIR")
     if root:
-        return Path(root)
+        return Path(root) 
     cute_cache_dir = os.environ.get("CUTE_DSL_CACHE_DIR")
     if cute_cache_dir:
         return Path(cute_cache_dir) / "b12x_object_cache"
@@ -477,7 +477,7 @@ def _store_cute_compile_to_disk(cache_key: str, compiled: Any) -> None:
         f.write(object_bytes)
     os.replace(tmp_path, object_path)
 
-
+# 运行时补丁 - 主要是为了给 cutlass dsl 的编译过程添加磁盘缓存功能，以及屏蔽特定的警告信息
 def apply_cutlass_runtime_patches() -> None:
     global _PATCHED
     if _PATCHED:
