@@ -51,11 +51,6 @@ class MLASparseExtendMetadata:
     max_seq_len_k: int
     mode: Literal["extend", "verify", "target_verify", "draft_extend"] = "extend"
 
-    @property
-    def page_table_1(self) -> torch.Tensor:
-        # Compatibility alias for existing internal callers/tests during migration.
-        return self.selected_token_offsets
-
 
 def clear_mla_caches() -> None:
     """Clear any cached MLA runtime state."""
@@ -121,117 +116,87 @@ def sparse_mla_decode_forward(
     *,
     q_all: torch.Tensor,
     kv_cache: torch.Tensor,
-    metadata: MLASparseDecodeMetadata,
+    page_table_1: torch.Tensor,
+    cache_seqlens_int32: torch.Tensor,
+    nsa_cache_seqlens_int32: torch.Tensor,
     workspace: B12XAttentionWorkspace,
     sm_scale: float,
     v_head_dim: int,
-) -> torch.Tensor:
-    workspace.prepare_decode(
-        metadata.page_table_1,
-        metadata.cache_seqlens_int32,
-        metadata.nsa_cache_seqlens_int32,
-    )
+    return_lse: bool = False,
+    lse_scale: Literal["base2", "natural"] = "base2",
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     return _run_sparse_mla(
         q_all=q_all,
         kv_cache=kv_cache,
+        selected_indices=page_table_1,
+        cache_seqlens_int32=cache_seqlens_int32,
+        active_token_counts=nsa_cache_seqlens_int32,
         workspace=workspace,
         sm_scale=sm_scale,
         v_head_dim=v_head_dim,
+        return_lse=return_lse,
+        lse_scale=lse_scale,
     )
-
-
-def sparse_mla_decode_forward_with_lse(
-    *,
-    q_all: torch.Tensor,
-    kv_cache: torch.Tensor,
-    metadata: MLASparseDecodeMetadata,
-    workspace: B12XAttentionWorkspace,
-    sm_scale: float,
-    v_head_dim: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    workspace.prepare_decode(
-        metadata.page_table_1,
-        metadata.cache_seqlens_int32,
-        metadata.nsa_cache_seqlens_int32,
-    )
-    output, lse_base2 = _run_sparse_mla(
-        q_all=q_all,
-        kv_cache=kv_cache,
-        workspace=workspace,
-        sm_scale=sm_scale,
-        v_head_dim=v_head_dim,
-        return_lse=True,
-    )
-    return output, lse_base2
 
 
 def sparse_mla_extend_forward(
     *,
     q_all: torch.Tensor,
     kv_cache: torch.Tensor,
-    metadata: MLASparseExtendMetadata,
+    selected_token_offsets: torch.Tensor,
+    cache_seqlens_int32: torch.Tensor,
+    nsa_cache_seqlens_int32: torch.Tensor,
     workspace: B12XAttentionWorkspace,
     sm_scale: float,
     v_head_dim: int,
-) -> torch.Tensor:
-    workspace.prepare_extend(
-        metadata.selected_token_offsets,
-        metadata.cache_seqlens_int32,
-        metadata.nsa_cache_seqlens_int32,
-    )
+    return_lse: bool = False,
+    lse_scale: Literal["base2", "natural"] = "base2",
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     return _run_sparse_mla(
         q_all=q_all,
         kv_cache=kv_cache,
+        selected_indices=selected_token_offsets,
+        cache_seqlens_int32=cache_seqlens_int32,
+        active_token_counts=nsa_cache_seqlens_int32,
         workspace=workspace,
         sm_scale=sm_scale,
         v_head_dim=v_head_dim,
+        return_lse=return_lse,
+        lse_scale=lse_scale,
     )
-
-
-def sparse_mla_extend_forward_with_lse(
-    *,
-    q_all: torch.Tensor,
-    kv_cache: torch.Tensor,
-    metadata: MLASparseExtendMetadata,
-    workspace: B12XAttentionWorkspace,
-    sm_scale: float,
-    v_head_dim: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    workspace.prepare_extend(
-        metadata.selected_token_offsets,
-        metadata.cache_seqlens_int32,
-        metadata.nsa_cache_seqlens_int32,
-    )
-    output, lse_base2 = _run_sparse_mla(
-        q_all=q_all,
-        kv_cache=kv_cache,
-        workspace=workspace,
-        sm_scale=sm_scale,
-        v_head_dim=v_head_dim,
-        return_lse=True,
-    )
-    return output, lse_base2
 
 
 def _run_sparse_mla(
     *,
     q_all: torch.Tensor,
     kv_cache: torch.Tensor,
+    selected_indices: torch.Tensor,
+    cache_seqlens_int32: torch.Tensor,
+    active_token_counts: torch.Tensor,
     workspace: B12XAttentionWorkspace,
     sm_scale: float,
     v_head_dim: int,
     return_lse: bool = False,
+    lse_scale: Literal["base2", "natural"] = "base2",
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    selected_indices = workspace.page_table_1
-    active_token_counts = workspace.nsa_cache_seqlens_int32
-    if selected_indices is None:
-        raise RuntimeError("workspace selected-index metadata is not prepared")
-    if active_token_counts is None:
-        raise RuntimeError("workspace active token counts are not prepared")
     if q_all.ndim != 3:
         raise ValueError(f"q_all must be rank-3, got {tuple(q_all.shape)}")
     if kv_cache.ndim != 3:
         raise ValueError(f"kv_cache must be rank-3, got {tuple(kv_cache.shape)}")
+    if selected_indices.ndim != 2:
+        raise ValueError(
+            f"selected indices must be rank-2, got {tuple(selected_indices.shape)}"
+        )
+    if cache_seqlens_int32.ndim != 1:
+        raise ValueError(
+            "cache_seqlens_int32 must be rank-1, "
+            f"got {tuple(cache_seqlens_int32.shape)}"
+        )
+    if active_token_counts.ndim != 1:
+        raise ValueError(
+            "nsa_cache_seqlens_int32 must be rank-1, "
+            f"got {tuple(active_token_counts.shape)}"
+        )
     if q_all.device != workspace.device:
         raise ValueError(
             f"q_all device {q_all.device} does not match workspace device {workspace.device}"
@@ -245,6 +210,16 @@ def _run_sparse_mla(
             "selected indices device "
             f"{selected_indices.device} does not match workspace device {workspace.device}"
         )
+    if cache_seqlens_int32.device != workspace.device:
+        raise ValueError(
+            "cache_seqlens_int32 device "
+            f"{cache_seqlens_int32.device} does not match workspace device {workspace.device}"
+        )
+    if active_token_counts.device != workspace.device:
+        raise ValueError(
+            "nsa_cache_seqlens_int32 device "
+            f"{active_token_counts.device} does not match workspace device {workspace.device}"
+        )
     if q_all.dtype != workspace.dtype:
         raise ValueError(
             f"q_all dtype {q_all.dtype} does not match workspace dtype {workspace.dtype}"
@@ -257,6 +232,16 @@ def _run_sparse_mla(
         raise ValueError(
             f"selected indices must have dtype torch.int32, got {selected_indices.dtype}"
         )
+    if cache_seqlens_int32.dtype != torch.int32:
+        raise ValueError(
+            "cache_seqlens_int32 must have dtype torch.int32, "
+            f"got {cache_seqlens_int32.dtype}"
+        )
+    if active_token_counts.dtype != torch.int32:
+        raise ValueError(
+            "nsa_cache_seqlens_int32 must have dtype torch.int32, "
+            f"got {active_token_counts.dtype}"
+        )
     if int(v_head_dim) != workspace.v_head_dim:
         raise ValueError(
             f"v_head_dim {v_head_dim} does not match workspace v_head_dim {workspace.v_head_dim}"
@@ -268,6 +253,17 @@ def _run_sparse_mla(
     if q_all.shape[0] != selected_indices.shape[0]:
         raise ValueError(
             f"selected-index rows {selected_indices.shape[0]} do not match q_all rows {q_all.shape[0]}"
+        )
+    if selected_indices.shape[0] != active_token_counts.shape[0]:
+        raise ValueError(
+            "selected-index rows "
+            f"{selected_indices.shape[0]} do not match nsa_cache_seqlens_int32 rows "
+            f"{active_token_counts.shape[0]}"
+        )
+    if cache_seqlens_int32.shape[0] > workspace.max_batch:
+        raise ValueError(
+            "cache_seqlens_int32 batch "
+            f"{cache_seqlens_int32.shape[0]} exceeds workspace capacity {workspace.max_batch}"
         )
     if selected_indices.shape[1] > workspace.topk:
         raise ValueError(
@@ -373,11 +369,12 @@ def _run_sparse_mla(
             workspace=workspace,
         )
         if return_lse:
-            lse_base2 = _final_lse_base2_from_split_workspace(
+            lse = _final_lse_from_split_workspace(
                 workspace=workspace,
                 q_rows=int(q_all.shape[0]),
                 num_heads=int(q_all.shape[1]),
                 launch_num_chunks=int(launch_num_chunks),
+                scale=lse_scale,
             )
     elif supports_sparse_mla_kernel(
         q_all=q_all,
@@ -422,18 +419,21 @@ def _run_sparse_mla(
             reference_kwargs["return_lse"] = True
         output = sparse_mla_reference(**reference_kwargs)
         if return_lse:
-            output, lse_base2 = output
+            output, lse = output
+            if lse_scale == "natural":
+                lse = lse * _LN2
     if return_lse:
-        return output, lse_base2
+        return output, lse
     return output
 
 
-def _final_lse_base2_from_split_workspace(
+def _final_lse_from_split_workspace(
     *,
     workspace: B12XAttentionWorkspace,
     q_rows: int,
     num_heads: int,
     launch_num_chunks: int,
+    scale: Literal["base2", "natural"] = "base2",
 ) -> torch.Tensor:
     if workspace.tmp_lse is None:
         raise RuntimeError("workspace is missing split MLA LSE buffer")
@@ -441,7 +441,10 @@ def _final_lse_base2_from_split_workspace(
     chunk_lse_base2 = workspace.tmp_lse[:q_rows, :num_heads, :chunk_count].to(
         torch.float32
     )
-    return torch.logsumexp(chunk_lse_base2 * _LN2, dim=-1) / _LN2
+    lse_natural = torch.logsumexp(chunk_lse_base2 * _LN2, dim=-1)
+    if scale == "natural":
+        return lse_natural
+    return lse_natural / _LN2
 
 
 def _get_sm_scale_tensor(

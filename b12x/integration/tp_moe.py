@@ -962,7 +962,7 @@ def _finalize_workspace_views(workspace: TPMoEWorkspace) -> None:
     )
 
 
-def _prepare_workspace_for_launch(workspace: TPMoEWorkspace) -> None:
+def _reset_volatile_launch_state(workspace: TPMoEWorkspace) -> None:
     if not workspace.volatile_launch_state:
         return
     # Shared execution-lane arenas overlay MoE scratch with attention/indexer
@@ -3369,7 +3369,7 @@ def _launch_exact_relu2_bs1_nemotron(
         input_scales_static=input_scales_static,
     )
     assert isinstance(resolved, TPCompactStaticWorkspace)
-    _prepare_workspace_for_launch(resolved)
+    _reset_volatile_launch_state(resolved)
     launcher.compiled(
         a,
         flat_ids,
@@ -3440,7 +3440,7 @@ def _launch_dynamic(
         quant_mode=quant_mode,
         share_input_across_experts=share_input_across_experts,
     )
-    _prepare_workspace_for_launch(workspace)
+    _reset_volatile_launch_state(workspace)
     def _gptr(dtype, t, align=16):
         return make_ptr(
             dtype, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align
@@ -3554,7 +3554,7 @@ def _launch_compact_static(
             compiled,
             _DIRECT_MICRO_BLOCK_DIM,
         ):
-            _prepare_workspace_for_launch(workspace)
+            _reset_volatile_launch_state(workspace)
             micro_cls.launch(
                 compiled,
                 x=a,
@@ -3603,7 +3603,7 @@ def _launch_compact_static(
         quant_mode=quant_mode,
     )
     launch_ids = flat_ids
-    _prepare_workspace_for_launch(workspace)
+    _reset_volatile_launch_state(workspace)
     compiled(
         a,
         launch_ids,

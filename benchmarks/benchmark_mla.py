@@ -1066,7 +1066,9 @@ def _run_decode_case(
         return sparse_mla_decode_forward(
             q_all=q_all,
             kv_cache=kv_cache,
-            metadata=mla_metadata,
+            page_table_1=mla_metadata.page_table_1,
+            cache_seqlens_int32=mla_metadata.cache_seqlens_int32,
+            nsa_cache_seqlens_int32=mla_metadata.nsa_cache_seqlens_int32,
             workspace=mla_workspace,
             sm_scale=cfg.sm_scale,
             v_head_dim=cfg.kv_lora_rank,
@@ -1091,12 +1093,9 @@ def _run_decode_case(
         return sparse_mla_decode_forward(
             q_all=q_all,
             kv_cache=kv_cache,
-            metadata=MLASparseDecodeMetadata(
-                page_table_1=topk_indices,
-                cache_seqlens_int32=graph_cache_seqlens,
-                nsa_cache_seqlens_int32=graph_nsa_cache_seqlens,
-                max_seq_len_k=aligned_graph_width,
-            ),
+            page_table_1=topk_indices,
+            cache_seqlens_int32=graph_cache_seqlens,
+            nsa_cache_seqlens_int32=graph_nsa_cache_seqlens,
             workspace=mla_workspace,
             sm_scale=cfg.sm_scale,
             v_head_dim=cfg.kv_lora_rank,
@@ -1599,7 +1598,9 @@ def _run_prefill_or_verify_case(
         return sparse_mla_extend_forward(
             q_all=q_all,
             kv_cache=mla_kv_cache,
-            metadata=mla_metadata,
+            selected_token_offsets=mla_metadata.selected_token_offsets,
+            cache_seqlens_int32=mla_metadata.cache_seqlens_int32,
+            nsa_cache_seqlens_int32=mla_metadata.nsa_cache_seqlens_int32,
             workspace=mla_workspace,
             sm_scale=cfg.sm_scale,
             v_head_dim=cfg.kv_lora_rank,
@@ -1610,16 +1611,9 @@ def _run_prefill_or_verify_case(
         return sparse_mla_extend_forward(
             q_all=q_all,
             kv_cache=mla_kv_cache,
-            metadata=MLASparseExtendMetadata(
-                selected_token_offsets=topk_indices,
-                cache_seqlens_int32=graph_batch_cache_seqlens,
-                nsa_cache_seqlens_int32=graph_nsa_cache_seqlens,
-                nsa_cu_seqlens_q=cu_seqlens_q,
-                nsa_cu_seqlens_k=cu_seqlens_k,
-                max_seq_len_q=case.q_len,
-                max_seq_len_k=aligned_graph_width,
-                mode=mla_metadata_mode,
-            ),
+            selected_token_offsets=topk_indices,
+            cache_seqlens_int32=graph_batch_cache_seqlens,
+            nsa_cache_seqlens_int32=graph_nsa_cache_seqlens,
             workspace=mla_workspace,
             sm_scale=cfg.sm_scale,
             v_head_dim=cfg.kv_lora_rank,
@@ -1737,11 +1731,6 @@ def _run_prefill_or_verify_case(
 
         def prepare_mla_components() -> None:
             prepare_verify_graph()
-            mla_workspace.prepare_extend(
-                mla_selected_indices,
-                graph_batch_cache_seqlens,
-                graph_nsa_cache_seqlens,
-            )
             mla_workspace.set_split_chunk_config(
                 kv_chunk_size=split_cfg.chunk_size,
                 num_chunks=split_cfg.num_chunks,
