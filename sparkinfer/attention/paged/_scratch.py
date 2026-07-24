@@ -884,7 +884,7 @@ class SPARKINFERPagedAttentionScratch:
         cu_seqlens_q: torch.Tensor,
         active_total_q: int | None,
     ) -> None:
-        """Require the exact static decode bucket installed before capture."""
+        """Require metadata compatible with the static decode graph bucket."""
         if self._plan is None:
             raise RuntimeError("decode graph scratch has not been prepared")
         metadata = (page_table, cache_seqlens, cu_seqlens_q)
@@ -897,11 +897,27 @@ class SPARKINFERPagedAttentionScratch:
         expected_batch = int(self._plan.page_table_shape[0])
         expected_width = int(self._plan.page_table_shape[1])
         expected_total_q = int(self._plan.total_q)
-        if tuple(page_table.shape) != (expected_batch, expected_width):
+        if page_table.ndim != 2 or int(page_table.shape[0]) != expected_batch:
             raise ValueError(
-                "decode graph page_table must exactly match the prepared bucket: "
-                f"got {tuple(page_table.shape)}, expected "
-                f"({expected_batch}, {expected_width})"
+                "decode graph page_table must exactly match the prepared batch: "
+                f"got {tuple(page_table.shape)}, expected batch={expected_batch}"
+            )
+        runtime_width = int(page_table.shape[1])
+        if self.copy_runtime_metadata:
+            # The caller's table is copied into fixed-capacity scratch before
+            # capture/replay.  Its row stride therefore does not become part of
+            # the graph contract.  Hybrid-cache integrations can conservatively
+            # plan a wider capacity than the table vLLM ultimately allocates.
+            if not 0 < runtime_width <= expected_width:
+                raise ValueError(
+                    "decode graph page_table width must fit the prepared "
+                    f"capacity: got {runtime_width}, expected 1..{expected_width}"
+                )
+        elif runtime_width != expected_width:
+            # A referenced table's row stride is embedded in the kernel launch.
+            raise ValueError(
+                "decode graph referenced page_table must exactly match the "
+                f"prepared width: got {runtime_width}, expected {expected_width}"
             )
         if tuple(cache_seqlens.shape) != (expected_batch,):
             raise ValueError(

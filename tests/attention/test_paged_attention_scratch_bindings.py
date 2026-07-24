@@ -256,6 +256,30 @@ def test_prepared_decode_graph_scratch_requires_fixed_metadata_contract(
         )
 
 
+def test_prepared_decode_graph_scratch_accepts_narrower_copied_page_table() -> None:
+    scratch = _prepared_cpu_decode_graph_scratch()
+
+    scratch._validate_decode_graph_runtime_contract(
+        page_table=torch.empty((2, 2), dtype=torch.int32),
+        cache_seqlens=torch.empty((2,), dtype=torch.int32),
+        cu_seqlens_q=torch.empty((3,), dtype=torch.int32),
+        active_total_q=2,
+    )
+
+
+def test_prepared_decode_graph_scratch_rejects_narrower_referenced_page_table() -> None:
+    scratch = _prepared_cpu_decode_graph_scratch()
+    scratch.copy_runtime_metadata = False
+
+    with pytest.raises(ValueError, match="referenced page_table must exactly match"):
+        scratch._validate_decode_graph_runtime_contract(
+            page_table=torch.empty((2, 2), dtype=torch.int32),
+            cache_seqlens=torch.empty((2,), dtype=torch.int32),
+            cu_seqlens_q=torch.empty((3,), dtype=torch.int32),
+            active_total_q=2,
+        )
+
+
 @pytest.mark.parametrize(
     ("page_table_shape", "cache_shape", "cu_shape", "active_total_q", "match"),
     [

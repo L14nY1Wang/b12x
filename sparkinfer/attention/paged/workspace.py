@@ -2184,11 +2184,16 @@ class PagedAttentionWorkspace:
         expected_batch = int(self._plan.page_table_shape[0])
         expected_width = int(self._plan.page_table_shape[1])
         expected_total_q = int(self._plan.total_q)
-        if tuple(page_table.shape) != (expected_batch, expected_width):
+        if page_table.ndim != 2 or int(page_table.shape[0]) != expected_batch:
             raise ValueError(
-                "decode graph page_table must exactly match the prepared bucket: "
-                f"got {tuple(page_table.shape)}, expected "
-                f"({expected_batch}, {expected_width})"
+                "decode graph page_table must exactly match the prepared batch: "
+                f"got {tuple(page_table.shape)}, expected batch={expected_batch}"
+            )
+        runtime_width = int(page_table.shape[1])
+        if not 0 < runtime_width <= expected_width:
+            raise ValueError(
+                "decode graph page_table width must fit the prepared capacity: "
+                f"got {runtime_width}, expected 1..{expected_width}"
             )
         if tuple(cache_seqlens.shape) != (expected_batch,):
             raise ValueError(

@@ -242,6 +242,19 @@ def test_workspace_rejects_partial_decode_graph_runtime_metadata(
         )
 
 
+def test_workspace_accepts_narrower_decode_graph_page_table_capacity() -> None:
+    workspace = _make_cpu_decode_graph_workspace()
+    page_table = torch.empty((2, 32), dtype=torch.int32)
+
+    workspace.bind_cuda_graph_runtime_metadata(
+        page_table,
+        torch.empty((2,), dtype=torch.int32),
+        torch.empty((3,), dtype=torch.int32),
+    )
+
+    assert workspace.page_table is page_table
+
+
 @pytest.mark.parametrize("invalid_kind", ["dtype", "contiguity"])
 def test_workspace_decode_graph_metadata_requires_fixed_dtype_and_layout(
     invalid_kind: str,
