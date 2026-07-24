@@ -10,6 +10,7 @@ from sparkinfer.attention._shared.contiguous.api import clear_attention_caches
 from sparkinfer.attention.paged._forward import paged_attention_forward
 from sparkinfer.attention.paged._scratch import SPARKINFERPagedAttentionScratchCaps, plan_paged_attention_scratch
 from sparkinfer.attention.paged.planner import create_paged_plan
+from sparkinfer.attention.paged.planner import plan_extend_graph_capacity
 from sparkinfer.attention.paged.planner import plan_verify_graph_capacity
 
 from tests._reference.helpers import require_sparkinfer
@@ -158,6 +159,310 @@ def test_laguna_fp8_verifier_replays_fixed_graph_across_context_lengths(
         torch.cuda.synchronize()
         assert (output - expected).abs().max().item() <= 0.01
         assert _cosine_similarity(output, expected) >= 0.999
+
+
+@torch.inference_mode()
+def test_laguna_fp8_extend_replays_smaller_uneven_query_capacity() -> None:
+    """Live query partitions are packed on device under one fixed graph plan."""
+    require_sparkinfer()
+    clear_attention_caches()
+    torch.manual_seed(4129)
+    device = torch.device("cuda")
+    batch = 2
+    capacity_q = 128
+    live_total_q = 21
+    page_size = 128
+    num_q_heads = 24
+    num_kv_heads = 4
+    head_dim = 128
+    num_pages = 8
+
+    q = torch.randn(
+        live_total_q,
+        num_q_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    ).mul_(0.125)
+    k_cache = torch.randn(
+        num_pages,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    ).mul_(0.125).to(torch.float8_e4m3fn)
+    v_cache = torch.randn(
+        num_pages,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    ).mul_(0.125).to(torch.float8_e4m3fn)
+    page_table = torch.tensor(
+        [[0, 1, 2, 3], [4, 5, 6, 7]],
+        dtype=torch.int32,
+        device=device,
+    )
+    cache_seqlens = torch.tensor(
+        [389, 501], dtype=torch.int32, device=device
+    )
+    cu_seqlens_q = torch.tensor(
+        [0, 8, live_total_q], dtype=torch.int32, device=device
+    )
+    prepare_cu_seqlens_q = torch.tensor(
+        [0, 1, capacity_q], dtype=torch.int32, device=device
+    )
+    descale = torch.ones((batch,), dtype=torch.float32, device=device)
+    output = torch.empty_like(q)
+
+    scratch_plan = plan_paged_attention_scratch(
+        SPARKINFERPagedAttentionScratchCaps(
+            device=device,
+            mode="extend",
+            dtype=q.dtype,
+            kv_dtype=k_cache.dtype,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim_qk=head_dim,
+            head_dim_vo=head_dim,
+            page_size=page_size,
+            max_total_q=capacity_q,
+            max_batch=batch,
+            max_page_table_width=page_table.shape[1],
+            max_work_items=256,
+            max_partial_rows=0,
+            num_cache_pages=num_pages,
+            use_cuda_graph=True,
+            copy_runtime_metadata=False,
+        )
+    )
+    scratch_plan.prepare_graph_replay_state(
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=prepare_cu_seqlens_q,
+        active_total_q=capacity_q,
+        disable_split_kv=True,
+        window_left=-1,
+    )
+    (scratch_spec,) = scratch_plan.scratch_specs()
+    scratch = torch.empty(
+        scratch_spec.shape,
+        dtype=scratch_spec.dtype,
+        device=scratch_spec.device,
+    )
+
+    def bind():
+        return scratch_plan.bind(
+            scratch=scratch,
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            output=output,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            disable_split_kv=True,
+            window_left=-1,
+            k_descale=descale,
+            v_descale=descale,
+        )
+
+    eager_binding = bind()
+    actual, _ = eager_binding.run()
+    torch.cuda.synchronize()
+    expected, _ = paged_attention_reference(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        k_descale=descale,
+        v_descale=descale,
+        causal=True,
+    )
+    assert actual.shape == q.shape
+    assert (actual - expected).abs().max().item() <= 0.02
+    assert _cosine_similarity(actual, expected) >= 0.999
+
+    schedule_ptrs = tuple(
+        int(getattr(eager_binding.scratch, name).data_ptr())
+        for name in (
+            "request_indices",
+            "qo_tile_indices",
+            "kv_tile_indices",
+            "block_valid_mask",
+        )
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_binding = bind()
+        captured_binding.run()
+    assert schedule_ptrs == tuple(
+        int(getattr(captured_binding.scratch, name).data_ptr())
+        for name in (
+            "request_indices",
+            "qo_tile_indices",
+            "kv_tile_indices",
+            "block_valid_mask",
+        )
+    )
+
+    q.copy_(torch.randn_like(q).mul_(0.125))
+    cache_seqlens.copy_(
+        torch.tensor([257, 417], dtype=torch.int32, device=device)
+    )
+    cu_seqlens_q[1] = 5
+    graph.replay()
+    torch.cuda.synchronize()
+    expected_replay, _ = paged_attention_reference(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        k_descale=descale,
+        v_descale=descale,
+        causal=True,
+    )
+    assert torch.isfinite(output).all()
+    assert torch.count_nonzero(output).item() > 0
+    assert (output - expected_replay).abs().max().item() <= 0.02
+    assert _cosine_similarity(output, expected_replay) >= 0.999
+
+
+@torch.inference_mode()
+def test_laguna_fp8_extend_reuses_dynamic_worklist_grid() -> None:
+    """A shared compiled entry must launch the current graph-static capacity."""
+    require_sparkinfer()
+    clear_attention_caches()
+    torch.manual_seed(4130)
+    device = torch.device("cuda")
+    page_size = 128
+    num_q_heads = 24
+    num_kv_heads = 4
+    head_dim = 128
+    num_pages = 8
+    page_table = torch.arange(
+        num_pages, dtype=torch.int32, device=device
+    ).unsqueeze(0)
+    cache_seqlens = torch.tensor(
+        [num_pages * page_size], dtype=torch.int32, device=device
+    )
+    combined_cache = torch.randn(
+        num_pages,
+        2,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    ).mul_(0.125).to(torch.float8_e4m3fn)
+    k_cache, v_cache = combined_cache.unbind(1)
+    descale = torch.ones((1,), dtype=torch.float32, device=device)
+
+    def run_capacity(total_q: int) -> tuple[torch.Tensor, torch.Tensor]:
+        q = torch.randn(
+            total_q,
+            num_q_heads,
+            head_dim,
+            dtype=torch.bfloat16,
+            device=device,
+        ).mul_(0.125)
+        cu_seqlens_q = torch.tensor(
+            [0, total_q], dtype=torch.int32, device=device
+        )
+        capacity = plan_extend_graph_capacity(
+            device=device,
+            q_dtype=q.dtype,
+            kv_dtype=k_cache.dtype,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim_qk=head_dim,
+            head_dim_vo=head_dim,
+            page_size=page_size,
+            batch=1,
+            total_q_capacity=total_q,
+            max_cache_page_count=num_pages,
+            window_left=-1,
+        )
+        scratch_plan = plan_paged_attention_scratch(
+            SPARKINFERPagedAttentionScratchCaps(
+                device=device,
+                mode="extend",
+                dtype=q.dtype,
+                kv_dtype=k_cache.dtype,
+                num_q_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim_qk=head_dim,
+                head_dim_vo=head_dim,
+                page_size=page_size,
+                max_total_q=total_q,
+                max_batch=1,
+                max_page_table_width=num_pages,
+                max_work_items=capacity.max_work_items,
+                max_partial_rows=0,
+                num_cache_pages=num_pages,
+                use_cuda_graph=True,
+                copy_runtime_metadata=False,
+            )
+        )
+        scratch_plan.prepare_graph_replay_state(
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            active_total_q=total_q,
+            disable_split_kv=True,
+            window_left=-1,
+        )
+        scratch = torch.empty(
+            scratch_plan.layout.nbytes,
+            dtype=torch.uint8,
+            device=device,
+        )
+        output = torch.full_like(q, float("nan"))
+        binding = scratch_plan.bind(
+            scratch=scratch,
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            output=output,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            disable_split_kv=True,
+            window_left=-1,
+            k_descale=descale,
+            v_descale=descale,
+        )
+        actual, _ = binding.run()
+        torch.cuda.synchronize()
+        return q, actual
+
+    # On the Laguna production geometry Q=128 uses the architecture wave,
+    # while Q=1024 needs a larger direct worklist. Compile the small launch
+    # first so a stale exact grid would leave the tail of the second output
+    # poisoned.
+    run_capacity(128)
+    q, actual = run_capacity(1024)
+    expected, _ = paged_attention_reference(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        torch.tensor([0, q.shape[0]], dtype=torch.int32, device=device),
+        k_descale=descale,
+        v_descale=descale,
+        causal=True,
+    )
+    assert torch.isfinite(actual).all()
+    assert torch.count_nonzero(actual).item() > 0
+    assert (actual - expected).abs().max().item() <= 0.02
+    assert _cosine_similarity(actual, expected) >= 0.999
 
 
 class _PagedGraphScratchHarness:

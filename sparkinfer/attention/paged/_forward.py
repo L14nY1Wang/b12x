@@ -13,16 +13,22 @@ from cutlass.cute.runtime import from_dlpack
 from sparkinfer._lib.compiler import (
     DimKey,
     KernelCompileSpec,
+    compile as sparkinfer_compile,
     launch as sparkinfer_launch,
 )
 from sparkinfer._lib.utils import current_cuda_stream
 
 from .forward_paged import (
+    PagedFp8ExtendRawForwardKernel,
     PagedForwardKernel,
 )
 from .forward_extend_generic import build_extend_forward_kernel
 from .graph_replay import build_msa_prefill_union_metadata
-from .merge import PagedPersistentMergeKernel, default_paged_persistent_ctas
+from .merge import (
+    LagunaVerifierMergeKernel,
+    PagedPersistentMergeKernel,
+    default_paged_persistent_ctas,
+)
 from .traits import PagedForwardTraits, select_paged_forward_traits_from_plan
 
 _DECODE_NATIVE_FP8_QKV_MAX_SMALL_BATCH = 2
@@ -56,6 +62,7 @@ def _to_kernel_tensor(
     dtype: type[cutlass.Numeric],
     *,
     assumed_align: int = 16,
+    dynamic_rank1: bool = False,
 ) -> torch.Tensor | cutlass.cute.Tensor | None:
     if tensor is None:
         return None
@@ -66,6 +73,14 @@ def _to_kernel_tensor(
     )
     if leading_dim is not None and tensor.ndim >= 2:
         cute_tensor = cute_tensor.mark_layout_dynamic(leading_dim=leading_dim)
+    elif dynamic_rank1 and tensor.ndim == 1:
+        # Rank-1 tensors are normally exact because most metadata vectors
+        # define a compile-time ABI. Extend worklists are different: their
+        # selected capacity is a graph-static launch extent, not kernel policy.
+        # Pass that extent through the CuTe JIT wrapper at launch so fixed
+        # Q-capacity buckets can share one compiled entry without inheriting
+        # the first bucket's CTA count.
+        cute_tensor = cute_tensor.mark_layout_dynamic(leading_dim=0)
     return cute_tensor
 
 
@@ -347,6 +362,9 @@ def _build_forward_kernel(
     single_request_decode_graph: bool,
     single_qtile_decode_graph: bool,
     regularized_decode_graph: bool,
+    analytic_laguna_decode_graph: bool,
+    analytic_laguna_decode_batch: int,
+    analytic_laguna_decode_total_chunks: int,
     use_native_fp8_qk: bool,
     use_native_fp8_pv: bool,
     decode_only: bool,
@@ -369,6 +387,9 @@ def _build_forward_kernel(
         single_request_decode_graph=single_request_decode_graph,
         single_qtile_decode_graph=single_qtile_decode_graph,
         regularized_decode_graph=regularized_decode_graph,
+        analytic_laguna_decode_graph=analytic_laguna_decode_graph,
+        analytic_laguna_decode_batch=analytic_laguna_decode_batch,
+        analytic_laguna_decode_total_chunks=analytic_laguna_decode_total_chunks,
         use_native_fp8_qk=use_native_fp8_qk,
         use_native_fp8_pv=use_native_fp8_pv,
         decode_only=decode_only,
@@ -379,6 +400,104 @@ def _build_forward_kernel(
         msa_block_sparse=msa_block_sparse,
         page_size=page_size,
         page_tiles_per_entry=page_tiles_per_entry,
+    )
+
+
+@lru_cache(maxsize=32)
+def _build_laguna_verify_forward_kernel(
+    page_tiles_per_entry: int,
+    batch: int,
+    max_chunks_per_request: int,
+    two_wave_b1: bool,
+    use_tma_kv_load: bool,
+) -> PagedFp8ExtendRawForwardKernel:
+    return PagedFp8ExtendRawForwardKernel(
+        split_kv=True,
+        cta_tile_q=64,
+        page_size=128,
+        head_dim=128,
+        page_tiles_per_entry=page_tiles_per_entry,
+        analytic_verify_batch=batch,
+        analytic_verify_max_chunks=max_chunks_per_request,
+        analytic_verify_two_wave_b1=two_wave_b1,
+        use_tma_kv_load=use_tma_kv_load,
+    )
+
+
+def _use_laguna_verify_forward_kernel(
+    *,
+    plan,
+    traits: PagedForwardTraits,
+    use_native_fp8_qk: bool,
+    has_attention_sink_bias: bool,
+    has_relative_attention_bias: bool,
+) -> bool:
+    batch_capacity = int(plan.page_table_shape[0])
+    return (
+        plan.mode == "verify"
+        and plan.enable_cuda_graph
+        and plan.split_kv
+        and not plan.msa_block_sparse
+        and plan.window_left < 0
+        and plan.page_size == 128
+        and plan.dtype == torch.bfloat16
+        and plan.kv_dtype == torch.float8_e4m3fn
+        and plan.num_q_heads == 24
+        and plan.num_kv_heads == 4
+        and plan.gqa_group_size == 6
+        and plan.head_dim_qk == 128
+        and plan.head_dim_vo == 128
+        and 1 <= batch_capacity <= 8
+        and plan.cta_tile_q == 64
+        and traits.cta_tile_kv == 64
+        and traits.num_warps_q == 4
+        and traits.num_warps_kv == 1
+        and int(plan.total_q) == batch_capacity * 8
+        and int(plan.num_qo_tiles) == batch_capacity
+        and all(int(qo_tile) == 0 for qo_tile in plan.qo_tile_indices)
+        and not use_native_fp8_qk
+        and not has_attention_sink_bias
+        and not has_relative_attention_bias
+    )
+
+
+def _use_laguna_decode_analytic_kernel(
+    *,
+    plan,
+    traits: PagedForwardTraits,
+    use_native_fp8_qk: bool,
+    has_attention_sink_bias: bool,
+    has_relative_attention_bias: bool,
+) -> bool:
+    batch_capacity = int(plan.page_table_shape[0])
+    return (
+        plan.mode == "decode"
+        and plan.enable_cuda_graph
+        and plan.graph_chunk_policy
+        and plan.fixed_split_size < 0
+        and plan.split_kv
+        and not plan.msa_block_sparse
+        and plan.window_left < 0
+        and plan.page_size == 128
+        and plan.dtype == torch.bfloat16
+        and plan.kv_dtype == torch.float8_e4m3fn
+        and plan.num_q_heads == 24
+        and plan.num_kv_heads == 4
+        and plan.gqa_group_size == 6
+        and plan.head_dim_qk == 128
+        and plan.head_dim_vo == 128
+        and 1 <= batch_capacity <= 8
+        and int(plan.total_q) == batch_capacity
+        and int(plan.num_qo_tiles) == batch_capacity
+        and all(int(qo_tile) == 0 for qo_tile in plan.qo_tile_indices)
+        and plan.cta_tile_q == 16
+        and traits.cta_tile_kv in (64, 128)
+        and traits.num_warps_q == 1
+        and traits.num_warps_kv == 4
+        and traits.num_mma_kv == (2 if traits.cta_tile_kv == 128 else 1)
+        and not use_native_fp8_qk
+        and not has_attention_sink_bias
+        and not has_relative_attention_bias
     )
 
 
@@ -415,29 +534,61 @@ def _build_merge_kernel(
     persistent_ctas: int,
     direct_grid: bool,
     regular_decode_graph: bool,
+    analytic_laguna_verify_graph: bool,
+    analytic_laguna_decode_graph: bool,
     pair_bf16_partial_loads: bool,
 ) -> PagedPersistentMergeKernel:
     cutlass_dtype = _torch_to_cutlass_dtype(dtype)
+    merge_vec_size = head_dim // 32
+    merge_bdx = 32
     merge_bdy = (
         3 if dtype == torch.bfloat16 and head_dim == 128 and regular_decode_graph else 4
     )
+    laguna_b1_decode_merge = (
+        dtype == torch.bfloat16
+        and head_dim == 128
+        and regular_decode_graph
+        and int(total_q) == 1
+    )
+    if analytic_laguna_verify_graph or laguna_b1_decode_merge:
+        # Match the proven FlashInfer merge geometry for BF16 D128:
+        # 16 lanes each move a native 16-byte vector while eight y-lanes
+        # partition the split states.  The previous 32x4 layout needed
+        # paired half-warp loads for the same bytes.
+        merge_vec_size = 8
+        merge_bdx = 16
+        merge_bdy = 8
     if (
         dtype == torch.bfloat16
         and head_dim == 128
         and regular_decode_graph
-        and int(total_q) in (1, 4)
+        and int(total_q) == 4
     ):
         merge_bdy = 4
     return PagedPersistentMergeKernel(
         cutlass_dtype,
         cutlass_dtype,
         head_dim=head_dim,
-        vec_size=head_dim // 32,
+        vec_size=merge_vec_size,
+        bdx=merge_bdx,
         bdy=merge_bdy,
         persistent_ctas=persistent_ctas,
         direct_grid=direct_grid,
         regular_decode_graph=regular_decode_graph,
+        analytic_laguna_verify_graph=analytic_laguna_verify_graph,
+        analytic_laguna_decode_graph=analytic_laguna_decode_graph,
         pair_bf16_partial_loads=pair_bf16_partial_loads,
+    )
+
+
+@lru_cache(maxsize=8)
+def _build_laguna_verify_merge_kernel(
+    persistent_ctas: int,
+    two_wave_b1: bool,
+) -> LagunaVerifierMergeKernel:
+    return LagunaVerifierMergeKernel(
+        persistent_ctas,
+        two_wave_b1=two_wave_b1,
     )
 
 
@@ -507,6 +658,8 @@ def _resolve_paged_attention_binding(
 
 def _capture_decode_graph_replay_metadata_if_needed(
     scratch: object,
+    *,
+    analytic_device_schedule: bool = False,
 ) -> None:
     scratch_device = getattr(scratch, "device", None)
     if scratch_device is not None and torch.device(scratch_device).type != "cuda":
@@ -518,10 +671,7 @@ def _capture_decode_graph_replay_metadata_if_needed(
         and getattr(scratch, "mode", None) == "decode"
     ):
         return
-    if (
-        getattr(scratch, "_decode_graph_chunk_pages_lut", None) is None
-        or getattr(scratch, "_plan", None) is None
-    ):
+    if getattr(scratch, "_plan", None) is None:
         raise RuntimeError(
             "decode CUDA graph capture requires "
             "prepare_decode_graph_replay_state before capture"
@@ -533,6 +683,17 @@ def _capture_decode_graph_replay_metadata_if_needed(
         # the owner must be pinned before a later prepare can replace them.
         owner_scratch_plan._mark_decode_graph_replay_state_captured(
             getattr(scratch, "_plan_metadata_cache", None)
+        )
+    if analytic_device_schedule:
+        # This specialization derives its active split count and balanced
+        # chunk ranges directly from the persistent device cache-length
+        # tensor.  Capturing the generic metadata updater would add a launch
+        # without contributing any state consumed by the forward or merge.
+        return
+    if getattr(scratch, "_decode_graph_chunk_pages_lut", None) is None:
+        raise RuntimeError(
+            "decode CUDA graph capture requires "
+            "prepare_decode_graph_replay_state before capture"
         )
     update_metadata = getattr(
         scratch,
@@ -563,6 +724,7 @@ def paged_attention_forward(
     attention_sink_bias: torch.Tensor | None = None,
     relative_attention_bias: torch.Tensor | None = None,
     binding=None,
+    _compile_only: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     (
         q,
@@ -602,15 +764,35 @@ def paged_attention_forward(
         and getattr(workspace, "mode", None) == "decode"
         and getattr(workspace, "_decode_graph_chunk_pages_lut", None) is not None
     )
+    capacity_extend_graph = (
+        getattr(workspace, "fixed_capacity", False)
+        and getattr(workspace, "use_cuda_graph", False)
+        and getattr(workspace, "mode", None) == "extend"
+    )
     if exact_decode_graph_bucket and int(q.shape[0]) != int(plan.total_q):
         raise ValueError(
             "decode graph q total_q must exactly match the prepared bucket: "
             f"got {int(q.shape[0])}, expected {int(plan.total_q)}"
         )
+    if capacity_extend_graph and not (
+        0 < int(q.shape[0]) <= int(plan.total_q)
+    ):
+        raise ValueError(
+            "extend graph q total_q must be within the prepared capacity: "
+            f"got {int(q.shape[0])}, capacity {int(plan.total_q)}"
+        )
     if k_descale is not None and k_descale.ndim == 2 and int(k_descale.shape[1]) == 1:
         k_descale = k_descale[:, 0].contiguous()
     if v_descale is not None and v_descale.ndim == 2 and int(v_descale.shape[1]) == 1:
         v_descale = v_descale[:, 0].contiguous()
+    # A one-request descale is semantically scalar.  Normalize its otherwise
+    # incidental singleton stride so engine warmup and the first live request
+    # share one compiled ABI.  ``as_strided`` is an allocation-free view and
+    # batches larger than one retain their per-request stride.
+    if k_descale is not None and k_descale.ndim == 1 and int(k_descale.numel()) == 1:
+        k_descale = k_descale.as_strided((1,), (0,))
+    if v_descale is not None and v_descale.ndim == 1 and int(v_descale.numel()) == 1:
+        v_descale = v_descale.as_strided((1,), (0,))
     if output.ndim != 3:
         raise ValueError(
             f"output must be rank-3 [total_q, heads, head_dim], got {tuple(output.shape)}"
@@ -620,17 +802,19 @@ def paged_attention_forward(
             "decode graph output total_q must exactly match the prepared bucket: "
             f"got {int(output.shape[0])}, expected {int(plan.total_q)}"
         )
-    if int(output.shape[0]) < int(plan.total_q):
+    required_output_rows = (
+        int(q.shape[0]) if capacity_extend_graph else int(plan.total_q)
+    )
+    if int(output.shape[0]) < required_output_rows:
         raise ValueError(
-            f"output first dimension must be at least total_q={plan.total_q}, got {int(output.shape[0])}"
+            "output first dimension must be at least "
+            f"total_q={required_output_rows}, got {int(output.shape[0])}"
         )
     if tuple(output.shape[1:]) != (plan.num_q_heads, plan.head_dim_vo):
         raise ValueError(
             "output shape must match the prepared scratch contract: "
             f"expected (*, {plan.num_q_heads}, {plan.head_dim_vo}), got {tuple(output.shape)}"
         )
-    _capture_decode_graph_replay_metadata_if_needed(workspace)
-
     if (
         k_cache.dtype == torch.float8_e4m3fn or v_cache.dtype == torch.float8_e4m3fn
     ) and (k_descale is None or v_descale is None):
@@ -762,6 +946,35 @@ def paged_attention_forward(
     single_request_decode_graph = False
     single_qtile_decode_graph = False
     regularized_decode_graph = False
+    use_laguna_verify_kernel = _use_laguna_verify_forward_kernel(
+        plan=plan,
+        traits=traits,
+        use_native_fp8_qk=use_native_fp8_qk,
+        has_attention_sink_bias=has_attention_sink_bias,
+        has_relative_attention_bias=has_relative_attention_bias,
+    )
+    use_laguna_decode_analytic_kernel = _use_laguna_decode_analytic_kernel(
+        plan=plan,
+        traits=traits,
+        use_native_fp8_qk=use_native_fp8_qk,
+        has_attention_sink_bias=has_attention_sink_bias,
+        has_relative_attention_bias=has_relative_attention_bias,
+    )
+    _capture_decode_graph_replay_metadata_if_needed(
+        workspace,
+        analytic_device_schedule=use_laguna_decode_analytic_kernel,
+    )
+    laguna_verify_use_tma = bool(use_laguna_verify_kernel)
+    laguna_verify_two_wave_b1 = bool(
+        use_laguna_verify_kernel
+        and int(plan.page_table_shape[0]) == 1
+        and int(plan.graph_ctas_per_sm) >= 2
+    )
+    laguna_verify_max_chunks = (
+        int(plan.total_num_partial_rows) // int(plan.total_q)
+        if use_laguna_verify_kernel
+        else 0
+    )
     if plan.mode == "extend":
         if plan.split_kv:
             raise ValueError("extend plans no longer support split-kv")
@@ -775,6 +988,14 @@ def paged_attention_forward(
             bool(plan.msa_block_sparse),
             bool(getattr(plan, "msa_union_tile", False)),
             page_size,
+        )
+    elif use_laguna_verify_kernel:
+        forward_kernel = _build_laguna_verify_forward_kernel(
+            page_tiles_per_entry,
+            int(plan.page_table_shape[0]),
+            laguna_verify_max_chunks,
+            laguna_verify_two_wave_b1,
+            laguna_verify_use_tma,
         )
     else:
         single_request_decode_graph = (
@@ -807,6 +1028,17 @@ def paged_attention_forward(
             single_request_decode_graph,
             single_qtile_decode_graph,
             regularized_decode_graph,
+            use_laguna_decode_analytic_kernel,
+            (
+                int(plan.page_table_shape[0])
+                if use_laguna_decode_analytic_kernel
+                else 1
+            ),
+            (
+                int(plan.total_num_partial_rows)
+                if use_laguna_decode_analytic_kernel
+                else 1
+            ),
             use_native_fp8_qk,
             use_native_fp8_pv,
             plan.mode == "decode",
@@ -822,6 +1054,10 @@ def paged_attention_forward(
     forward_lse = workspace.tmp_lse if plan.split_kv else workspace.lse
     assert forward_output is not None
     assert forward_lse is not None
+    if use_laguna_verify_kernel or use_laguna_decode_analytic_kernel:
+        partial_rows = int(plan.total_num_partial_rows)
+        forward_output = forward_output[:partial_rows]
+        forward_lse = forward_lse[:partial_rows]
     msa_union_blocks = None
     msa_union_masks = None
     msa_union_counts = None
@@ -875,13 +1111,22 @@ def paged_attention_forward(
         _as_int32_tensor(cu_seqlens_q), cutlass.Int32, assumed_align=4
     )
     request_indices_arg = _to_kernel_tensor(
-        workspace.request_indices, cutlass.Int32, assumed_align=4
+        workspace.request_indices,
+        cutlass.Int32,
+        assumed_align=4,
+        dynamic_rank1=True,
     )
     qo_tile_indices_arg = _to_kernel_tensor(
-        workspace.qo_tile_indices, cutlass.Int32, assumed_align=4
+        workspace.qo_tile_indices,
+        cutlass.Int32,
+        assumed_align=4,
+        dynamic_rank1=True,
     )
     kv_tile_indices_arg = _to_kernel_tensor(
-        workspace.kv_tile_indices, cutlass.Int32, assumed_align=4
+        workspace.kv_tile_indices,
+        cutlass.Int32,
+        assumed_align=4,
+        dynamic_rank1=True,
     )
     o_indptr_arg = _to_kernel_tensor(workspace.o_indptr, cutlass.Int32, assumed_align=4)
     kv_chunk_size_arg = _to_kernel_tensor(
@@ -891,7 +1136,10 @@ def paged_attention_forward(
         workspace.kv_window_start_tokens, cutlass.Int32, assumed_align=4
     )
     block_valid_mask_arg = _to_kernel_tensor(
-        workspace.block_valid_mask, cutlass.Int32, assumed_align=4
+        workspace.block_valid_mask,
+        cutlass.Int32,
+        assumed_align=4,
+        dynamic_rank1=True,
     )
     q2k_indices_arg = _to_kernel_tensor(q2k_indices, cutlass.Int32, assumed_align=4)
     msa_union_blocks_arg = _to_kernel_tensor(
@@ -987,11 +1235,10 @@ def paged_attention_forward(
     )
     cuda_graph_decode = plan.mode == "decode" and plan.enable_cuda_graph
     dynamic_first_dim = () if cuda_graph_decode else (0,)
-    # The worklist length determines the CUTE launch grid below:
-    # grid=(mBlockValidMask.shape[0], ...). Keep it static in the compile key
-    # so a kernel compiled for a smaller eager prefill bucket is not reused for
-    # a larger one with too few CTAs.
-    grid_worklist_dynamic_first_dim = ()
+    # The worklist length is a graph-static launch extent, not kernel policy.
+    # Its rank-1 CuTe tensors are marked layout-dynamic below, so the launch
+    # wrapper receives the selected bucket's real extent on every invocation.
+    grid_worklist_dynamic_first_dim = (0,)
     forward_lse_dynamic_dims = (
         dynamic_first_dim if plan.split_kv else (() if cuda_graph_decode else (1,))
     )
@@ -1006,6 +1253,7 @@ def paged_attention_forward(
             bool(single_request_decode_graph),
             bool(single_qtile_decode_graph),
             bool(regularized_decode_graph),
+            bool(use_laguna_decode_analytic_kernel),
             bool(plan.mode == "decode"),
             bool(use_native_fp8_qk),
             bool(use_native_fp8_pv),
@@ -1015,6 +1263,9 @@ def paged_attention_forward(
             bool(has_relative_attention_bias),
             bool(plan.msa_block_sparse),
             bool(getattr(plan, "msa_union_tile", False)),
+            bool(use_laguna_verify_kernel),
+            bool(laguna_verify_two_wave_b1),
+            bool(laguna_verify_use_tma),
             int(page_size),
             int(page_tiles_per_entry),
         ),
@@ -1144,10 +1395,9 @@ def paged_attention_forward(
             relative_attention_bias_arg,
             forward_output_arg,
             forward_lse_arg,
-            k_descale_arg,
-            v_descale_arg,
         ]
     )
+    forward_args.extend((k_descale_arg, v_descale_arg))
     if plan.mode == "extend":
         k_tma_desc_arg = _to_kernel_tensor(
             k_tma_desc_ptrs, cutlass.Int64, assumed_align=8
@@ -1163,19 +1413,48 @@ def paged_attention_forward(
             )
         )
         cache_key_labels.extend(("k_tma_desc_ptrs", "v_tma_desc_ptrs"))
+    if use_laguna_verify_kernel:
+        # Keep the verifier entry's ABI as narrow as its device contract:
+        # no window, sparse-index, bias, or extend-only metadata reaches the
+        # specialization, so those paths cannot inflate its register footprint.
+        forward_args = [
+            q_arg,
+            k_cache_arg,
+            v_cache_arg,
+            page_table_arg,
+            cache_seqlens_arg,
+            cu_seqlens_q_arg,
+            request_indices_arg,
+            qo_tile_indices_arg,
+            kv_tile_indices_arg,
+            o_indptr_arg,
+            kv_chunk_size_arg,
+            block_valid_mask_arg,
+            forward_output_arg,
+            forward_lse_arg,
+            k_descale_arg,
+            v_descale_arg,
+        ]
     forward_args.append(stream)
     forward_spec = KernelCompileSpec.from_key(
         "attention.paged.forward",
-        5,
+        26,
         tuple(forward_cache_key),
         labels=tuple(cache_key_labels),
     )
-    sparkinfer_launch(
-        forward_kernel,
-        compile_spec=forward_spec,
-        compile_args=tuple(forward_args),
-        runtime_args=tuple(forward_args),
-    )
+    if _compile_only:
+        sparkinfer_compile(
+            forward_kernel,
+            *forward_args,
+            compile_spec=forward_spec,
+        )
+    else:
+        sparkinfer_launch(
+            forward_kernel,
+            compile_spec=forward_spec,
+            compile_args=tuple(forward_args),
+            runtime_args=tuple(forward_args),
+        )
 
     if plan.split_kv:
         persistent_ctas = default_paged_persistent_ctas(
@@ -1192,28 +1471,37 @@ def paged_attention_forward(
             and max(plan.qo_tile_indices, default=0) == 0
         )
         merge_direct_grid = merge_regular_decode_graph
+        merge_analytic_laguna_verify_graph = bool(use_laguna_verify_kernel)
+        merge_analytic_laguna_decode_graph = bool(
+            use_laguna_decode_analytic_kernel
+        )
         pair_bf16_merge_partial_loads = (
-            plan.mode == "decode"
-            and 2 <= int(plan.total_q) <= 4
+            (
+                (
+                    plan.mode == "decode"
+                    and 2 <= int(plan.total_q) <= 4
+                    and plan.gqa_group_size == 6
+                )
+                or (
+                    plan.mode == "verify"
+                    and plan.enable_cuda_graph
+                    and plan.cta_tile_q == 64
+                    and plan.page_size == 128
+                    and plan.num_q_heads == 24
+                    and plan.num_kv_heads == 4
+                    and plan.gqa_group_size == 6
+                    and plan.window_left < 0
+                )
+            )
             and output.dtype == torch.bfloat16
             and workspace.tmp_output is not None
             and workspace.tmp_output.dtype == torch.bfloat16
             and plan.head_dim_vo == 128
-            and plan.gqa_group_size == 6
-        )
-        merge_kernel = _build_merge_kernel(
-            output.dtype,
-            plan.head_dim_vo,
-            plan.total_q,
-            persistent_ctas,
-            merge_direct_grid,
-            merge_regular_decode_graph,
-            pair_bf16_merge_partial_loads,
         )
         tmp_output_arg = _to_kernel_tensor(
-            workspace.tmp_output, _torch_to_cutlass_dtype(workspace.tmp_output.dtype)
+            forward_output, _torch_to_cutlass_dtype(forward_output.dtype)
         )
-        tmp_lse_arg = _to_kernel_tensor(workspace.tmp_lse, cutlass.Float32)
+        tmp_lse_arg = _to_kernel_tensor(forward_lse, cutlass.Float32)
         merge_indptr_arg = _to_kernel_tensor(
             workspace.merge_indptr, cutlass.Int32, assumed_align=4
         )
@@ -1222,79 +1510,156 @@ def paged_attention_forward(
         )
         output_arg = _to_kernel_tensor(output, _torch_to_cutlass_dtype(output.dtype))
         lse_arg = _to_kernel_tensor(workspace.lse, cutlass.Float32)
-        total_num_rows_arg = (
-            None
-            if merge_regular_decode_graph
-            else _to_kernel_tensor(
-                workspace.total_num_rows_ptr, cutlass.Int32, assumed_align=4
+        if merge_analytic_laguna_verify_graph:
+            exact_merge_work = int(plan.total_q * plan.num_q_heads)
+            laguna_merge_ctas = exact_merge_work
+            merge_kernel = _build_laguna_verify_merge_kernel(
+                laguna_merge_ctas,
+                laguna_verify_two_wave_b1,
             )
-        )
-        merge_args = (
-            tmp_output_arg,
-            tmp_lse_arg,
-            merge_indptr_arg,
-            merge_cache_seqlens_arg,
-            kv_chunk_size_arg,
-            output_arg,
-            lse_arg,
-            total_num_rows_arg,
-        )
-        merge_dynamic_first_dim = () if cuda_graph_decode else (0,)
-        merge_cache_key = (
-            _tensor_meta_key(
-                workspace.tmp_output, dynamic_dims=merge_dynamic_first_dim
-            ),
-            _tensor_meta_key(workspace.tmp_lse, dynamic_dims=merge_dynamic_first_dim),
-            _tensor_meta_key(
-                workspace.merge_indptr, dynamic_dims=merge_dynamic_first_dim
-            ),
-            _tensor_meta_key(cache_seqlens, dynamic_dims=merge_dynamic_first_dim),
-            _tensor_meta_key(workspace.kv_chunk_size_ptr),
-            _tensor_meta_key(output, dynamic_dims=merge_dynamic_first_dim),
-            _tensor_meta_key(
-                workspace.lse,
-                dynamic_dims=(() if cuda_graph_decode else (1,)),
-                dynamic_strides=(() if cuda_graph_decode else (0,)),
-            ),
-            None
-            if merge_regular_decode_graph
-            else _tensor_meta_key(workspace.total_num_rows_ptr),
-            persistent_ctas,
-            merge_direct_grid,
-            merge_regular_decode_graph,
-            pair_bf16_merge_partial_loads,
-        )
-        merge_spec = KernelCompileSpec.from_key(
-            "attention.paged.merge",
-            2,
-            merge_cache_key,
-            labels=(
-                "tmp_output",
-                "tmp_lse",
-                "merge_indptr",
-                "cache_seqlens",
-                "kv_chunk_size_ptr",
-                "output",
-                "lse",
-                "total_num_rows_ptr",
-                "persistent_ctas",
-                "direct_grid",
-                "regular_decode_graph",
-                "pair_bf16_partial_loads",
-            ),
-        )
-        sparkinfer_launch(
-            merge_kernel,
-            compile_spec=merge_spec,
-            compile_args=(*merge_args, stream),
-            runtime_args=(*merge_args, stream),
-        )
+            merge_args = (
+                tmp_output_arg,
+                tmp_lse_arg,
+                merge_cache_seqlens_arg,
+                output_arg,
+                lse_arg,
+            )
+            merge_spec = KernelCompileSpec.from_key(
+                "attention.paged.laguna_verify_merge",
+                3,
+                (
+                    _tensor_meta_key(forward_output),
+                    _tensor_meta_key(forward_lse),
+                    _tensor_meta_key(cache_seqlens),
+                    _tensor_meta_key(output),
+                    _tensor_meta_key(workspace.lse),
+                    laguna_merge_ctas,
+                    laguna_verify_two_wave_b1,
+                ),
+                labels=(
+                    "tmp_output",
+                    "tmp_lse",
+                    "cache_seqlens",
+                    "output",
+                    "lse",
+                    "persistent_ctas",
+                    "two_wave_b1",
+                ),
+            )
+        else:
+            merge_kernel = _build_merge_kernel(
+                output.dtype,
+                plan.head_dim_vo,
+                plan.total_q,
+                persistent_ctas,
+                merge_direct_grid,
+                merge_regular_decode_graph,
+                False,
+                merge_analytic_laguna_decode_graph,
+                pair_bf16_merge_partial_loads,
+            )
+            total_num_rows_arg = (
+                None
+                if merge_regular_decode_graph
+                else _to_kernel_tensor(
+                    workspace.total_num_rows_ptr, cutlass.Int32, assumed_align=4
+                )
+            )
+            merge_args = (
+                tmp_output_arg,
+                tmp_lse_arg,
+                merge_indptr_arg,
+                merge_cache_seqlens_arg,
+                kv_chunk_size_arg,
+                output_arg,
+                lse_arg,
+                total_num_rows_arg,
+            )
+            merge_dynamic_first_dim = () if cuda_graph_decode else (0,)
+            merge_cache_key = (
+                _tensor_meta_key(
+                    forward_output, dynamic_dims=merge_dynamic_first_dim
+                ),
+                _tensor_meta_key(
+                    forward_lse, dynamic_dims=merge_dynamic_first_dim
+                ),
+                _tensor_meta_key(
+                    workspace.merge_indptr, dynamic_dims=merge_dynamic_first_dim
+                ),
+                _tensor_meta_key(
+                    cache_seqlens, dynamic_dims=merge_dynamic_first_dim
+                ),
+                _tensor_meta_key(workspace.kv_chunk_size_ptr),
+                _tensor_meta_key(output, dynamic_dims=merge_dynamic_first_dim),
+                _tensor_meta_key(
+                    workspace.lse,
+                    dynamic_dims=(() if cuda_graph_decode else (1,)),
+                    dynamic_strides=(() if cuda_graph_decode else (0,)),
+                ),
+                None
+                if merge_regular_decode_graph
+                else _tensor_meta_key(workspace.total_num_rows_ptr),
+                persistent_ctas,
+                merge_direct_grid,
+                merge_regular_decode_graph,
+                False,
+                merge_analytic_laguna_decode_graph,
+                pair_bf16_merge_partial_loads,
+            )
+            merge_spec = KernelCompileSpec.from_key(
+                "attention.paged.merge",
+                9,
+                merge_cache_key,
+                labels=(
+                    "tmp_output",
+                    "tmp_lse",
+                    "merge_indptr",
+                    "cache_seqlens",
+                    "kv_chunk_size_ptr",
+                    "output",
+                    "lse",
+                    "total_num_rows_ptr",
+                    "persistent_ctas",
+                    "direct_grid",
+                    "regular_decode_graph",
+                    "analytic_laguna_verify_graph",
+                    "analytic_laguna_decode_graph",
+                    "pair_bf16_partial_loads",
+                ),
+            )
+        if _compile_only:
+            sparkinfer_compile(
+                merge_kernel,
+                *merge_args,
+                stream,
+                compile_spec=merge_spec,
+            )
+        else:
+            sparkinfer_launch(
+                merge_kernel,
+                compile_spec=merge_spec,
+                compile_args=(*merge_args, stream),
+                runtime_args=(*merge_args, stream),
+            )
 
+    if capacity_extend_graph:
+        active_rows = int(q.shape[0])
+        return (
+            output[:active_rows],
+            workspace.lse[:, :active_rows].transpose(0, 1),
+        )
     return output[: plan.total_q], workspace.current_lse_view()
+
+
+def compile_paged_attention(*, binding) -> None:
+    """Compile the exact paged entries selected by ``binding`` without launching."""
+    paged_attention_forward(binding=binding, _compile_only=True)
 
 
 def clear_paged_caches() -> None:
     """Clear compiled-kernel caches for the primary paged backend."""
     _build_forward_kernel.cache_clear()
+    _build_laguna_verify_forward_kernel.cache_clear()
     _build_extend_forward_kernel.cache_clear()
     _build_merge_kernel.cache_clear()
+    _build_laguna_verify_merge_kernel.cache_clear()

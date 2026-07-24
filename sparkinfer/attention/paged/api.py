@@ -7,6 +7,9 @@ from ._forward import (
     clear_paged_caches as clear_caches,
 )
 from ._forward import (
+    compile_paged_attention as compile,
+)
+from ._forward import (
     paged_attention_forward as run,
 )
 from ._scratch import (
@@ -31,6 +34,9 @@ from .planner import (
     PagedDecodeGraphCapacity as DecodeGraphCapacity,
 )
 from .planner import (
+    PagedExtendGraphCapacity as ExtendGraphCapacity,
+)
+from .planner import (
     PagedVerifyGraphCapacity as VerifyGraphCapacity,
 )
 from .planner import (
@@ -41,6 +47,9 @@ from .planner import (
 )
 from .planner import (
     plan_decode_graph_capacity as decode_graph_capacity,
+)
+from .planner import (
+    plan_extend_graph_capacity as extend_graph_capacity,
 )
 from .planner import (
     plan_verify_graph_capacity as verify_graph_capacity,
@@ -72,13 +81,16 @@ __all__ = [
     "Workspace",
     "Budget",
     "DecodeGraphCapacity",
+    "ExtendGraphCapacity",
     "VerifyGraphCapacity",
     "DecodeGraphScratchEnvelope",
     "decode_graph_capacity",
+    "extend_graph_capacity",
     "verify_graph_capacity",
     "decode_graph_scratch_envelope",
     "plan",
     "bind",
+    "compile",
     "run",
     "infer_mode",
     "is_supported",

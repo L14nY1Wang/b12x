@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 import torch
 
 from sparkinfer._lib.smem import make_tma_aligned_payload_storage
@@ -109,6 +110,8 @@ def select_paged_forward_traits(
     o_dtype: torch.dtype | None = None,
     device: torch.device | int | None = None,
     exact_num_mma_kv: int | None = None,
+    minimum_shared_storage_bytes: int = 0,
+    compact_sync_rows: int = 0,
 ) -> PagedForwardTraits:
     if head_dim_qk % 16 != 0 or head_dim_vo % 16 != 0:
         raise ValueError("head_dim_qk and head_dim_vo must be multiples of 16")
@@ -121,6 +124,15 @@ def select_paged_forward_traits(
     o_dtype = q_dtype if o_dtype is None else o_dtype
     if o_dtype not in (torch.float16, torch.bfloat16):
         raise TypeError(f"unsupported output dtype {o_dtype}")
+    minimum_shared_storage_bytes = int(minimum_shared_storage_bytes)
+    if minimum_shared_storage_bytes < 0:
+        raise ValueError("minimum_shared_storage_bytes must be nonnegative")
+    compact_sync_rows = int(compact_sync_rows)
+    if compact_sync_rows < 0 or compact_sync_rows > cta_tile_q:
+        raise ValueError(
+            "compact_sync_rows must be between zero and cta_tile_q, got "
+            f"{compact_sync_rows}"
+        )
 
     if kv_dtype == _FP8_KV_DTYPE and cta_tile_q == 48:
         device_props = torch.cuda.get_device_properties(
@@ -136,7 +148,7 @@ def select_paged_forward_traits(
         kv_bytes = _dtype_num_bytes(kv_dtype)
         upcast_stride_k = _align_up(head_dim_qk // (16 // kv_bytes), 8)
         upcast_stride_v = _align_up(head_dim_vo // (16 // kv_bytes), 8)
-        shared_storage_bytes = 49152
+        shared_storage_bytes = max(49152, minimum_shared_storage_bytes)
         launch_smem_bytes = int(
             make_tma_aligned_payload_storage(
                 payload_bytes=shared_storage_bytes,
@@ -213,10 +225,26 @@ def select_paged_forward_traits(
         )
         else 0
     )
-    cta_sync_o_bytes = (
-        4 if num_warps_kv == 1 else num_warps_kv * cta_tile_q * sync_o_row_stride * 4
-    )
-    cta_sync_md_bytes = 8 if num_warps_kv == 1 else num_warps_kv * cta_tile_q * 8
+    if compact_sync_rows:
+        if num_warps_kv <= 1:
+            raise ValueError("compact sync storage requires multiple KV warps")
+        # The exact single-row decode merge keeps warp zero's partial in
+        # registers. Only the remaining KV warps spill the statically known
+        # valid GQA rows.
+        spilled_warps = num_warps_kv - 1
+        cta_sync_o_bytes = (
+            spilled_warps * compact_sync_rows * sync_o_row_stride * 4
+        )
+        cta_sync_md_bytes = spilled_warps * compact_sync_rows * 8
+    else:
+        cta_sync_o_bytes = (
+            4
+            if num_warps_kv == 1
+            else num_warps_kv * cta_tile_q * sync_o_row_stride * 4
+        )
+        cta_sync_md_bytes = (
+            8 if num_warps_kv == 1 else num_warps_kv * cta_tile_q * 8
+        )
     cta_sync_storage_bytes = cta_sync_o_bytes + cta_sync_md_bytes
     smem_o_bytes = cta_tile_q * head_dim_vo * o_bytes
 
@@ -257,7 +285,12 @@ def select_paged_forward_traits(
         candidate_cta_tile_kv = candidate_mma_kv * num_warps_kv * 16
         candidate_qkv_bytes = q_smem_bytes + candidate_mma_kv * kv_bytes_per_mma
         candidate_payload_bytes = _align_up(
-            max(candidate_qkv_bytes, cta_sync_storage_bytes, smem_o_bytes),
+            max(
+                candidate_qkv_bytes,
+                cta_sync_storage_bytes,
+                smem_o_bytes,
+                minimum_shared_storage_bytes,
+            ),
             16,
         )
         candidate_launch_bytes = int(
@@ -338,27 +371,127 @@ def select_paged_forward_traits_from_plan(
     # MMAs per KV warp for that static family so each CTA consumes one physical
     # page per loop iteration.  This is plan/capacity metadata only: no live
     # sequence length participates in the choice.
-    exact_num_mma_kv = (
-        2
-        if (
-            plan.mode == "decode"
-            and device_capability == (12, 0)
-            and plan.enable_cuda_graph
-            and plan.split_kv
-            and not plan.msa_block_sparse
-            and plan.page_size == 128
-            and plan.cta_tile_q == 16
-            and plan.head_dim_qk == 128
-            and plan.head_dim_vo == 128
-            and plan.num_q_heads == 36
-            and plan.num_kv_heads == 4
-            and plan.gqa_group_size == 9
-            and plan.dtype == torch.bfloat16
-            and plan.kv_dtype == _FP8_KV_DTYPE
-            and resolved_o_dtype == torch.bfloat16
+    exact_num_mma_kv: int | None = None
+    minimum_shared_storage_bytes = 0
+    compact_sync_rows = 0
+    if (
+        plan.mode == "extend"
+        and device_capability == (12, 0)
+        and plan.enable_cuda_graph
+        and not plan.msa_block_sparse
+        and not plan.split_kv
+        and plan.window_left == 511
+        and plan.page_size == 128
+        and plan.cta_tile_q == 128
+        and plan.head_dim_qk == 128
+        and plan.head_dim_vo == 128
+        and plan.num_q_heads == 36
+        and plan.num_kv_heads == 4
+        and plan.gqa_group_size == 9
+        and plan.dtype == torch.bfloat16
+        and plan.kv_dtype == _FP8_KV_DTYPE
+        and resolved_o_dtype == torch.bfloat16
+    ):
+        # Match the instruction-efficient verifier pipeline: one cooperative
+        # FP8->BF16 widening pass per CTA, then reuse the widened N32 tile
+        # across all four query warps.  N32 keeps Q + raw K/V + the reusable
+        # widened K-or-V tile at two resident CTAs/SM on SM120.
+        exact_num_mma_kv = 2
+        minimum_shared_storage_bytes = (
+            plan.cta_tile_q * plan.head_dim_qk * 2
+            + 2 * 32 * plan.head_dim_qk
+            + 32 * max(plan.head_dim_qk, plan.head_dim_vo) * 2
         )
-        else None
-    )
+    elif (
+        plan.mode == "extend"
+        and device_capability == (12, 0)
+        and plan.enable_cuda_graph
+        and not plan.msa_block_sparse
+        and not plan.split_kv
+        and plan.window_left < 0
+        and plan.page_size == 128
+        and plan.cta_tile_q == 64
+        and plan.head_dim_qk == 128
+        and plan.head_dim_vo == 128
+        and plan.num_q_heads == 24
+        and plan.num_kv_heads == 4
+        and plan.gqa_group_size == 6
+        and plan.dtype == torch.bfloat16
+        and plan.kv_dtype == _FP8_KV_DTYPE
+        and resolved_o_dtype == torch.bfloat16
+    ):
+        # Keep the exact Laguna prefill family on an N32 KV stage.  The
+        # cooperative widening path removes per-fragment FP8 conversion state.
+        exact_num_mma_kv = 2
+        # Q, raw K/V (2x32x128 FP8), and one reusable 32x128 K-or-V
+        # repack tile.  This is derived only from static production geometry.
+        minimum_shared_storage_bytes = (
+            plan.cta_tile_q * plan.head_dim_qk * 2
+            + 2 * 32 * plan.head_dim_qk
+            + 32 * max(plan.head_dim_qk, plan.head_dim_vo) * 2
+        )
+    elif (
+        plan.mode == "decode"
+        and device_capability == (12, 0)
+        and plan.enable_cuda_graph
+        and plan.split_kv
+        and not plan.msa_block_sparse
+        and plan.window_left < 0
+        and plan.page_size == 128
+        and plan.cta_tile_q == 16
+        and plan.head_dim_qk == 128
+        and plan.head_dim_vo == 128
+        and plan.num_q_heads == 24
+        and plan.num_kv_heads == 4
+        and plan.gqa_group_size == 6
+        and plan.dtype == torch.bfloat16
+        and plan.kv_dtype == _FP8_KV_DTYPE
+        and resolved_o_dtype == torch.bfloat16
+    ):
+        if os.environ.get("SPARKINFER_PAGED_LAGUNA_DECODE_N128", "0") == "1":
+            exact_num_mma_kv = 2
+        compact_sync_rows = plan.gqa_group_size
+    elif (
+        plan.mode == "decode"
+        and device_capability == (12, 0)
+        and plan.enable_cuda_graph
+        and plan.split_kv
+        and not plan.msa_block_sparse
+        and plan.page_size == 128
+        and plan.cta_tile_q == 16
+        and plan.head_dim_qk == 128
+        and plan.head_dim_vo == 128
+        and plan.num_q_heads == 36
+        and plan.num_kv_heads == 4
+        and plan.gqa_group_size == 9
+        and plan.dtype == torch.bfloat16
+        and plan.kv_dtype == _FP8_KV_DTYPE
+        and resolved_o_dtype == torch.bfloat16
+    ):
+        exact_num_mma_kv = 2
+    elif (
+        plan.mode == "verify"
+        and device_capability == (12, 0)
+        and plan.enable_cuda_graph
+        and plan.split_kv
+        and not plan.msa_block_sparse
+        and plan.window_left < 0
+        and plan.page_size == 128
+        and plan.cta_tile_q == 64
+        and plan.head_dim_qk == 128
+        and plan.head_dim_vo == 128
+        and plan.num_q_heads == 24
+        and plan.num_kv_heads == 4
+        and plan.gqa_group_size == 6
+        and plan.dtype == torch.bfloat16
+        and plan.kv_dtype == _FP8_KV_DTYPE
+        and resolved_o_dtype == torch.bfloat16
+    ):
+        # A 64-row KV stage halves the verifier's live probability fragment
+        # relative to the original 128-row stage.  On SM120 this trades one
+        # extra loop iteration per physical page for substantially lower
+        # register and shared-memory pressure.
+        exact_num_mma_kv = 4
     return select_paged_forward_traits(
         cta_tile_q=plan.cta_tile_q,
         head_dim_qk=plan.head_dim_qk,
@@ -368,4 +501,6 @@ def select_paged_forward_traits_from_plan(
         o_dtype=resolved_o_dtype,
         device=plan.device,
         exact_num_mma_kv=exact_num_mma_kv,
+        minimum_shared_storage_bytes=minimum_shared_storage_bytes,
+        compact_sync_rows=compact_sync_rows,
     )

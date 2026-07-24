@@ -2429,6 +2429,56 @@ def pack_f32x2_to_bfloat2(x0: Float32, x1: Float32, *, loc=None, ip=None) -> Uin
 
 
 @dsl_user_op
+def pack_f32x2_to_half2(x0: Float32, x1: Float32, *, loc=None, ip=None) -> Uint32:
+    """Pack two float32 values into one f16x2 register."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Float32(x0).ir_value(loc=loc, ip=ip),
+                Float32(x1).ir_value(loc=loc, ip=ip),
+            ],
+            "cvt.rn.f16x2.f32 $0, $2, $1;",
+            "=r,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def cvt_bf16x2_to_f16x2_via_f32(
+    packed: Uint32, *, loc=None, ip=None
+) -> Uint32:
+    """Convert packed bf16x2 to packed f16x2 through exact FP32 values."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Uint32(packed).ir_value(loc=loc, ip=ip)],
+            """
+            {
+                .reg .b16 b_lo, b_hi;
+                .reg .f32 f_lo, f_hi;
+                mov.b32 {b_lo, b_hi}, $1;
+                cvt.f32.bf16 f_lo, b_lo;
+                cvt.f32.bf16 f_hi, b_hi;
+                cvt.rn.f16x2.f32 $0, f_hi, f_lo;
+            }
+            """,
+            "=r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def cvt_bf16x2_to_e4m3x2(src: Uint32, *, loc=None, ip=None) -> Uint32:
     """Convert packed bf16x2 to packed e4m3x2 in the low 16 bits of a u32."""
     return Uint32(
@@ -2525,6 +2575,111 @@ def fp8x4_e4m3_to_bfloat2x2(
 
             mul.bf16x2 $0, out0, bias;
             mul.bf16x2 $1, out1, bias;
+        }
+        """,
+        "=r,=r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    lo = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
+    hi = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
+    return Uint32(lo), Uint32(hi)
+
+
+@dsl_user_op
+def fp8x4_e4m3_to_bfloat2x2_via_f16(
+    packed: Uint32, *, loc=None, ip=None
+) -> Tuple[Uint32, Uint32]:
+    """Widen four packed E4M3 values exactly through native FP16 conversion.
+
+    Every E4M3 value is exactly representable in FP16, and its four-bit
+    significand is exactly representable in BF16.  The FP32 intermediates are
+    therefore lossless; they only bridge the packed FP16 and BF16 PTX
+    conversion forms.
+    """
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [Uint32(packed).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b16 e01, e23, h0, h1, h2, h3;
+            .reg .b32 p01, p23;
+            .reg .f32 f0, f1, f2, f3;
+            mov.b32 {e01, e23}, $2;
+            cvt.rn.f16x2.e4m3x2 p01, e01;
+            cvt.rn.f16x2.e4m3x2 p23, e23;
+            mov.b32 {h0, h1}, p01;
+            mov.b32 {h2, h3}, p23;
+            cvt.f32.f16 f0, h0;
+            cvt.f32.f16 f1, h1;
+            cvt.f32.f16 f2, h2;
+            cvt.f32.f16 f3, h3;
+            cvt.rn.bf16x2.f32 $0, f1, f0;
+            cvt.rn.bf16x2.f32 $1, f3, f2;
+        }
+        """,
+        "=r,=r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    lo = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
+    hi = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
+    return Uint32(lo), Uint32(hi)
+
+
+@dsl_user_op
+def fp8x4_e4m3_to_bfloat2x2_native_sm120(
+    packed: Uint32, *, loc=None, ip=None
+) -> Tuple[Uint32, Uint32]:
+    """Widen four packed E4M3 values with SM120a's direct BF16 conversion.
+
+    ``cvt.rn.bf16x2.e4m3x2`` requires PTX ISA 9.2 and an architecture-specific
+    SM120 target. Callers must therefore keep this helper behind an SM120-only
+    compiled entry instead of using it in a portable kernel specialization.
+    """
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [Uint32(packed).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b16 e01, e23;
+            mov.b32 {e01, e23}, $2;
+            cvt.rn.bf16x2.e4m3x2 $0, e01;
+            cvt.rn.bf16x2.e4m3x2 $1, e23;
+        }
+        """,
+        "=r,=r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    lo = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
+    hi = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
+    return Uint32(lo), Uint32(hi)
+
+
+@dsl_user_op
+def fp8x4_e4m3_to_half2x2(
+    packed: Uint32, *, loc=None, ip=None
+) -> Tuple[Uint32, Uint32]:
+    """Widen four packed E4M3 values exactly into two f16x2 registers."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [Uint32(packed).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b16 e01, e23;
+            mov.b32 {e01, e23}, $2;
+            cvt.rn.f16x2.e4m3x2 $0, e01;
+            cvt.rn.f16x2.e4m3x2 $1, e23;
         }
         """,
         "=r,=r,r",
@@ -3162,6 +3317,52 @@ def bf16_rowsum_m16k16_f32(
         """
         {
             mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32
+            {$0, _, $1, _},
+            {$2, $3, $4, $5},
+            {$6, $7},
+            {$0, 0., $1, 0.};
+        }
+        """,
+        "=f,=f,r,r,r,r,r,r,0,1",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    r0 = llvm.extractvalue(T.f32(), result, [0], loc=loc, ip=ip)
+    r1 = llvm.extractvalue(T.f32(), result, [1], loc=loc, ip=ip)
+    return Float32(r0), Float32(r1)
+
+
+@dsl_user_op
+def f16_rowsum_m16k16_f32(
+    d0: Float32,
+    d1: Float32,
+    a0: Uint32,
+    a1: Uint32,
+    a2: Uint32,
+    a3: Uint32,
+    *,
+    loc=None,
+    ip=None,
+) -> Tuple[Float32, Float32]:
+    """Row-sum helper for an FP16-packed m16k16 probability fragment."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32()]),
+        [
+            Uint32(a0).ir_value(loc=loc, ip=ip),
+            Uint32(a1).ir_value(loc=loc, ip=ip),
+            Uint32(a2).ir_value(loc=loc, ip=ip),
+            Uint32(a3).ir_value(loc=loc, ip=ip),
+            Uint32(1006648320).ir_value(loc=loc, ip=ip),
+            Uint32(1006648320).ir_value(loc=loc, ip=ip),
+            Float32(d0).ir_value(loc=loc, ip=ip),
+            Float32(d1).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        {
+            mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
             {$0, _, $1, _},
             {$2, $3, $4, $5},
             {$6, $7},

@@ -581,6 +581,8 @@ def update_prefill_graph_work_metadata_triton(
     PAGE_SIZE: tl.constexpr,
     WINDOW_LEFT: tl.constexpr,
     SPLIT_KV: tl.constexpr,
+    ADAPTIVE_CHUNKING: tl.constexpr,
+    BLOCK_BATCH: tl.constexpr,
     BLOCK_WORK_ITEMS: tl.constexpr,
 ):
     block_idx = tl.program_id(axis=0)
@@ -613,7 +615,38 @@ def update_prefill_graph_work_metadata_triton(
         window_start_page = tl.minimum(window_start_page, tl.maximum(num_pages - 1, 0))
     effective_pages = tl.maximum(num_pages - window_start_page, 1)
 
-    kv_chunk_size = tl.load(kv_chunk_size_ptr).to(tl.int32)
+    if ADAPTIVE_CHUNKING:
+        batch_offsets = tl.arange(0, BLOCK_BATCH)
+        batch_mask = batch_offsets < BATCH
+        policy_cache_len = tl.load(
+            cache_seqlens_ptr + batch_offsets,
+            mask=batch_mask,
+            other=0,
+        ).to(tl.int32)
+        policy_pages = tl.max(
+            tl.where(
+                batch_mask,
+                tl.maximum(
+                    (policy_cache_len + PAGE_SIZE - 1) // PAGE_SIZE,
+                    1,
+                ),
+                1,
+            ),
+            axis=0,
+        )
+        adaptive_chunk_pages = tl.maximum(
+            (policy_pages + MAX_CHUNKS_PER_Q_TILE - 1)
+            // MAX_CHUNKS_PER_Q_TILE,
+            1,
+        )
+        kv_chunk_size = adaptive_chunk_pages * PAGE_SIZE
+        tl.store(
+            kv_chunk_size_ptr + offsets,
+            kv_chunk_size,
+            mask=offsets == 0,
+        )
+    else:
+        kv_chunk_size = tl.load(kv_chunk_size_ptr).to(tl.int32)
     chunk_pages = tl.maximum((kv_chunk_size + PAGE_SIZE - 1) // PAGE_SIZE, 1)
     num_chunks = tl.full((BLOCK_WORK_ITEMS,), 1, tl.int32)
     if SPLIT_KV:
@@ -649,6 +682,125 @@ def update_prefill_graph_work_metadata_triton(
         mask=first_slot_for_req,
     )
     tl.store(o_indptr_ptr + offsets, 0, mask=offsets == 0)
+
+
+@triton.jit(
+    do_not_specialize=[
+        "work_items_capacity",
+        "block_valid_capacity",
+    ]
+)
+def update_prefill_graph_compact_nonsplit_work_metadata_triton(
+    cache_seqlens_ptr,
+    cu_seqlens_q_ptr,
+    request_indices_ptr,
+    qo_tile_indices_ptr,
+    kv_tile_indices_ptr,
+    block_valid_mask_ptr,
+    kv_window_start_tokens_ptr,
+    work_items_capacity,
+    block_valid_capacity,
+    BATCH: tl.constexpr,
+    CTA_TILE_Q: tl.constexpr,
+    GQA_GROUP_SIZE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    WINDOW_LEFT: tl.constexpr,
+    BLOCK_WORK_ITEMS: tl.constexpr,
+):
+    """Pack live non-split prefill tiles into a fixed-capacity worklist.
+
+    The fixed grid is sized from total query capacity, not a per-request
+    rectangle.  Every CTA slot scans the capture-static request count and
+    derives its owner from live device ``cu_seqlens_q`` values.  This preserves
+    capacity for arbitrarily uneven request lengths without multiplying the
+    launch grid by the graph batch.
+    """
+
+    block_idx = tl.program_id(axis=0)
+    offsets = block_idx * BLOCK_WORK_ITEMS + tl.arange(0, BLOCK_WORK_ITEMS)
+    in_block_capacity = offsets < block_valid_capacity
+    in_work_capacity = offsets < work_items_capacity
+
+    request_idx = tl.zeros((BLOCK_WORK_ITEMS,), tl.int32)
+    qo_tile_idx = tl.zeros((BLOCK_WORK_ITEMS,), tl.int32)
+    active = tl.zeros((BLOCK_WORK_ITEMS,), tl.int1)
+    tile_prefix = tl.zeros((), tl.int32)
+
+    for req_idx in tl.static_range(0, BATCH):
+        q_start = tl.load(cu_seqlens_q_ptr + req_idx).to(tl.int32)
+        q_end = tl.load(cu_seqlens_q_ptr + req_idx + 1).to(tl.int32)
+        q_len = tl.maximum(q_end - q_start, 0)
+        num_q_tiles = (
+            q_len * GQA_GROUP_SIZE + CTA_TILE_Q - 1
+        ) // CTA_TILE_Q
+        owns_slot = (offsets >= tile_prefix) & (
+            offsets < tile_prefix + num_q_tiles
+        )
+        request_idx = tl.where(owns_slot, req_idx, request_idx)
+        qo_tile_idx = tl.where(owns_slot, offsets - tile_prefix, qo_tile_idx)
+        cache_len = tl.load(cache_seqlens_ptr + req_idx).to(tl.int32)
+        active = active | (owns_slot & (q_len > 0) & (cache_len > 0))
+        num_pages = tl.maximum((cache_len + PAGE_SIZE - 1) // PAGE_SIZE, 1)
+        window_start_page = tl.zeros((), tl.int32)
+        if WINDOW_LEFT >= 0:
+            first_causal_key = tl.maximum(cache_len - tl.maximum(q_len, 1), 0)
+            first_window_key = tl.maximum(first_causal_key - WINDOW_LEFT, 0)
+            window_start_page = first_window_key // PAGE_SIZE
+            window_start_page = tl.minimum(
+                window_start_page, tl.maximum(num_pages - 1, 0)
+            )
+        tl.store(
+            kv_window_start_tokens_ptr
+            + req_idx
+            + tl.zeros((BLOCK_WORK_ITEMS,), tl.int32),
+            window_start_page * PAGE_SIZE,
+            mask=offsets == req_idx,
+        )
+        tile_prefix += num_q_tiles
+
+    valid = active & in_block_capacity & in_work_capacity
+    tl.store(
+        block_valid_mask_ptr + offsets,
+        valid.to(tl.int32),
+        mask=in_block_capacity,
+    )
+    tl.store(
+        request_indices_ptr + offsets,
+        request_idx,
+        mask=in_work_capacity,
+    )
+    tl.store(
+        qo_tile_indices_ptr + offsets,
+        qo_tile_idx,
+        mask=in_work_capacity,
+    )
+    tl.store(
+        kv_tile_indices_ptr + offsets,
+        0,
+        mask=in_work_capacity,
+    )
+
+
+@triton.jit
+def prefix_prefill_graph_o_indptr_triton(
+    o_indptr_ptr,
+    BATCH: tl.constexpr,
+    BLOCK_BATCH: tl.constexpr,
+):
+    batch_offsets = tl.arange(0, BLOCK_BATCH)
+    batch_mask = batch_offsets < BATCH
+    counts = tl.load(
+        o_indptr_ptr + batch_offsets + 1,
+        mask=batch_mask,
+        other=0,
+    ).to(tl.int32)
+    prefix = tl.cumsum(tl.where(batch_mask, counts, 0), 0)
+    tl.store(o_indptr_ptr, 0)
+    tl.store(
+        o_indptr_ptr + batch_offsets + 1,
+        prefix,
+        mask=batch_mask,
+    )
 
 
 @triton.jit
@@ -1689,6 +1841,7 @@ def update_prefill_graph_chunk_metadata(
     page_size: int,
     split_kv: bool,
     window_left: int = -1,
+    adaptive_chunking: bool = False,
 ) -> None:
     device = cache_seqlens.device
     if cu_seqlens_q.device != device:
@@ -1717,6 +1870,10 @@ def update_prefill_graph_chunk_metadata(
         raise ValueError("gqa_group_size must be positive")
     if window_left < -1:
         raise ValueError("window_left must be -1 or non-negative")
+    if adaptive_chunking and (not split_kv or window_left >= 0):
+        raise ValueError(
+            "adaptive prefill chunking currently requires full split-KV attention"
+        )
 
     bs = int(batch)
     if bs <= 0:
@@ -1740,6 +1897,42 @@ def update_prefill_graph_chunk_metadata(
         raise ValueError("max_chunks_per_q_tile must be positive")
     if max_q_rows_per_req <= 0:
         raise ValueError("max_q_rows_per_req must be positive")
+    if not split_kv:
+        # A non-split prefill only needs one work item per live query tile.
+        # Pack those tiles across the fixed graph capacity instead of reserving
+        # a batch x max-tiles rectangle.  The capture-static batch is scanned
+        # in the device kernel, so uneven live query lengths never require a
+        # host-side plan or live-length-dependent launch decision.
+        if bs > work_items_capacity or bs > block_valid_capacity:
+            raise RuntimeError(
+                "prefill graph workspace must have at least one work item per request"
+            )
+        if int(kv_window_start_tokens.shape[0]) < bs:
+            raise RuntimeError(
+                "prefill graph workspace kv_window_start_tokens capacity is too small"
+            )
+        work_blocks = triton.cdiv(
+            block_valid_capacity, _PREFILL_BLOCK_WORK_ITEMS
+        )
+        update_prefill_graph_compact_nonsplit_work_metadata_triton[(work_blocks,)](
+            cache_seqlens,
+            cu_seqlens_q,
+            request_indices,
+            qo_tile_indices,
+            kv_tile_indices,
+            block_valid_mask,
+            kv_window_start_tokens,
+            work_items_capacity=work_items_capacity,
+            block_valid_capacity=block_valid_capacity,
+            BATCH=bs,
+            CTA_TILE_Q=int(cta_tile_q),
+            GQA_GROUP_SIZE=int(gqa_group_size),
+            PAGE_SIZE=int(page_size),
+            WINDOW_LEFT=int(window_left),
+            BLOCK_WORK_ITEMS=_PREFILL_BLOCK_WORK_ITEMS,
+        )
+        return
+
     required_work_items = bs * int(max_q_tiles_per_req) * int(max_chunks_per_q_tile)
     if required_work_items > work_items_capacity:
         raise RuntimeError(
@@ -1777,12 +1970,14 @@ def update_prefill_graph_chunk_metadata(
         PAGE_SIZE=int(page_size),
         WINDOW_LEFT=int(window_left),
         SPLIT_KV=bool(split_kv),
+        ADAPTIVE_CHUNKING=bool(adaptive_chunking),
+        BLOCK_BATCH=triton.next_power_of_2(bs),
         BLOCK_WORK_ITEMS=_PREFILL_BLOCK_WORK_ITEMS,
     )
-    torch.cumsum(
-        o_indptr[1 : bs + 1],
-        dim=0,
-        out=o_indptr[1 : bs + 1],
+    prefix_prefill_graph_o_indptr_triton[(1,)](
+        o_indptr,
+        BATCH=bs,
+        BLOCK_BATCH=triton.next_power_of_2(bs),
     )
     total_num_rows_ptr[:1].copy_(cu_seqlens_q[bs : bs + 1])
 

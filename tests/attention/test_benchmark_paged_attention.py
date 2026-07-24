@@ -105,7 +105,7 @@ def test_observed_decode_graph_topology_reports_device_schedule() -> None:
 
 
 def test_decode_graph_metadata_records_flashinfer_host_plan_asymmetry() -> None:
-    policy = _decode_graph_replay_policy_metadata(include_flashinfer=True)
+    policy = _decode_graph_replay_policy_metadata(flashinfer_backend="fa2")
     backends = policy["backends"]
     sparkinfer = backends["sparkinfer"]
     flashinfer = backends["flashinfer-fa2"]
@@ -131,7 +131,7 @@ def test_decode_graph_metadata_records_flashinfer_host_plan_asymmetry() -> None:
     }
     timing = _decode_graph_timing_metadata(
         base_timing,
-        include_flashinfer=True,
+        flashinfer_backend="fa2",
     )
     assert timing["method"] == "paired-interleaved-ab-ba"
     assert timing["even_pair_order"] == ["sparkinfer", "flashinfer-fa2"]
@@ -417,6 +417,7 @@ def test_decode_graph_buckets_reuse_single_graph_across_long_contexts_and_match_
         kv_dtype=torch.bfloat16,
         workspace_bytes=512 * 1024 * 1024,
         warmup=1,
+        backend="fa2",
     )
 
     sparkinfer_graph_id = id(sparkinfer_bucket.graph)

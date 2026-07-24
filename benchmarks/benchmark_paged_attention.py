@@ -149,6 +149,27 @@ def _bench_graph(
     return [start.elapsed_time(end) for start, end in zip(starts, ends, strict=True)]
 
 
+def _export_graph_trace(
+    graph: torch.cuda.CUDAGraph,
+    *,
+    path: pathlib.Path,
+    replays: int = 10,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.cuda.synchronize()
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA],
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,
+    ) as profiler:
+        for _ in range(replays):
+            graph.replay()
+        torch.cuda.synchronize()
+    profiler.export_chrome_trace(str(path))
+    print(f"CUDA graph trace: {path}")
+
+
 _PAIRED_AB_BA_TIMING_METHOD = "paired-interleaved-ab-ba"
 
 
@@ -156,7 +177,7 @@ def _balanced_graph_replay_schedule(
     replays: int,
     *,
     backend_a: str = "sparkinfer",
-    backend_b: str = "flashinfer-fa2",
+    backend_b: str = "flashinfer-trtllm-gen",
 ) -> tuple[tuple[str, str], ...]:
     """Return an AB/BA schedule whose sample index is the replay-pair index."""
     if replays <= 0:
@@ -175,7 +196,7 @@ def _bench_graph_pair_balanced(
     *,
     replays: int,
     backend_a: str = "sparkinfer",
-    backend_b: str = "flashinfer-fa2",
+    backend_b: str = "flashinfer-trtllm-gen",
     l2_flush=None,
 ) -> tuple[list[float], list[float], dict[str, object]]:
     """Time two graphs in alternating AB/BA order with independent events."""
@@ -269,13 +290,38 @@ def _reference_gate(
         or relative_l2 > maximum_relative_l2
         or not allclose
     ):
+        row_diagnostics = ""
+        if output.shape == reference.shape and output.ndim >= 2:
+            output_rows = output.float().reshape(-1, output.shape[-1])
+            reference_rows = reference.float().reshape(-1, reference.shape[-1])
+            row_diff_norm = torch.linalg.vector_norm(
+                output_rows - reference_rows, dim=-1
+            )
+            row_ref_norm = torch.linalg.vector_norm(reference_rows, dim=-1)
+            row_relative_l2 = row_diff_norm / row_ref_norm.clamp_min(1.0e-12)
+            worst_rows = torch.topk(
+                row_relative_l2, k=min(24, row_relative_l2.numel())
+            )
+            row_diagnostics = (
+                ", worst_row_rel_l2="
+                + repr(
+                    [
+                        (int(row), float(error))
+                        for error, row in zip(
+                            worst_rows.values.tolist(),
+                            worst_rows.indices.tolist(),
+                            strict=True,
+                        )
+                    ]
+                )
+            )
         raise AssertionError(
             f"{backend} paged attention failed the Torch reference gate: "
             f"nonzero={nonzero}, finite={finite}, cos={cosine:.8f}, "
             f"minimum_cosine={minimum_cosine:.8f}, rel_l2={relative_l2:.8f}, "
             f"maximum_relative_l2={maximum_relative_l2:.8f}, "
             f"allclose={allclose} (rtol={relative_tolerance}, "
-            f"atol={absolute_tolerance})"
+            f"atol={absolute_tolerance}){row_diagnostics}"
         )
     return max_abs, relative_l2, cosine, nonzero
 
@@ -320,15 +366,15 @@ def _json_sha256(payload: object) -> str:
 
 def _decode_graph_replay_policy_metadata(
     *,
-    include_flashinfer: bool,
+    flashinfer_backend: str | None,
 ) -> dict[str, object]:
     """Describe live-length planning included in and excluded from timing.
 
-    FlashInfer's ``use_cuda_graph=True`` stabilizes its buffers and captured
-    execution, but its public FA2 ``plan`` API is still a host operation.  The
-    decode-bucket benchmark calls it once for each live length before replay
-    timing.  Sparkinfer instead captures its schedule updater in the graph.
-    Keep that asymmetry explicit wherever a replay ratio is recorded.
+    FlashInfer FA2's public ``plan`` API is a live-length-dependent host
+    operation.  TRTLLM-Gen instead consumes persistent GPU block tables and
+    sequence lengths directly, matching the serving path and Sparkinfer's
+    graph-safety contract.  Keep the selected comparator explicit wherever a
+    replay ratio is recorded.
     """
     backends: dict[str, object] = {
         "sparkinfer": {
@@ -352,7 +398,7 @@ def _decode_graph_replay_policy_metadata(
             ],
         }
     }
-    if include_flashinfer:
+    if flashinfer_backend == "fa2":
         backends["flashinfer-fa2"] = {
             "strict_live_length_graph_safe": False,
             "live_length_dependent_host_planning": True,
@@ -369,9 +415,29 @@ def _decode_graph_replay_policy_metadata(
             ],
             "available_strict_graph_safe_live_length_path_in_benchmark": False,
         }
+    elif flashinfer_backend == "trtllm-gen":
+        backends["flashinfer-trtllm-gen"] = {
+            "strict_live_length_graph_safe": True,
+            "live_length_dependent_host_planning": False,
+            "runtime_metadata_binding": (
+                "stable-address device block_tables and seq_lens passed directly "
+                "to trtllm_batch_decode_with_kv_cache"
+            ),
+            "live_length_staging_before_timing": [
+                "fill persistent device seq_lens input",
+            ],
+            "planning_timed": [],
+            "planning_excluded_from_timing": [],
+            "timed_graph_work": [
+                "captured TRTLLM-Gen paged-attention execution",
+            ],
+            "available_strict_graph_safe_live_length_path_in_benchmark": True,
+        }
+    elif flashinfer_backend is not None:
+        raise ValueError(f"unsupported FlashInfer backend {flashinfer_backend!r}")
 
     payload: dict[str, object] = {
-        "schema": "sparkinfer-decode-graph-replay-policy-v1",
+        "schema": "sparkinfer-decode-graph-replay-policy-v2",
         "measurement_scope": "captured-cuda-graph-replay-only",
         "backends": backends,
         "comparison_limitation": (
@@ -379,8 +445,13 @@ def _decode_graph_replay_policy_metadata(
             "excluded, while Sparkinfer's device schedule updater runs inside every "
             "timed graph replay; ratios are captured-execution comparisons, not "
             "strict graph-safe end-to-end serving comparisons."
-            if include_flashinfer
-            else "Sparkinfer device schedule selection is included in every timed graph replay."
+            if flashinfer_backend == "fa2"
+            else (
+                "Both backends consume stable-address device live-length metadata "
+                "without live-length-dependent host planning."
+                if flashinfer_backend == "trtllm-gen"
+                else "Sparkinfer device schedule selection is included in every timed graph replay."
+            )
         ),
     }
     payload["sha256"] = _json_sha256(payload)
@@ -390,7 +461,7 @@ def _decode_graph_replay_policy_metadata(
 def _decode_graph_timing_metadata(
     base_timing: Mapping[str, object] | None,
     *,
-    include_flashinfer: bool,
+    flashinfer_backend: str | None,
 ) -> dict[str, object]:
     timing = (
         dict(base_timing)
@@ -401,7 +472,7 @@ def _decode_graph_timing_metadata(
         }
     )
     timing["replay_policy"] = _decode_graph_replay_policy_metadata(
-        include_flashinfer=include_flashinfer
+        flashinfer_backend=flashinfer_backend
     )
     return timing
 
@@ -745,7 +816,9 @@ def _initialize_raw_sample_log(
                 "fixed_workspace_capacity": True,
                 "decode_graph_replay_policy": (
                     _decode_graph_replay_policy_metadata(
-                        include_flashinfer=args.compare_fa2
+                        flashinfer_backend=(
+                            args.flashinfer_backend if args.compare_fa2 else None
+                        )
                     )
                     if args.mode == "decode-graph-buckets"
                     else {"status": "not-applicable-to-legacy-matrix"}
@@ -864,10 +937,16 @@ def _import_flashinfer():
         import flashinfer
     except ImportError as exc:  # pragma: no cover - benchmark-time dependency
         raise ImportError(
-            "flashinfer is required for --compare-fa2; install it in the benchmark env "
-            "or add the repo to PYTHONPATH"
+            "flashinfer is required for FlashInfer comparison; install it in the "
+            "benchmark env or add the repo to PYTHONPATH"
         ) from exc
     return flashinfer
+
+
+def _flashinfer_backend_label(backend: str) -> str:
+    if backend not in ("fa2", "trtllm-gen"):
+        raise ValueError(f"unsupported FlashInfer backend {backend!r}")
+    return f"flashinfer-{backend}"
 
 
 @dataclass(frozen=True)
@@ -906,6 +985,7 @@ class FlashinferCapture:
     guarded_output: _GuardedOutput
     wrapper: object
     owners: tuple[object, ...]
+    backend_label: str
 
 
 def _build_shape_cases(
@@ -1490,13 +1570,36 @@ def _assert_backend_result_regions_overwritten(
                     workspace._use_regular_decode_graph_replay
                 ),
             )
-        if not bool(torch.isfinite(tmp_output).all().item()):
-            raise AssertionError(
-                "sparkinfer logical split-KV temporary output was not fully overwritten"
+        elif (
+            workspace.use_cuda_graph
+            and workspace.mode in ("extend", "verify")
+        ):
+            assert workspace.o_indptr is not None
+            tmp_output, tmp_lse = _active_split_kv_temporary_results(
+                tmp_output=tmp_output,
+                tmp_lse=tmp_lse,
+                o_indptr=workspace.o_indptr,
+                batch=int(plan.page_table_shape[0]),
+                regular_decode_graph=False,
             )
-        if not bool(torch.isfinite(tmp_lse).all().item()):
+        # Causally empty split rows are represented by LSE=-inf.  Their
+        # temporary output is semantically ignored by the merge and need not
+        # be written.  Require every contributing partial to be finite and
+        # reject NaN/+inf LSE without imposing writes on neutral slots.
+        if bool(torch.isnan(tmp_lse).any().item()) or bool(
+            torch.isposinf(tmp_lse).any().item()
+        ):
             raise AssertionError(
-                "sparkinfer logical split-KV temporary LSE was not fully overwritten"
+                "sparkinfer active split-KV temporary LSE contains NaN or +inf"
+            )
+        contributing = torch.isfinite(tmp_lse)
+        if not bool(contributing.any().item()):
+            raise AssertionError(
+                "sparkinfer split-KV replay produced no contributing partials"
+            )
+        if not bool(torch.isfinite(tmp_output[contributing]).all().item()):
+            raise AssertionError(
+                "sparkinfer contributing split-KV temporary output was not fully overwritten"
             )
 
 
@@ -1765,6 +1868,9 @@ def _make_decode_bucket_shared_inputs(
         seed=seed,
         combined_kv_cache=combined_kv_cache,
     )
+    if os.environ.get("SPARKINFER_PAGED_DEBUG_IDENTICAL_KV_HEADS", "0") == "1":
+        k_cache.copy_(k_cache[:, :, :1, :].expand_as(k_cache))
+        v_cache.copy_(v_cache[:, :, :1, :].expand_as(v_cache))
     k_descale = None
     v_descale = None
     k_scale = None
@@ -1910,6 +2016,8 @@ class FlashinferDecodeGraphBucket:
     current_cache_seqlens: torch.Tensor
     read_only_snapshot: _ReadOnlyInputSnapshot | None
     read_only_inputs: dict[str, torch.Tensor] | None
+    backend_label: str
+    owners: tuple[object, ...]
 
     @property
     def batch(self) -> int:
@@ -1928,6 +2036,31 @@ class FlashinferDecodeGraphBucket:
         effective_cache_tokens = _decode_effective_cache_tokens(
             context_tokens=context_tokens
         )
+        if self.backend_label == "flashinfer-trtllm-gen":
+            # TRTLLM-Gen reads this persistent GPU tensor inside the captured
+            # kernel.  The fixed-capacity block table and graph topology do not
+            # change with the live sequence length.
+            self.current_cache_seqlens.fill_(effective_cache_tokens)
+            if self.shared.read_only_snapshot is not None:
+                self.read_only_snapshot = _extend_read_only_input_snapshot(
+                    self.shared.read_only_snapshot,
+                    page_table=self.current_page_table,
+                    cache_seqlens=self.current_cache_seqlens,
+                )
+                self.read_only_inputs = {
+                    **self.shared.read_only_inputs,
+                    "page_table": self.current_page_table,
+                    "cache_seqlens": self.current_cache_seqlens,
+                }
+            else:
+                self.read_only_snapshot = None
+                self.read_only_inputs = None
+            return
+
+        if self.backend_label != "flashinfer-fa2":
+            raise ValueError(
+                f"unsupported FlashInfer bucket backend {self.backend_label!r}"
+            )
         active_pages = (
             effective_cache_tokens + self.page_size - 1
         ) // self.page_size
@@ -1993,6 +2126,7 @@ def _capture_backend_graph(
     warmup: int,
     graph_ctas_per_sm: int | None,
     window_left: int,
+    paged_mode: str = "auto",
     strict_check: bool = True,
 ) -> BackendCapture:
     base_snapshot = (
@@ -2027,7 +2161,16 @@ def _capture_backend_graph(
         base_inputs["v_descale"] = v_descale
     guarded_output = _allocate_guarded_output(q)
     output = guarded_output.output
-    mode = "decode" if int(q.shape[0]) == int(page_table.shape[0]) else "extend"
+    inferred_mode = (
+        "decode" if int(q.shape[0]) == int(page_table.shape[0]) else "extend"
+    )
+    mode = inferred_mode if paged_mode == "auto" else paged_mode
+    if mode not in ("decode", "extend", "verify"):
+        raise ValueError(f"unsupported paged attention mode {mode!r}")
+    if mode == "decode" and inferred_mode != "decode":
+        raise ValueError("decode mode requires exactly one query row per request")
+    if mode == "verify" and inferred_mode == "decode":
+        raise ValueError("verify mode requires more than one query row per request")
     workspace = PagedAttentionWorkspace.for_tensors(
         mode=mode,
         q=q,
@@ -2035,10 +2178,10 @@ def _capture_backend_graph(
         v_cache=v_cache,
         use_cuda_graph=True,
     )
-    if mode == "extend":
+    if mode in ("extend", "verify"):
         if fixed_split_pages is not None or graph_ctas_per_sm is not None:
             raise ValueError(
-                "prefill graph replay uses the workspace planner policy; "
+                "extend/verify graph replay uses the workspace planner policy; "
                 "fixed split and CTA overrides are decode-only benchmark options"
             )
         workspace.prepare_prefill_graph_replay_state(
@@ -2049,6 +2192,27 @@ def _capture_backend_graph(
             cu_seqlens_q=cu_seqlens_q,
             window_left=window_left,
         )
+        capture_plan = workspace.plan
+        replay_plan = None
+    elif window_left >= 0:
+        if fixed_split_pages is not None or graph_ctas_per_sm is not None:
+            raise ValueError(
+                "sliding decode graph replay uses the production workspace "
+                "policy; fixed split and CTA overrides are not supported"
+            )
+        workspace.prepare_decode_graph_replay_state(
+            batch=int(capture_page_table.shape[0]),
+            total_q_capacity=int(q.shape[0]),
+            max_page_table_width=int(capture_page_table.shape[1]),
+            max_cache_page_count=int(capture_page_table.shape[1]),
+            window_left=window_left,
+        )
+        workspace._copy_runtime_metadata(
+            capture_page_table,
+            capture_cache_seqlens,
+            cu_seqlens_q,
+        )
+        workspace.update_decode_graph_replay_metadata_from_runtime_cache_seqlens()
         capture_plan = workspace.plan
         replay_plan = None
     else:
@@ -2101,7 +2265,7 @@ def _capture_backend_graph(
     guarded_output.assert_fully_overwritten(backend="sparkinfer-capture")
     if capture_snapshot is not None and capture_inputs is not None:
         _assert_read_only_inputs_unchanged(capture_snapshot, capture_inputs)
-    if mode == "extend":
+    if mode in ("extend", "verify"):
         workspace.update_prefill_graph_replay_metadata(
             page_table,
             cache_seqlens,
@@ -2112,8 +2276,18 @@ def _capture_backend_graph(
             kv_chunk_size=capture_plan.kv_chunk_size,
             split_kv=capture_plan.split_kv,
         )
+    elif replay_plan is None:
+        workspace._copy_runtime_metadata(
+            page_table,
+            cache_seqlens,
+            cu_seqlens_q,
+        )
+        workspace.update_decode_graph_replay_metadata_from_runtime_cache_seqlens()
+        chunk_desc = _format_plan_desc(
+            kv_chunk_size=capture_plan.kv_chunk_size,
+            split_kv=capture_plan.split_kv,
+        )
     else:
-        assert replay_plan is not None
         chunk_desc = _load_backend_graph_plan(
             workspace=workspace,
             plan=replay_plan,
@@ -2258,6 +2432,7 @@ def _capture_flashinfer_fa2_graph(
                 capture_paged_kv_last_page_len,
                 q_input,
             ),
+            backend_label="flashinfer-fa2",
         )
 
     wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
@@ -2324,7 +2499,107 @@ def _capture_flashinfer_fa2_graph(
             capture_paged_kv_indices,
             capture_paged_kv_last_page_len,
         ),
+        backend_label="flashinfer-fa2",
     )
+
+
+def _capture_flashinfer_trtllm_gen_decode_graph(
+    *,
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    capture_page_table: torch.Tensor,
+    q_seqlen: int,
+    page_size: int,
+    q_heads: int,
+    head_dim: int,
+    k_scale: float | None,
+    v_scale: float | None,
+    workspace_bytes: int,
+    warmup: int,
+    window_left: int,
+) -> FlashinferCapture:
+    if q_seqlen not in (1, 8):
+        raise ValueError(
+            "the direct TRTLLM-Gen decode comparator is restricted to the "
+            f"production q=1/q=8 decode surface, got q={q_seqlen}"
+        )
+    from flashinfer.decode import trtllm_batch_decode_with_kv_cache
+
+    batch = int(page_table.shape[0])
+    if int(capture_page_table.shape[0]) != batch:
+        raise ValueError("capture page table batch does not match the live page table")
+    if int(page_table.shape[1]) > int(capture_page_table.shape[1]):
+        raise ValueError("live page table exceeds the captured TRTLLM-Gen capacity")
+
+    # These are the stable-address metadata tensors consumed by the captured
+    # kernel.  Only their contents change between graph replays.
+    runtime_block_tables = capture_page_table.clone()
+    runtime_block_tables[:, : int(page_table.shape[1])].copy_(page_table)
+    runtime_seq_lens = cache_seqlens.clone()
+    workspace = torch.zeros(workspace_bytes, dtype=torch.uint8, device=q.device)
+    q_input = q.view(batch * q_seqlen, q_heads, head_dim)
+    guarded_output = _allocate_guarded_output(q_input)
+    output = guarded_output.output
+    bmm1_scale = float(head_dim**-0.5) * (
+        1.0 if k_scale is None else float(k_scale)
+    )
+    bmm2_scale = 1.0 if v_scale is None else float(v_scale)
+    max_seq_len = int(capture_page_table.shape[1]) * int(page_size)
+
+    def run() -> None:
+        trtllm_batch_decode_with_kv_cache(
+            query=q_input,
+            kv_cache=(k_cache, v_cache),
+            workspace_buffer=workspace,
+            block_tables=runtime_block_tables,
+            seq_lens=runtime_seq_lens,
+            max_seq_len=max_seq_len,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            window_left=window_left,
+            out=output,
+            kv_layout="NHD",
+            backend="trtllm-gen",
+            q_len_per_req=q_seqlen,
+        )
+
+    graph = _capture_graph(run, warmup=warmup)
+    guarded_output.assert_fully_overwritten(
+        backend="flashinfer-trtllm-gen-capture"
+    )
+    return FlashinferCapture(
+        graph=graph,
+        output=output,
+        guarded_output=guarded_output,
+        wrapper=None,
+        owners=(
+            workspace,
+            runtime_block_tables,
+            runtime_seq_lens,
+            q_input,
+        ),
+        backend_label="flashinfer-trtllm-gen",
+    )
+
+
+def _capture_flashinfer_graph(
+    *,
+    backend: str,
+    **kwargs,
+) -> FlashinferCapture:
+    if backend == "fa2":
+        return _capture_flashinfer_fa2_graph(**kwargs)
+    if backend == "trtllm-gen":
+        trtllm_kwargs = dict(kwargs)
+        trtllm_kwargs.pop("q_dtype")
+        trtllm_kwargs.pop("kv_dtype")
+        trtllm_kwargs.pop("capture_cache_seqlens")
+        trtllm_kwargs.pop("kv_heads")
+        return _capture_flashinfer_trtllm_gen_decode_graph(**trtllm_kwargs)
+    raise ValueError(f"unsupported FlashInfer backend {backend!r}")
 
 
 def _capture_sparkinfer_decode_graph_bucket(
@@ -2458,7 +2733,66 @@ def _capture_flashinfer_decode_graph_bucket(
     kv_dtype: torch.dtype,
     workspace_bytes: int,
     warmup: int,
+    backend: str,
 ) -> FlashinferDecodeGraphBucket:
+    if backend == "trtllm-gen":
+        capture = _capture_flashinfer_trtllm_gen_decode_graph(
+            q=shared.q,
+            k_cache=shared.k_cache,
+            v_cache=shared.v_cache,
+            page_table=shared.capture_page_table,
+            cache_seqlens=shared.capture_cache_seqlens,
+            capture_page_table=shared.capture_page_table,
+            q_seqlen=1,
+            page_size=page_size,
+            q_heads=q_heads,
+            head_dim=head_dim,
+            k_scale=shared.k_scale,
+            v_scale=shared.v_scale,
+            workspace_bytes=workspace_bytes,
+            warmup=warmup,
+            window_left=-1,
+        )
+        runtime_block_tables = capture.owners[1]
+        runtime_seq_lens = capture.owners[2]
+        assert isinstance(runtime_block_tables, torch.Tensor)
+        assert isinstance(runtime_seq_lens, torch.Tensor)
+        if shared.read_only_snapshot is not None:
+            read_only_snapshot = _extend_read_only_input_snapshot(
+                shared.read_only_snapshot,
+                page_table=runtime_block_tables,
+                cache_seqlens=runtime_seq_lens,
+            )
+            read_only_inputs = {
+                **shared.read_only_inputs,
+                "page_table": runtime_block_tables,
+                "cache_seqlens": runtime_seq_lens,
+            }
+        else:
+            read_only_snapshot = None
+            read_only_inputs = None
+        return FlashinferDecodeGraphBucket(
+            shared=shared,
+            wrapper=None,
+            graph=capture.graph,
+            output=capture.output,
+            guarded_output=capture.guarded_output,
+            page_size=page_size,
+            q_heads=q_heads,
+            kv_heads=kv_heads,
+            head_dim=head_dim,
+            q_dtype=q_dtype,
+            kv_dtype=kv_dtype,
+            current_page_table=runtime_block_tables,
+            current_cache_seqlens=runtime_seq_lens,
+            read_only_snapshot=read_only_snapshot,
+            read_only_inputs=read_only_inputs,
+            backend_label=capture.backend_label,
+            owners=capture.owners,
+        )
+    if backend != "fa2":
+        raise ValueError(f"unsupported FlashInfer backend {backend!r}")
+
     flashinfer = _import_flashinfer()
     (
         capture_qo_indptr,
@@ -2535,6 +2869,8 @@ def _capture_flashinfer_decode_graph_bucket(
         read_only_inputs=(
             shared.read_only_inputs if shared.read_only_snapshot is not None else None
         ),
+        backend_label="flashinfer-fa2",
+        owners=(float_workspace,),
     )
 
 
@@ -2578,6 +2914,8 @@ def _run_legacy_matrix(args: argparse.Namespace) -> None:
         q_seqlens=q_seqlens,
         cache_seqlens=cache_seqlens,
     )
+    if args.torch_profile_trace is not None and len(cases) != 1:
+        raise ValueError("--torch-profile-trace requires exactly one shape case")
 
     print(
         "shape matrix:",
@@ -2598,9 +2936,12 @@ def _run_legacy_matrix(args: argparse.Namespace) -> None:
             "fixed_split_pages": args.fixed_split_pages,
             "capture_cache_seqlen": args.capture_cache_seqlen,
             "graph_ctas_per_sm": args.graph_ctas_per_sm,
+            "paged_mode": args.paged_mode,
             "window_left": args.window_left,
             "replays": args.replays,
-            "flashinfer_fa2": args.compare_fa2,
+            "flashinfer_backend": (
+                args.flashinfer_backend if args.compare_fa2 else None
+            ),
             "l2_flush": args.flush_l2,
         },
     )
@@ -2664,7 +3005,11 @@ def _run_legacy_matrix(args: argparse.Namespace) -> None:
             if args.graph_ctas_per_sm > 0
             else None,
             window_left=args.window_left,
+            paged_mode=args.paged_mode,
             strict_check=args.check,
+        )
+        sparkinfer_forward_traits = _paged_forward_traits_contract(
+            backend_capture.workspace.plan
         )
         check_suffix = ""
         reference_output: torch.Tensor | None = None
@@ -2707,6 +3052,11 @@ def _run_legacy_matrix(args: argparse.Namespace) -> None:
                 f" torch_cos={reference_cos:.8f}"
                 f" nonzero={nonzero}"
             )
+        if args.torch_profile_trace is not None:
+            _export_graph_trace(
+                backend_capture.graph,
+                path=args.torch_profile_trace,
+            )
         backend_times_ms = _bench_graph(
             backend_capture.graph,
             replays=args.replays,
@@ -2716,6 +3066,7 @@ def _run_legacy_matrix(args: argparse.Namespace) -> None:
             {
                 "profile": args.profile,
                 "mode": args.mode,
+                "paged_mode": args.paged_mode,
                 "phase": case.phase,
                 "batch": case.batch,
                 "q_seqlen": case.q_seqlen,
@@ -2729,6 +3080,7 @@ def _run_legacy_matrix(args: argparse.Namespace) -> None:
                 "kv_dtype": str(kv_dtype),
                 "kv_cache_layout": _kv_cache_layout_contract(k_cache, v_cache),
                 "plan": backend_capture.plan_desc,
+                "sparkinfer_forward_traits": sparkinfer_forward_traits,
             },
             input_seed=1 + case_idx,
             input_generator="uniform-paged-inputs-v1",
@@ -2749,7 +3101,8 @@ def _run_legacy_matrix(args: argparse.Namespace) -> None:
         flashinfer_output: torch.Tensor | None = None
         fa2_correctness: dict[str, object] | None = None
         if args.compare_fa2:
-            flashinfer_capture = _capture_flashinfer_fa2_graph(
+            flashinfer_capture = _capture_flashinfer_graph(
+                backend=args.flashinfer_backend,
                 q=q,
                 k_cache=k_cache,
                 v_cache=v_cache,
@@ -2771,10 +3124,19 @@ def _run_legacy_matrix(args: argparse.Namespace) -> None:
                 window_left=args.window_left,
             )
             flashinfer_output = flashinfer_capture.output
+            if args.torch_profile_trace is not None:
+                flashinfer_trace = args.torch_profile_trace.with_name(
+                    f"{args.torch_profile_trace.stem}-flashinfer"
+                    f"{args.torch_profile_trace.suffix}"
+                )
+                _export_graph_trace(
+                    flashinfer_capture.graph,
+                    path=flashinfer_trace,
+                )
             if args.check:
                 assert reference_output is not None
                 _strict_guarded_replay_for_correctness(
-                    backend="flashinfer-fa2",
+                    backend=flashinfer_capture.backend_label,
                     graph=flashinfer_capture.graph,
                     guarded_output=flashinfer_capture.guarded_output,
                     read_only_snapshot=backend_capture.read_only_snapshot,
@@ -2787,7 +3149,7 @@ def _run_legacy_matrix(args: argparse.Namespace) -> None:
                     fa2_ref_cos,
                     fa2_nonzero,
                 ) = _reference_gate(
-                    backend="flashinfer-fa2",
+                    backend=flashinfer_capture.backend_label,
                     output=flashinfer_output,
                     reference=reference_output,
                 )
@@ -2823,9 +3185,12 @@ def _run_legacy_matrix(args: argparse.Namespace) -> None:
                     ),
                 }
                 check_suffix += (
-                    f" fa2/ref_rel_l2={fa2_ref_rel_l2:.6f}"
-                    f" fa2/ref_cos={fa2_ref_cos:.8f}"
-                    f" sparkinfer/fa2_cos={cross_cos:.8f}"
+                    f" {flashinfer_capture.backend_label}/ref_rel_l2="
+                    f"{fa2_ref_rel_l2:.6f}"
+                    f" {flashinfer_capture.backend_label}/ref_cos="
+                    f"{fa2_ref_cos:.8f}"
+                    f" sparkinfer/{flashinfer_capture.backend_label}_cos="
+                    f"{cross_cos:.8f}"
                 )
             flashinfer_times_ms = _bench_graph(
                 flashinfer_capture.graph,
@@ -2834,13 +3199,13 @@ def _run_legacy_matrix(args: argparse.Namespace) -> None:
             )
             _record_samples(
                 args.raw_samples_jsonl,
-                backend="flashinfer-fa2",
+                backend=flashinfer_capture.backend_label,
                 case=sample_case,
                 samples_ms=flashinfer_times_ms,
                 correctness=fa2_correctness,
             )
             flashinfer_metrics = CaseMetrics(
-                backend="flashinfer-fa2",
+                backend=flashinfer_capture.backend_label,
                 mean_us=statistics.fmean(flashinfer_times_ms) * 1000.0,
             )
             speedups.append(flashinfer_metrics.mean_us / backend_metrics.mean_us)
@@ -2856,14 +3221,18 @@ def _run_legacy_matrix(args: argparse.Namespace) -> None:
         if flashinfer_metrics is not None:
             ratio = flashinfer_metrics.mean_us / backend_metrics.mean_us
             line += (
-                f" | fa2 mean={flashinfer_metrics.mean_us:8.1f} us "
-                f"| fa2/{backend_metrics.backend}="
+                f" | {flashinfer_metrics.backend} "
+                f"mean={flashinfer_metrics.mean_us:8.1f} us "
+                f"| {flashinfer_metrics.backend}/{backend_metrics.backend}="
                 f"{ratio:6.3f}x"
             )
         print(line + check_suffix)
 
     if speedups:
-        print(f"geomean fa2/sparkinfer: {statistics.geometric_mean(speedups):.3f}x")
+        print(
+            f"geomean {_flashinfer_backend_label(args.flashinfer_backend)}/sparkinfer: "
+            f"{statistics.geometric_mean(speedups):.3f}x"
+        )
 
 
 def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
@@ -2879,6 +3248,10 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
         batch_buckets=batch_buckets,
         context_tokens=decode_contexts,
     )
+    if args.torch_profile_trace is not None and len(cases) != 1:
+        raise ValueError(
+            "--torch-profile-trace requires exactly one decode graph case"
+        )
 
     print(
         "decode graph buckets:",
@@ -2902,7 +3275,9 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
             "fixed_split_pages": args.fixed_split_pages,
             "graph_ctas_per_sm": args.graph_ctas_per_sm,
             "replays": args.replays,
-            "flashinfer_fa2": args.compare_fa2,
+            "flashinfer_backend": (
+                args.flashinfer_backend if args.compare_fa2 else None
+            ),
             "l2_flush": args.flush_l2,
         },
     )
@@ -2964,6 +3339,7 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
                 kv_dtype=kv_dtype,
                 workspace_bytes=flashinfer_workspace_bytes,
                 warmup=args.warmup,
+                backend=args.flashinfer_backend,
             )
             if args.compare_fa2
             else None
@@ -2982,11 +3358,179 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
                 ) from exc
             if fa2_bucket is not None:
                 fa2_bucket.prepare_replay(context_tokens=case.context_tokens)
+            if args.torch_profile_trace is not None:
+                _export_graph_trace(
+                    sparkinfer_bucket.graph,
+                    path=args.torch_profile_trace,
+                )
+                if fa2_bucket is not None:
+                    flashinfer_trace = args.torch_profile_trace.with_name(
+                        f"{args.torch_profile_trace.stem}-flashinfer"
+                        f"{args.torch_profile_trace.suffix}"
+                    )
+                    _export_graph_trace(
+                        fa2_bucket.graph,
+                        path=flashinfer_trace,
+                    )
 
             check_suffix = ""
             sparkinfer_correctness: dict[str, object] | None = None
             fa2_correctness: dict[str, object] | None = None
             if args.check:
+                tma_debug_dump = os.environ.get(
+                    "SPARKINFER_PAGED_KV_TMA_DEBUG_DUMP", ""
+                )
+                if tma_debug_dump in ("K", "Q", "S", "V"):
+                    if l2_flush is not None:
+                        l2_flush()
+                    _poison_backend_result_regions(sparkinfer_bucket)
+                    torch.cuda.synchronize()
+                    sparkinfer_bucket.graph.replay()
+                    torch.cuda.synchronize()
+                    tmp_output = sparkinfer_bucket.workspace.tmp_output
+                    assert tmp_output is not None
+                    if tma_debug_dump == "Q":
+                        expected_q = sparkinfer_bucket.q[0, :6, :].float()
+                        dumped_q = tmp_output.flatten()[
+                            : expected_q.numel()
+                        ].view_as(expected_q).float()
+                        delta = dumped_q - expected_q
+                        q_candidates = sparkinfer_bucket.q[0].float()
+                        nearest_q = torch.argmin(
+                            torch.cdist(dumped_q, q_candidates), dim=1
+                        ).tolist()
+                        print(
+                            f"Q stage dump mismatch_count="
+                            f"{int((dumped_q != expected_q).sum().item())} "
+                            f"max_abs={float(delta.abs().max().item())} "
+                            f"rel_l2={float(torch.linalg.vector_norm(delta) / torch.linalg.vector_norm(expected_q).clamp_min(1e-12))} "
+                            f"nearest_q_heads={nearest_q}"
+                        )
+                        return
+                    if tma_debug_dump == "S":
+                        live_tokens = int(
+                            sparkinfer_bucket.current_cache_seqlens[0].item()
+                        )
+                        page_count = (live_tokens + args.page_size - 1) // args.page_size
+                        page_ids = sparkinfer_bucket.current_page_table[
+                            0, :page_count
+                        ].long()
+                        logical_k = (
+                            sparkinfer_bucket.k_cache[page_ids]
+                            .reshape(-1, args.kv_heads, args.head_dim)[
+                                :live_tokens, 0, :
+                            ]
+                            .float()
+                        )
+                        k_scale = 1.0
+                        if sparkinfer_bucket.k_descale is not None:
+                            if sparkinfer_bucket.k_descale.ndim == 1:
+                                k_scale = float(
+                                    sparkinfer_bucket.k_descale[0].item()
+                                )
+                            else:
+                                k_scale = float(
+                                    sparkinfer_bucket.k_descale[0, 0].item()
+                                )
+                        expected_scores = (
+                            sparkinfer_bucket.q[0, :6, :].float()
+                            @ logical_k.transpose(0, 1)
+                        ) * k_scale
+                        dumped_scores = tmp_output.flatten()[
+                            : 6 * live_tokens
+                        ].view(6, live_tokens).float()
+                        delta = dumped_scores - expected_scores
+                        rel_l2 = float(
+                            torch.linalg.vector_norm(delta)
+                            / torch.linalg.vector_norm(expected_scores).clamp_min(1e-12)
+                        )
+                        candidate_k = (
+                            sparkinfer_bucket.k_cache[page_ids]
+                            .reshape(-1, args.kv_heads, args.head_dim)[:64]
+                            .float()
+                        )
+                        candidate_scores = torch.einsum(
+                            "qd,thd->thq",
+                            sparkinfer_bucket.q[0, :6, :].float(),
+                            candidate_k,
+                        ) * k_scale
+                        nearest = []
+                        for key_col in range(live_tokens):
+                            candidate_error = torch.linalg.vector_norm(
+                                candidate_scores
+                                - dumped_scores[:, key_col].view(1, 1, 6),
+                                dim=2,
+                            )
+                            nearest_flat = torch.topk(
+                                candidate_error.flatten(),
+                                k=min(4, candidate_error.numel()),
+                                largest=False,
+                            )
+                            nearest.append(
+                                [
+                                    (
+                                        int(idx.item()) // args.kv_heads,
+                                        int(idx.item()) % args.kv_heads,
+                                        float(err.item()),
+                                    )
+                                    for err, idx in zip(
+                                        nearest_flat.values, nearest_flat.indices
+                                    )
+                                ]
+                            )
+                        print(
+                            f"S QK dump max_abs={float(delta.abs().max().item())} "
+                            f"rel_l2={rel_l2} "
+                            f"nearest_keys={nearest} "
+                            f"dumped={dumped_scores.tolist()} "
+                            f"expected={expected_scores.tolist()}"
+                        )
+                        return
+                    page_id = int(sparkinfer_bucket.current_page_table[0, 0].item())
+                    cache = (
+                        sparkinfer_bucket.k_cache
+                        if tma_debug_dump == "K"
+                        else sparkinfer_bucket.v_cache
+                    )
+                    expected_codes = (
+                        cache[page_id, :24, 0, :]
+                        .view(torch.uint8)
+                        .float()
+                    )
+                    dumped_codes = tmp_output[0, :24, :].float()
+                    mismatch = (dumped_codes != expected_codes)
+                    candidate_codes = (
+                        cache[page_id, :64, :, :]
+                        .view(torch.uint8)
+                        .reshape(64, args.kv_heads, args.head_dim)
+                        .reshape(64, args.kv_heads, args.head_dim // 16, 16)
+                    )
+                    vector_mapping = []
+                    dumped_vectors = dumped_codes[:4].reshape(
+                        4, args.head_dim // 16, 16
+                    )
+                    for dump_row in range(dumped_vectors.shape[0]):
+                        row_mapping = []
+                        for dump_vec in range(dumped_vectors.shape[1]):
+                            matches = (
+                                candidate_codes
+                                == dumped_vectors[dump_row, dump_vec]
+                            ).all(dim=-1)
+                            match_idx = matches.nonzero()
+                            row_mapping.append(
+                                [
+                                    tuple(int(v) for v in idx.tolist())
+                                    for idx in match_idx[:4]
+                                ]
+                            )
+                        vector_mapping.append(row_mapping)
+                    print(
+                        f"{tma_debug_dump} TMA dump mismatch_count="
+                        f"{int(mismatch.sum().item())} "
+                        f"max_abs={float((dumped_codes - expected_codes).abs().max().item())} "
+                        f"vector_mapping={vector_mapping}"
+                    )
+                    return
                 _strict_backend_replay_for_correctness(
                     sparkinfer_bucket,
                     l2_flush=l2_flush,
@@ -3024,7 +3568,7 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
                 )
                 if fa2_bucket is not None:
                     _strict_guarded_replay_for_correctness(
-                        backend="flashinfer-fa2",
+                        backend=fa2_bucket.backend_label,
                         graph=fa2_bucket.graph,
                         guarded_output=fa2_bucket.guarded_output,
                         read_only_snapshot=fa2_bucket.read_only_snapshot,
@@ -3038,7 +3582,7 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
                         fa2_ref_cos,
                         fa2_nonzero,
                     ) = _reference_gate(
-                        backend="flashinfer-fa2",
+                        backend=fa2_bucket.backend_label,
                         output=flashinfer_output,
                         reference=ref_out,
                     )
@@ -3077,9 +3621,11 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
                         ),
                     }
                     check_suffix += (
-                        f" | fa2/ref rel_l2={fa2_ref_rel_l2:.6f}"
+                        f" | {fa2_bucket.backend_label}/ref "
+                        f"rel_l2={fa2_ref_rel_l2:.6f}"
                         f" cos={fa2_ref_cos:.8f}"
-                        f" | sparkinfer/fa2 rel_l2={cross_rel_l2:.6f}"
+                        f" | sparkinfer/{fa2_bucket.backend_label} "
+                        f"rel_l2={cross_rel_l2:.6f}"
                         f" cos={cross_cos:.8f}"
                     )
             flashinfer_times_ms: list[float] | None = None
@@ -3093,6 +3639,7 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
                     sparkinfer_bucket.graph,
                     fa2_bucket.graph,
                     replays=args.replays,
+                    backend_b=fa2_bucket.backend_label,
                     l2_flush=l2_flush,
                 )
             else:
@@ -3103,7 +3650,9 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
                 )
             timing_metadata = _decode_graph_timing_metadata(
                 timing_metadata,
-                include_flashinfer=fa2_bucket is not None,
+                flashinfer_backend=(
+                    args.flashinfer_backend if fa2_bucket is not None else None
+                ),
             )
             observed_replay_topology = _observe_decode_graph_replay_topology(
                 sparkinfer_bucket.workspace,
@@ -3177,14 +3726,14 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
                 assert flashinfer_times_ms is not None
                 _record_samples(
                     args.raw_samples_jsonl,
-                    backend="flashinfer-fa2",
+                    backend=fa2_bucket.backend_label,
                     case=sample_case,
                     samples_ms=flashinfer_times_ms,
                     correctness=fa2_correctness,
                     timing=timing_metadata,
                 )
                 flashinfer_metrics = CaseMetrics(
-                    backend="flashinfer-fa2",
+                    backend=fa2_bucket.backend_label,
                     mean_us=statistics.fmean(flashinfer_times_ms) * 1000.0,
                 )
                 speedups.append(flashinfer_metrics.mean_us / backend_metrics.mean_us)
@@ -3204,8 +3753,9 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
             if flashinfer_metrics is not None:
                 ratio = flashinfer_metrics.mean_us / backend_metrics.mean_us
                 line += (
-                    f" | fa2 mean={flashinfer_metrics.mean_us:8.1f} us "
-                    f"| fa2/{backend_metrics.backend}="
+                    f" | {flashinfer_metrics.backend} "
+                    f"mean={flashinfer_metrics.mean_us:8.1f} us "
+                    f"| {flashinfer_metrics.backend}/{backend_metrics.backend}="
                     f"{ratio:6.3f}x"
                 )
             print(line + check_suffix)
@@ -3216,7 +3766,10 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
         torch.cuda.empty_cache()
 
     if speedups:
-        print(f"geomean fa2/sparkinfer: {statistics.geometric_mean(speedups):.3f}x")
+        print(
+            f"geomean {_flashinfer_backend_label(args.flashinfer_backend)}/sparkinfer: "
+            f"{statistics.geometric_mean(speedups):.3f}x"
+        )
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -3266,14 +3819,44 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--capture-cache-seqlen", type=int, default=0)
     parser.add_argument("--graph-ctas-per-sm", type=int, default=0)
     parser.add_argument(
+        "--paged-mode",
+        choices=["auto", "decode", "extend", "verify"],
+        default="auto",
+        help=(
+            "B12X kernel family for legacy-matrix cases. Use verify for uniform "
+            "multi-token speculative decode; auto preserves shape inference."
+        ),
+    )
+    parser.add_argument(
         "--window-left",
         type=int,
         default=-1,
         help="causal sliding-window size for legacy-matrix cases; -1 is full attention",
     )
     parser.add_argument("--ci-level", type=float, default=0.95, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--flashinfer-backend",
+        choices=["trtllm-gen", "fa2"],
+        default="fa2",
+        help=(
+            "FlashInfer comparator. SM120 Laguna currently resolves to native FA2; "
+            "the installed TRTLLM-Gen runner only accepts SM100/SM103."
+        ),
+    )
     parser.add_argument("--compare-fa2", action="store_true", default=True)
     parser.add_argument("--no-compare-fa2", action="store_false", dest="compare_fa2")
+    parser.add_argument(
+        "--compare-flashinfer",
+        action="store_true",
+        dest="compare_fa2",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--no-compare-flashinfer",
+        action="store_false",
+        dest="compare_fa2",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--flush-l2", action="store_true", default=True)
     parser.add_argument("--no-flush-l2", action="store_false", dest="flush_l2")
@@ -3291,6 +3874,14 @@ def main(argv: list[str] | None = None) -> None:
             "the file is replaced at benchmark start"
         ),
     )
+    parser.add_argument(
+        "--torch-profile-trace",
+        type=pathlib.Path,
+        help=(
+            "export child-kernel CUDA graph traces for one benchmark case; "
+            "the FlashInfer trace receives a -flashinfer suffix"
+        ),
+    )
     parser.set_defaults(**BENCHMARK_PROFILES[profile_name])
     args = parser.parse_args(argv)
     args.profile = _canonical_profile_name(args.profile)
@@ -3300,8 +3891,10 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError("--window-left must be -1 or a non-negative token count")
     if args.mode != "legacy-matrix" and args.window_left != -1:
         raise ValueError("--window-left is currently supported only in legacy-matrix mode")
-    if args.replays < 100:
-        raise ValueError("--replays must be at least 100 for graph-replay benchmarking")
+    if args.mode != "legacy-matrix" and args.paged_mode != "auto":
+        raise ValueError("--paged-mode is currently supported only in legacy-matrix mode")
+    if args.replays <= 0:
+        raise ValueError("--replays must be positive for graph-replay benchmarking")
     _gqa_group_size(q_heads=args.q_heads, kv_heads=args.kv_heads)
     _initialize_raw_sample_log(args.raw_samples_jsonl, args=args, argv=argv)
     l2_flush_bytes = resolve_l2_flush_bytes(args.l2_flush_bytes)

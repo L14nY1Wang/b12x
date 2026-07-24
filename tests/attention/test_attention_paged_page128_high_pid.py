@@ -5,6 +5,7 @@ import math
 import pytest
 import torch
 
+from benchmarks.benchmark_paged_attention import _capture_backend_graph
 from sparkinfer.attention.paged._scratch import (
     SPARKINFERPagedAttentionScratchCaps,
     plan_paged_attention_scratch,
@@ -14,6 +15,21 @@ from sparkinfer.attention.paged.reference import paged_attention_reference
 from sparkinfer.attention.paged.traits import select_paged_forward_traits_from_plan
 
 from tests._reference.helpers import require_sparkinfer
+
+
+_ALLOCATOR_COUNTERS = (
+    "allocation.all.allocated",
+    "allocation.all.freed",
+    "segment.all.allocated",
+    "segment.all.freed",
+    "num_alloc_retries",
+    "num_ooms",
+)
+
+
+def _allocator_counters(device: torch.device) -> dict[str, int]:
+    stats = torch.cuda.memory_stats(device)
+    return {name: int(stats.get(name, 0)) for name in _ALLOCATOR_COUNTERS}
 
 
 def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -27,6 +43,186 @@ def _require_exact_laguna_device() -> torch.device:
     if torch.cuda.get_device_capability(device) != (12, 0):
         pytest.skip("the exact Laguna KV128 specialization requires SM120")
     return device
+
+
+@torch.inference_mode()
+def test_laguna_gqa6_prefill_graph_replay_handles_high_fp8_page_ids_and_tails() -> None:
+    """Qualify the exact full-prefill repack path at production-scale offsets."""
+    device = _require_exact_laguna_device()
+    torch.manual_seed(20260726)
+
+    page_size = 128
+    head_dim = 128
+    q_heads = 24
+    kv_heads = 4
+    q_rows = 64
+    max_cache_seqlen = 129
+    live_page_count = math.ceil(max_cache_seqlen / page_size)
+
+    element_size = torch.empty((), dtype=torch.float8_e4m3fn).element_size()
+    page_stride_bytes = 2 * page_size * kv_heads * head_dim * element_size
+    int32_max = torch.iinfo(torch.int32).max
+    high_page_id = int32_max // page_stride_bytes + 2
+    num_cache_pages = high_page_id + live_page_count
+    combined_kv_cache = torch.empty(
+        (num_cache_pages, 2, page_size, kv_heads, head_dim),
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    k_cache = combined_kv_cache[:, 0]
+    v_cache = combined_kv_cache[:, 1]
+    assert not k_cache.is_contiguous()
+    assert not v_cache.is_contiguous()
+    assert k_cache.stride(0) * element_size == page_stride_bytes
+    assert high_page_id * page_stride_bytes > int32_max
+
+    # Graph warmup uses the capacity plan's low page ids before runtime
+    # metadata is installed. Keep those pages finite and deliberately unlike
+    # the live high-id pages so wrapped addressing cannot pass accidentally.
+    low_poison = torch.empty(
+        (live_page_count, 2, page_size, kv_heads, head_dim),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    low_poison[:, 0].fill_(3)
+    low_poison[:, 1].fill_(-3)
+    combined_kv_cache[:live_page_count].copy_(
+        low_poison.to(torch.float8_e4m3fn)
+    )
+    live_pages = (
+        torch.randn(
+            (live_page_count, 2, page_size, kv_heads, head_dim),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        / 4
+    ).to(torch.float8_e4m3fn)
+    combined_kv_cache[high_page_id:num_cache_pages].copy_(live_pages)
+
+    page_table = torch.arange(
+        high_page_id,
+        num_cache_pages,
+        dtype=torch.int32,
+        device=device,
+    ).unsqueeze(0)
+    assert int(page_table.min().item()) * page_stride_bytes > int32_max
+    q = (
+        torch.randn(
+            (q_rows, q_heads, head_dim),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        / 4
+    )
+    cache_seqlens = torch.tensor(
+        [max_cache_seqlen], dtype=torch.int32, device=device
+    )
+    cu_seqlens_q = torch.tensor([0, q_rows], dtype=torch.int32, device=device)
+    k_descale = torch.tensor(
+        [[0.5, 0.75, 1.25, 1.5]], dtype=torch.float32, device=device
+    )
+    v_descale = torch.tensor(
+        [[1.5, 1.25, 0.75, 0.5]], dtype=torch.float32, device=device
+    )
+
+    capture = _capture_backend_graph(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        capture_page_table=page_table,
+        capture_cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        fixed_split_pages=None,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        warmup=2,
+        graph_ctas_per_sm=None,
+        window_left=-1,
+        paged_mode="extend",
+        strict_check=False,
+    )
+    plan = capture.workspace.plan
+    traits = select_paged_forward_traits_from_plan(plan)
+    assert plan.split_kv is False
+    assert traits.cta_tile_q == 64
+    assert traits.cta_tile_kv == 32
+    assert traits.num_warps_q == 4
+    assert traits.num_warps_kv == 1
+
+    stable_tensors = {
+        "q": q,
+        "combined_kv_cache": combined_kv_cache,
+        "page_table": page_table,
+        "cache_seqlens": cache_seqlens,
+        "cu_seqlens_q": cu_seqlens_q,
+        "k_descale": k_descale,
+        "v_descale": v_descale,
+        "output": capture.output,
+    }
+    for name in (
+        "request_indices",
+        "qo_tile_indices",
+        "kv_tile_indices",
+        "merge_indptr",
+        "o_indptr",
+        "kv_chunk_size_ptr",
+        "kv_window_start_tokens",
+        "total_num_rows_ptr",
+        "block_valid_mask",
+        "page_table",
+        "cache_seqlens",
+        "cu_seqlens_q",
+        "lse",
+        "shared_arena",
+    ):
+        tensor = getattr(capture.workspace, name)
+        if tensor is not None:
+            stable_tensors[f"workspace.{name}"] = tensor
+    stable_addresses = {
+        name: int(tensor.data_ptr()) for name, tensor in stable_tensors.items()
+    }
+
+    for cache_seqlen in (127, 128, 129):
+        cache_seqlens.fill_(cache_seqlen)
+        capture.output.fill_(torch.nan)
+        torch.cuda.synchronize(device)
+        allocator_before = _allocator_counters(device)
+        capture.workspace.update_prefill_graph_replay_metadata(
+            page_table,
+            cache_seqlens,
+            cu_seqlens_q,
+            window_left=-1,
+        )
+        capture.graph.replay()
+        torch.cuda.synchronize(device)
+        allocator_after = _allocator_counters(device)
+
+        assert allocator_after == allocator_before
+        assert {
+            name: int(tensor.data_ptr()) for name, tensor in stable_tensors.items()
+        } == stable_addresses
+        reference_output, _ = paged_attention_reference(
+            q,
+            k_cache,
+            v_cache,
+            page_table,
+            cache_seqlens,
+            cu_seqlens_q,
+            causal=True,
+            k_descale=k_descale,
+            v_descale=v_descale,
+        )
+        assert torch.isfinite(capture.output).all().item()
+        assert capture.output.abs().max().item() > 0
+        torch.testing.assert_close(
+            capture.output.to(torch.float32),
+            reference_output.to(torch.float32),
+            atol=5e-2,
+            rtol=5e-2,
+        )
+        assert _cosine_similarity(capture.output, reference_output) >= 0.999
 
 
 def _make_laguna_graph_plan(

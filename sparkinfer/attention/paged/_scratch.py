@@ -605,18 +605,45 @@ class SPARKINFERPagedAttentionScratch:
                 )
             if (
                 self.use_cuda_graph
-                and self.mode == "verify"
+                and self.mode in ("extend", "verify")
                 and self._plan is not None
             ):
                 if int(window_left) != int(self._plan.window_left):
                     raise ValueError(
-                        "verifier graph replay was prepared with "
+                        "prefill graph replay was prepared with "
                         f"window_left={self._plan.window_left}, got "
                         f"window_left={int(window_left)}"
                     )
                 if self._plan_metadata_cache is None:
                     raise RuntimeError(
-                        "verifier graph replay is missing cached plan metadata"
+                        "prefill graph replay is missing cached plan metadata"
+                    )
+                expected_batch = int(self._plan.page_table_shape[0])
+                if tuple(page_table.shape[:1]) != (expected_batch,):
+                    raise ValueError(
+                        "prefill graph page_table batch must match the prepared "
+                        f"bucket: got {int(page_table.shape[0])}, expected "
+                        f"{expected_batch}"
+                    )
+                if tuple(cache_seqlens.shape) != (expected_batch,):
+                    raise ValueError(
+                        "prefill graph cache_seqlens must match the prepared "
+                        f"bucket: got {tuple(cache_seqlens.shape)}, expected "
+                        f"({expected_batch},)"
+                    )
+                if tuple(cu_seqlens_q.shape) != (expected_batch + 1,):
+                    raise ValueError(
+                        "prefill graph cu_seqlens_q must match the prepared "
+                        f"bucket: got {tuple(cu_seqlens_q.shape)}, expected "
+                        f"({expected_batch + 1},)"
+                    )
+                if active_total_q is not None and not (
+                    0 < int(active_total_q) <= int(self._plan.total_q)
+                ):
+                    raise ValueError(
+                        "prefill graph active_total_q must be within the "
+                        f"prepared capacity 1..{int(self._plan.total_q)}, got "
+                        f"{int(active_total_q)}"
                     )
                 self._bind_runtime_metadata(page_table, cache_seqlens, cu_seqlens_q)
                 self._copy_cached_plan_metadata(self._plan_metadata_cache)

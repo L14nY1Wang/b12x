@@ -256,6 +256,95 @@ def _laguna_page128_one_wave_chunk_budget(
     )
 
 
+def _is_laguna_fp8_gqa6_analytic_decode_graph(
+    *,
+    device: torch.device,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    page_size: int,
+    batch: int,
+    window_left: int,
+) -> bool:
+    """Identify the capture-static Laguna q=1 family with device split mapping."""
+
+    return bool(
+        q_dtype == torch.bfloat16
+        and kv_dtype == _FP8_KV_DTYPE
+        and int(num_q_heads) == 24
+        and int(num_kv_heads) == 4
+        and int(head_dim_qk) == 128
+        and int(head_dim_vo) == 128
+        and int(page_size) == 128
+        and 1 <= int(batch) <= 8
+        and int(window_left) < 0
+        and tuple(torch.cuda.get_device_capability(device)) == (12, 0)
+    )
+
+
+def _is_laguna_fp8_gqa6_analytic_verify_graph(
+    *,
+    device: torch.device,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    page_size: int,
+    batch: int,
+    query_len: int,
+    window_left: int,
+) -> bool:
+    """Identify the exact Laguna q=8 verifier device schedule."""
+
+    return bool(
+        q_dtype == torch.bfloat16
+        and kv_dtype == _FP8_KV_DTYPE
+        and int(num_q_heads) == 24
+        and int(num_kv_heads) == 4
+        and int(head_dim_qk) == 128
+        and int(head_dim_vo) == 128
+        and int(page_size) == 128
+        and 1 <= int(batch) <= 8
+        and int(query_len) == 8
+        and int(window_left) < 0
+        and tuple(torch.cuda.get_device_capability(device)) == (12, 0)
+    )
+
+
+def _is_laguna_fp8_gqa6_full_prefill_graph(
+    *,
+    device: torch.device,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    page_size: int,
+    batch: int,
+    window_left: int,
+) -> bool:
+    """Identify Laguna's capture-static full-attention prefill family."""
+
+    return bool(
+        q_dtype == torch.bfloat16
+        and kv_dtype == _FP8_KV_DTYPE
+        and int(num_q_heads) == 24
+        and int(num_kv_heads) == 4
+        and int(head_dim_qk) == 128
+        and int(head_dim_vo) == 128
+        and int(page_size) == 128
+        and 1 <= int(batch) <= 8
+        and int(window_left) < 0
+        and tuple(torch.cuda.get_device_capability(device)) == (12, 0)
+    )
+
+
 def _heuristic_decode_graph_ctas_per_sm(
     *,
     kv_dtype: torch.dtype,
@@ -450,6 +539,7 @@ def _decode_graph_heuristic_max_chunks_per_req(
     *,
     kv_dtype: torch.dtype,
     batch: int,
+    page_size: int,
     head_dim_qk: int,
     head_dim_vo: int,
     gqa_group_size: int,
@@ -464,6 +554,23 @@ def _decode_graph_heuristic_max_chunks_per_req(
         divisor = batch
         min_chunks = 1
         max_chunks = 256
+    elif (
+        kv_dtype == _FP8_KV_DTYPE
+        and page_size == 128
+        and gqa_group_size == 6
+        and head_dim_qk <= 192
+        and head_dim_vo <= 128
+        and batch <= 8
+    ):
+        # The M16 FP8 GQA6 decode kernel admits two CTAs per SM.  Reserve both
+        # waves in the captured graph across all requests: the architecture
+        # budget clamps this nominal 96-way split to the exact device-sized
+        # limit (94 total work items on 188-SM Laguna).  Live lengths select
+        # each request's useful prefix and balanced ranges inside the kernel.
+        total_chunk_budget = 96
+        divisor = batch
+        min_chunks = 4
+        max_chunks = 96
     elif (
         kv_dtype == _FP8_KV_DTYPE
         and batch == 1
@@ -508,10 +615,10 @@ def heuristic_decode_graph_chunk_pages(
     max_effective_kv_pages: int,
     max_chunks_per_req: int | None = None,
 ) -> int:
-    del page_size
     max_chunks = _decode_graph_heuristic_max_chunks_per_req(
         kv_dtype=kv_dtype,
         batch=batch,
+        page_size=page_size,
         head_dim_qk=head_dim_qk,
         head_dim_vo=head_dim_vo,
         gqa_group_size=gqa_group_size,
@@ -555,8 +662,22 @@ def _paged_determine_cta_tile_q(
     kv_dtype: torch.dtype,
     packed_qo_len: int,
     head_dim: int,
+    page_size: int,
     max_effective_kv_pages: int,
 ) -> int:
+    if (
+        mode == "verify"
+        and kv_dtype == _FP8_KV_DTYPE
+        and packed_qo_len == 48
+        and head_dim == 128
+        and page_size == 128
+    ):
+        # Laguna's uniform q=8/GQA6 verifier has exactly 48 packed rows.
+        # Keep them in one CTA so every paged K/V tile is reused across all
+        # verifier rows.  This is a capture-static geometry decision; live KV
+        # length still only controls device-side chunk validity.
+        del max_effective_kv_pages
+        return 64
     if mode in ("decode", "verify"):
         # The production paged decode kernel's exact-plane K/V TMA path is a
         # one-Q-warp, M16 kernel.  Larger GQA groups are represented by
@@ -587,6 +708,7 @@ def chunk_pages_for_family(
     gqa_group_size: int,
     max_effective_kv_pages: int,
     max_chunks_per_req: int | None = None,
+    cta_tile_q: int | None = None,
 ) -> int | None:
     if q_dtype != torch.bfloat16:
         return None
@@ -624,16 +746,34 @@ def chunk_pages_for_family(
     ):
         return None
 
-    chunk_pages = heuristic_decode_graph_chunk_pages(
-        kv_dtype=kv_dtype,
-        batch=int(policy_batch),
-        page_size=page_size,
-        head_dim_qk=head_dim_qk,
-        head_dim_vo=head_dim_vo,
-        gqa_group_size=gqa_group_size,
-        max_effective_kv_pages=max_effective_kv_pages,
-        max_chunks_per_req=max_chunks_per_req,
-    )
+    if (
+        mode == "verify"
+        and cta_tile_q == 64
+        and kv_dtype == _FP8_KV_DTYPE
+        and page_size == 128
+        and head_dim_qk == 128
+        and head_dim_vo == 128
+        and gqa_group_size == 6
+        and max_chunks_per_req is not None
+    ):
+        # The M64 verifier has only one query tile per request.  Spend the full
+        # fixed graph work budget on KV splits; replay will shrink the same
+        # grid analytically from the live device cache lengths.
+        chunk_pages = _ceil_div(
+            max(int(max_effective_kv_pages), 1),
+            max(int(max_chunks_per_req), 1),
+        )
+    else:
+        chunk_pages = heuristic_decode_graph_chunk_pages(
+            kv_dtype=kv_dtype,
+            batch=int(policy_batch),
+            page_size=page_size,
+            head_dim_qk=head_dim_qk,
+            head_dim_vo=head_dim_vo,
+            gqa_group_size=gqa_group_size,
+            max_effective_kv_pages=max_effective_kv_pages,
+            max_chunks_per_req=max_chunks_per_req,
+        )
 
     chunk_pages = _apply_decode_graph_chunk_pages_debug_policy(chunk_pages)
     return _cap_decode_graph_chunk_pages(
@@ -688,6 +828,22 @@ class PagedVerifyGraphCapacity:
     max_partial_rows: int
     max_effective_kv_pages: int
     kv_chunk_size_pages: int
+    representative_cache_seqlen: int
+
+
+@dataclass(frozen=True)
+class PagedExtendGraphCapacity:
+    """Fixed capacity for one multi-token extend graph bucket.
+
+    Total query capacity and request count are capture-time geometry. Live
+    per-request query/cache lengths are intentionally absent; the replay
+    scheduler derives those ranges from device metadata.
+    """
+
+    graph_ctas_per_sm: int
+    cta_tile_q: int
+    max_work_items: int
+    max_effective_kv_pages: int
     representative_cache_seqlen: int
 
 
@@ -917,6 +1073,7 @@ def plan_decode_graph_capacity(
         kv_dtype=kv_dtype,
         packed_qo_len=gqa_group_size,
         head_dim=head_dim_qk,
+        page_size=page_size,
         max_effective_kv_pages=max_effective_kv_pages,
     )
     query_tiles_per_request = _ceil_div(gqa_group_size, cta_tile_q)
@@ -936,6 +1093,32 @@ def plan_decode_graph_capacity(
         graph_ctas_per_sm=resolved_graph_ctas_per_sm,
         query_tiles_per_request=query_tiles_per_request,
     )
+    architecture_max_work_items = _graph_max_batch_size_if_split(
+        device=device,
+        num_kv_heads=num_kv_heads,
+        graph_ctas_per_sm=resolved_graph_ctas_per_sm,
+    )
+    analytic_total_work_budget: int | None = None
+    if batch <= 2 and _is_laguna_fp8_gqa6_analytic_decode_graph(
+        device=device,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim_qk=head_dim_qk,
+        head_dim_vo=head_dim_vo,
+        page_size=page_size,
+        batch=batch,
+        window_left=window_left,
+    ):
+        # The flat device schedule may distribute the remainder across
+        # requests (24/24/23/23 for B4, 12/.../11 for B8) instead of throwing
+        # away TPC slots through integer division.  Never reserve more active
+        # chunks than the captured page capacity can supply at 64 rows/stage.
+        analytic_total_work_budget = min(
+            architecture_max_work_items,
+            batch * max_cache_page_count * max(page_size // 64, 1),
+        )
     direct_work_items = batch * query_tiles_per_request
     max_chunks_budget = int(architecture_max_chunks)
     one_wave_chunks = _laguna_page128_one_wave_chunk_budget(
@@ -966,6 +1149,7 @@ def plan_decode_graph_capacity(
         )
     if force_split_kv is False or not split_policy_supported:
         max_chunks_budget = 1
+        analytic_total_work_budget = None
 
     if max_work_items is not None:
         max_work_items = int(max_work_items)
@@ -977,6 +1161,10 @@ def plan_decode_graph_capacity(
         max_chunks_budget = min(
             max_chunks_budget, max(max_work_items // direct_work_items, 1)
         )
+        if analytic_total_work_budget is not None:
+            analytic_total_work_budget = min(
+                analytic_total_work_budget, max_work_items
+            )
     if max_partial_rows is not None:
         max_partial_rows = int(max_partial_rows)
         if max_partial_rows < 0:
@@ -992,6 +1180,10 @@ def plan_decode_graph_capacity(
             else 1
         )
         max_chunks_budget = min(max_chunks_budget, partial_chunk_capacity)
+        if analytic_total_work_budget is not None:
+            analytic_total_work_budget = min(
+                analytic_total_work_budget, max_partial_rows
+            )
 
     if split_policy_supported and force_split_kv is not False:
         chunk_pages_lut = build_decode_chunk_pages_lut(
@@ -1021,21 +1213,158 @@ def plan_decode_graph_capacity(
             worst_page_count = page_count
 
     split_storage_required = force_split_kv is True or max_chunks_per_request > 1
+    if (
+        analytic_total_work_budget is not None
+        and split_storage_required
+        and analytic_total_work_budget >= direct_work_items
+    ):
+        capacity_max_work_items = int(analytic_total_work_budget)
+        capacity_max_partial_rows = int(analytic_total_work_budget)
+        capacity_max_chunks_per_request = _ceil_div(
+            analytic_total_work_budget, batch
+        )
+    else:
+        capacity_max_work_items = (
+            batch * query_tiles_per_request * max_chunks_per_request
+        )
+        capacity_max_partial_rows = (
+            batch * max_chunks_per_request if split_storage_required else 0
+        )
+        capacity_max_chunks_per_request = max_chunks_per_request
     return PagedDecodeGraphCapacity(
         graph_ctas_per_sm=int(resolved_graph_ctas_per_sm),
         cta_tile_q=int(cta_tile_q),
         query_tiles_per_request=int(query_tiles_per_request),
         architecture_max_chunks_per_request=int(architecture_max_chunks),
-        max_chunks_per_request=int(max_chunks_per_request),
-        max_work_items=int(
-            batch * query_tiles_per_request * max_chunks_per_request
-        ),
-        max_partial_rows=int(
-            batch * max_chunks_per_request if split_storage_required else 0
-        ),
+        max_chunks_per_request=int(capacity_max_chunks_per_request),
+        max_work_items=int(capacity_max_work_items),
+        max_partial_rows=int(capacity_max_partial_rows),
         max_effective_kv_pages=int(max_effective_kv_pages),
         worst_page_count=int(worst_page_count),
         chunk_pages_lut=tuple(int(v) for v in chunk_pages_lut),
+    )
+
+
+def plan_extend_graph_capacity(
+    *,
+    device: torch.device | str,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    page_size: int,
+    batch: int,
+    total_q_capacity: int,
+    max_cache_page_count: int,
+    window_left: int = -1,
+    graph_ctas_per_sm: int | None = None,
+) -> PagedExtendGraphCapacity:
+    """Return capture-static scratch capacity for an extend Q bucket."""
+
+    device = torch.device(device)
+    if device.type != "cuda":
+        raise ValueError("extend CUDA-graph capacity requires a CUDA device")
+    if device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    batch = int(batch)
+    total_q_capacity = int(total_q_capacity)
+    num_q_heads = int(num_q_heads)
+    num_kv_heads = int(num_kv_heads)
+    head_dim_qk = int(head_dim_qk)
+    head_dim_vo = int(head_dim_vo)
+    page_size = int(page_size)
+    max_cache_page_count = int(max_cache_page_count)
+    window_left = int(window_left)
+    if batch <= 0:
+        raise ValueError("batch must be positive")
+    if total_q_capacity < batch:
+        raise ValueError(
+            "extend total_q_capacity must cover one query per request: "
+            f"got {total_q_capacity} < {batch}"
+        )
+    if num_q_heads <= 0 or num_kv_heads <= 0:
+        raise ValueError("query and KV head counts must be positive")
+    if num_q_heads % num_kv_heads != 0:
+        raise ValueError("num_q_heads must be divisible by num_kv_heads")
+    if head_dim_qk <= 0 or head_dim_vo <= 0:
+        raise ValueError("head dimensions must be positive")
+    if page_size not in (64, 128):
+        raise ValueError("extend graph policy requires page_size=64 or 128")
+    if max_cache_page_count <= 0:
+        raise ValueError("max_cache_page_count must be positive")
+    if window_left < -1:
+        raise ValueError(
+            "window_left must be -1 for full attention or a non-negative token count"
+        )
+
+    gqa_group_size = num_q_heads // num_kv_heads
+    max_q_len = total_q_capacity - batch + 1
+    max_effective_kv_pages = max_cache_page_count
+    if window_left >= 0:
+        max_effective_kv_pages = min(
+            max_cache_page_count,
+            max(
+                1,
+                _ceil_div(max_q_len + window_left, page_size),
+            ),
+        )
+    max_qo_len = max_q_len * gqa_group_size
+    cta_tile_q = _paged_determine_cta_tile_q(
+        mode="extend",
+        kv_dtype=kv_dtype,
+        packed_qo_len=max_qo_len,
+        head_dim=head_dim_qk,
+        page_size=page_size,
+        max_effective_kv_pages=max_effective_kv_pages,
+    )
+    if (
+        max_qo_len > 64
+        and _is_laguna_fp8_gqa6_full_prefill_graph(
+            device=device,
+            q_dtype=q_dtype,
+            kv_dtype=kv_dtype,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim_qk=head_dim_qk,
+            head_dim_vo=head_dim_vo,
+            page_size=page_size,
+            batch=batch,
+            window_left=window_left,
+        )
+    ):
+        cta_tile_q = 64
+
+    total_num_qo_tiles = (
+        _ceil_div(total_q_capacity * gqa_group_size, cta_tile_q)
+        + batch
+        - 1
+    )
+    resolved_graph_ctas_per_sm = _resolve_graph_ctas_per_sm(
+        mode="extend",
+        kv_dtype=kv_dtype,
+        policy_batch=batch,
+        page_size=page_size,
+        head_dim_qk=head_dim_qk,
+        head_dim_vo=head_dim_vo,
+        gqa_group_size=gqa_group_size,
+        graph_ctas_per_sm=graph_ctas_per_sm,
+    )
+    max_work_items = max(
+        _graph_max_batch_size_if_split(
+            device=device,
+            num_kv_heads=num_kv_heads,
+            graph_ctas_per_sm=resolved_graph_ctas_per_sm,
+        ),
+        total_num_qo_tiles,
+    )
+    return PagedExtendGraphCapacity(
+        graph_ctas_per_sm=int(resolved_graph_ctas_per_sm),
+        cta_tile_q=int(cta_tile_q),
+        max_work_items=int(max_work_items),
+        max_effective_kv_pages=int(max_effective_kv_pages),
+        representative_cache_seqlen=int(max_cache_page_count * page_size),
     )
 
 
@@ -1114,10 +1443,24 @@ def plan_verify_graph_capacity(
         kv_dtype=kv_dtype,
         packed_qo_len=query_len * gqa_group_size,
         head_dim=head_dim_qk,
+        page_size=page_size,
         max_effective_kv_pages=max_effective_kv_pages,
     )
-    total_num_qo_tiles = (
-        _ceil_div(total_q * gqa_group_size, cta_tile_q) + batch - 1
+    total_num_qo_tiles = batch * _ceil_div(
+        query_len * gqa_group_size, cta_tile_q
+    )
+    analytic_laguna_verify = _is_laguna_fp8_gqa6_analytic_verify_graph(
+        device=device,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim_qk=head_dim_qk,
+        head_dim_vo=head_dim_vo,
+        page_size=page_size,
+        batch=batch,
+        query_len=query_len,
+        window_left=window_left,
     )
     resolved_graph_ctas_per_sm = _resolve_graph_ctas_per_sm(
         mode="verify",
@@ -1129,6 +1472,13 @@ def plan_verify_graph_capacity(
         gqa_group_size=gqa_group_size,
         graph_ctas_per_sm=graph_ctas_per_sm,
     )
+    if (
+        analytic_laguna_verify
+        and batch == 1
+        and graph_ctas_per_sm is None
+        and max_effective_kv_pages <= 512
+    ):
+        resolved_graph_ctas_per_sm = 1
     max_work_items = max(
         _graph_max_batch_size_if_split(
             device=device,
@@ -1165,6 +1515,7 @@ def plan_verify_graph_capacity(
         gqa_group_size=gqa_group_size,
         max_effective_kv_pages=max_effective_kv_pages,
         max_chunks_per_req=graph_max_chunks_per_req,
+        cta_tile_q=cta_tile_q,
     )
     work_items = 0
     partial_rows = 0
@@ -1199,6 +1550,15 @@ def plan_verify_graph_capacity(
         )
     if work_items > max_work_items:
         raise RuntimeError("verify graph policy exceeded its fixed work-item capacity")
+
+    if analytic_laguna_verify:
+        # The exact verifier maps balanced 64-row stage ranges from the live
+        # device length, so page-rounded host metadata must not discard the
+        # final TPC slots (512 pages / ceil(512 / 94) would launch only 86).
+        # Keep a uniform per-request rectangle for B2/B4/B8 and reserve eight
+        # partial rows per split because every K/V tile is shared by q=8.
+        analytic_chunks_per_request = max(max_work_items // batch, 1)
+        partial_rows = batch * query_len * analytic_chunks_per_request
 
     return PagedVerifyGraphCapacity(
         graph_ctas_per_sm=int(resolved_graph_ctas_per_sm),
@@ -1512,18 +1872,51 @@ def create_paged_plan(
 
     if enable_cuda_graph:
         total_num_rows = total_q
-        max_seq_len = total_num_rows - batch + 1
-        max_qo_len = max_seq_len * gqa_group_size
+        if mode == "verify":
+            # Verifier graph plans are prepared for an exact, uniform static
+            # query length.  Preserve that shape across graph batches so the
+            # q=8/GQA6 packed-row specialization remains M64 for B=1..8.
+            max_qo_len = max(packed_qo_len_arr)
+        else:
+            max_seq_len = total_num_rows - batch + 1
+            max_qo_len = max_seq_len * gqa_group_size
         cta_tile_q = _paged_determine_cta_tile_q(
             mode=mode,
             kv_dtype=k_cache.dtype,
             packed_qo_len=max_qo_len,
             head_dim=head_dim_qk,
+            page_size=page_size,
             max_effective_kv_pages=max(max(effective_kv_len_arr), 1),
         )
+        if (
+            mode == "extend"
+            and max_qo_len > 64
+            and not msa_block_sparse
+            and _is_laguna_fp8_gqa6_full_prefill_graph(
+                device=q.device,
+                q_dtype=q.dtype,
+                kv_dtype=k_cache.dtype,
+                num_q_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim_qk=head_dim_qk,
+                head_dim_vo=head_dim_vo,
+                page_size=page_size,
+                batch=batch,
+                window_left=window_left,
+            )
+        ):
+            # M64 raises active-CTA residency for the exact Laguna prefill
+            # family while retaining reuse across a full GQA6 query group.
+            # Query capacity is static; live KV length does not participate.
+            cta_tile_q = 64
         if mode == "decode":
             total_num_qo_tiles = batch * _ceil_div(
                 gqa_group_size, cta_tile_q
+            )
+        elif mode == "verify":
+            total_num_qo_tiles = sum(
+                _ceil_div(packed_qo_len, cta_tile_q)
+                for packed_qo_len in packed_qo_len_arr
             )
         else:
             total_num_qo_tiles = (
@@ -1547,6 +1940,7 @@ def create_paged_plan(
             kv_dtype=k_cache.dtype,
             packed_qo_len=avg_packed_qo_len,
             head_dim=head_dim_qk,
+            page_size=page_size,
             max_effective_kv_pages=max(max(effective_kv_len_arr), 1),
         )
         total_num_qo_tiles = sum(
@@ -1586,6 +1980,27 @@ def create_paged_plan(
             gqa_group_size=gqa_group_size,
             graph_ctas_per_sm=graph_ctas_per_sm,
         )
+        if (
+            mode == "verify"
+            and batch == 1
+            and graph_ctas_per_sm is None
+            and all(int(q_len) == 8 for q_len in q_lengths)
+            and max(max(effective_kv_len_arr), 1) <= 512
+            and _is_laguna_fp8_gqa6_analytic_verify_graph(
+                device=q.device,
+                q_dtype=q.dtype,
+                kv_dtype=k_cache.dtype,
+                num_q_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim_qk=head_dim_qk,
+                head_dim_vo=head_dim_vo,
+                page_size=page_size,
+                batch=batch,
+                query_len=8,
+                window_left=window_left,
+            )
+        ):
+            resolved_graph_ctas_per_sm = 1
     if max_batch_size_if_split is None:
         if enable_cuda_graph:
             max_batch_size_if_split = _graph_max_batch_size_if_split(
@@ -1622,9 +2037,9 @@ def create_paged_plan(
 
     min_kv_chunk_size = max(128 // page_size, 1)
     if mode == "extend":
+        required_kv_chunk_size_pages = max(max(effective_kv_len_arr), 1)
         split_kv = False
         disable_split_kv = True
-        required_kv_chunk_size_pages = max(max(effective_kv_len_arr), 1)
         if fixed_split_size > 0:
             if fixed_split_size < required_kv_chunk_size_pages:
                 raise ValueError(
@@ -1696,6 +2111,7 @@ def create_paged_plan(
             gqa_group_size=gqa_group_size,
             max_effective_kv_pages=max(max(effective_kv_len_arr), 1),
             max_chunks_per_req=graph_max_chunks_per_req,
+            cta_tile_q=cta_tile_q,
         )
         heuristic_fits_graph_budget = True
         heuristic_fits_plan_budget = True
@@ -1801,6 +2217,68 @@ def create_paged_plan(
     if force_split_kv:
         split_kv = True
     total_num_partial_rows = o_indptr[-1] if split_kv else 0
+    if (
+        split_kv
+        and mode == "verify"
+        and enable_cuda_graph
+        and graph_chunk_policy
+        and fixed_split_size < 0
+        and _is_laguna_fp8_gqa6_analytic_verify_graph(
+            device=q.device,
+            q_dtype=q.dtype,
+            kv_dtype=k_cache.dtype,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim_qk=head_dim_qk,
+            head_dim_vo=head_dim_vo,
+            page_size=page_size,
+            batch=batch,
+            query_len=(q_lengths[0] if q_lengths else 0),
+            window_left=window_left,
+        )
+        and all(int(q_len) == 8 for q_len in q_lengths)
+    ):
+        # `padded_batch_size` is the capture-static forward work envelope.
+        # The exact entry launches a uniform split rectangle and stores one
+        # partial for each of its eight query positions.
+        analytic_chunks_per_request = max(padded_batch_size // batch, 1)
+        total_num_partial_rows = (
+            batch * 8 * analytic_chunks_per_request
+        )
+    if (
+        split_kv
+        and mode == "decode"
+        and enable_cuda_graph
+        and graph_chunk_policy
+        and fixed_split_size < 0
+        and total_q == batch
+        and batch <= 2
+        and _is_laguna_fp8_gqa6_analytic_decode_graph(
+            device=q.device,
+            q_dtype=q.dtype,
+            kv_dtype=k_cache.dtype,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim_qk=head_dim_qk,
+            head_dim_vo=head_dim_vo,
+            page_size=page_size,
+            batch=batch,
+            window_left=window_left,
+        )
+    ):
+        # The exact forward and merge entries use a flat partial-row arena.
+        # Preserve every device-wide work slot, including the remainder that
+        # cannot be represented by one uniform chunks-per-request integer.
+        # The generic metadata remains valid in its prefix; only the analytic
+        # entries consume the extra fixed-capacity rows.
+        analytic_stage_capacity = sum(
+            _ceil_div(max(int(cache_len), 1), 64)
+            for cache_len in cache_lengths
+        )
+        total_num_partial_rows = max(
+            total_num_partial_rows,
+            min(int(max_batch_size_if_split), analytic_stage_capacity),
+        )
     if not _prefill_usage_fits_budget(
         budget=plan_budget,
         new_batch_size=new_batch_size,

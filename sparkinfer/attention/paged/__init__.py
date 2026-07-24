@@ -8,7 +8,8 @@ supply tensors, shape metadata, and capacity caps (``Budget``). Decode
 supports CUDA-graph replay with all metadata rebuilt on-device.
 
 Planned lifecycle: ``plan(Caps(...))`` sizes the caller-owned scratch;
-``bind`` maps allocation-free views; ``run`` launches (capture safe).
+``bind`` maps allocation-free views; ``compile`` resolves the selected entries
+without launching; ``run`` launches (capture safe).
 ``Workspace`` is the preplanned arena alternative for workspace-style
 serving.
 
@@ -41,13 +42,16 @@ META = OpMeta(
         "Workspace",
         "Budget",
         "DecodeGraphCapacity",
+        "ExtendGraphCapacity",
         "VerifyGraphCapacity",
         "DecodeGraphScratchEnvelope",
         "decode_graph_capacity",
+        "extend_graph_capacity",
         "verify_graph_capacity",
         "decode_graph_scratch_envelope",
         "plan",
         "bind",
+        "compile",
         "run",
         "infer_mode",
         "is_supported",
@@ -79,13 +83,16 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
         Budget,
         Caps,
         DecodeGraphCapacity,
+        ExtendGraphCapacity,
         VerifyGraphCapacity,
         DecodeGraphScratchEnvelope,
         Plan,
         Workspace,
         bind,
         clear_caches,
+        compile,
         decode_graph_capacity,
+        extend_graph_capacity,
         verify_graph_capacity,
         decode_graph_scratch_envelope,
         infer_mode,

@@ -1011,9 +1011,40 @@ class PagedAttentionWorkspace:
 
         with record_function("paged_workspace.copy_runtime_metadata"):
             self._copy_runtime_metadata(page_table, cache_seqlens, cu_seqlens_q)
+        if self._uses_laguna_verify_analytic_schedule():
+            # The exact Laguna verifier forward and merge kernels derive their
+            # split mapping from the live device cache length.  Runtime replay
+            # only needs stable-address metadata copies; launching a separate
+            # worklist updater would be redundant and would hide scheduler
+            # latency outside the captured attention graph.
+            return self
         with record_function("paged_workspace.update_prefill_graph_replay_metadata"):
             self._update_prefill_graph_replay_metadata_from_runtime()
         return self
+
+    def _uses_laguna_verify_analytic_schedule(self) -> bool:
+        plan = self._plan
+        return bool(
+            plan is not None
+            and self.mode == "verify"
+            and self.use_cuda_graph
+            and tuple(torch.cuda.get_device_capability(self.device)) == (12, 0)
+            and plan.split_kv
+            and not plan.msa_block_sparse
+            and plan.window_left < 0
+            and plan.page_size == 128
+            and plan.cta_tile_q == 64
+            and plan.head_dim_qk == 128
+            and plan.head_dim_vo == 128
+            and plan.num_q_heads == 24
+            and plan.num_kv_heads == 4
+            and plan.gqa_group_size == 6
+            and plan.dtype == torch.bfloat16
+            and plan.kv_dtype == torch.float8_e4m3fn
+            and 1 <= int(plan.page_table_shape[0]) <= 8
+            and int(plan.total_q) == 8 * int(plan.page_table_shape[0])
+            and int(plan.num_qo_tiles) == int(plan.page_table_shape[0])
+        )
 
     def prepare_for_cuda_graph_replay(
         self,
@@ -2052,6 +2083,17 @@ class PagedAttentionWorkspace:
             page_size=int(self.page_size),
             split_kv=bool(self._plan.split_kv),
             window_left=int(self._plan.window_left),
+            adaptive_chunking=bool(
+                self.mode == "verify"
+                and self._plan.split_kv
+                and self._plan.cta_tile_q == 64
+                and self._plan.window_left < 0
+                and self._plan.page_size == 128
+                and self._plan.head_dim_qk == 128
+                and self._plan.head_dim_vo == 128
+                and self._plan.gqa_group_size == 6
+                and self._plan.kv_dtype == torch.float8_e4m3fn
+            ),
         )
 
     def _validate_decode_graph_replay_capacity(
