@@ -358,6 +358,41 @@ MODEL_PROFILES = {
             top_k=8,
         ),
     ),
+    "minimax-m3-shape": ModelProfile(
+        label="MiniMax-M3 (shape)",
+        checkpoint_family="minimax_m3_shape",
+        default_layer_idx=3,
+        tp_size=4,
+        hf_repo_id=None,
+        default_activation=SWIGLUOAI_UNINTERLEAVE,
+        default_quant_mode="nvfp4",
+        default_validate="none",
+        default_swiglu_limit=SWIGLUOAI_DEFAULT_LIMIT,
+        default_swiglu_alpha=SWIGLUOAI_DEFAULT_ALPHA,
+        default_swiglu_beta=SWIGLUOAI_DEFAULT_BETA,
+        shape=ShapeSpec(
+            hidden_size=6144,
+            intermediate_size=3072,
+            num_experts=128,
+            top_k=4,
+        ),
+    ),
+    "laguna-s21-shape": ModelProfile(
+        label="Laguna S-2.1 (shape)",
+        checkpoint_family="laguna_s21_shape",
+        default_layer_idx=1,
+        tp_size=1,
+        hf_repo_id=None,
+        default_activation="silu",
+        default_quant_mode="nvfp4",
+        default_validate="none",
+        shape=ShapeSpec(
+            hidden_size=3072,
+            intermediate_size=1024,
+            num_experts=256,
+            top_k=10,
+        ),
+    ),
     "deepseek-v4-flash": ModelProfile(
         label="DeepSeek V4 Flash",
         checkpoint_family="deepseek_v4_flash",
@@ -768,6 +803,8 @@ def load_expert_weights(
         "nano35_w4a16_shape",
         "dsv4f_shape",
         "dsv4f_nvfp4_shape",
+        "laguna_s21_shape",
+        "minimax_m3_shape",
     }:
         shape_source_format = (
             "fp4_e8m0_k32" if checkpoint_family == "dsv4f_shape" else "modelopt_nvfp4"

@@ -190,7 +190,7 @@ def _capture_msa_case(
     warmup: int,
     page_size: int = 64,
     kv_dtype: str = "bf16",
-) -> tuple[torch.cuda.CUDAGraph, int, int]:
+) -> tuple[torch.cuda.CUDAGraph, int, int, object]:
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_uniform_inputs(
         batch=batch,
         cache_len=cache_len,
@@ -259,7 +259,10 @@ def _capture_msa_case(
     launch_ctas = batch * 4 * active_chunks_per_req
     elem_bytes = 1 if kv_dtype == "fp8" else 2
     bytes_read = batch * 4 * selected_tokens * 128 * elem_bytes * 2
-    return graph, launch_ctas, bytes_read
+    # The graph records raw addresses but does not retain the eager tensors
+    # backing them. Keep the binding alive through replay so the allocator
+    # cannot recycle its inputs or scratch between sweep cases.
+    return graph, launch_ctas, bytes_read, binding
 
 
 def _capture_dense_case(
@@ -269,7 +272,7 @@ def _capture_dense_case(
     seed: int,
     warmup: int,
     kv_dtype: str = "bf16",
-) -> tuple[torch.cuda.CUDAGraph, int, int]:
+) -> tuple[torch.cuda.CUDAGraph, int, int, object]:
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_uniform_inputs(
         batch=batch,
         cache_len=cache_len,
@@ -323,7 +326,7 @@ def _capture_dense_case(
     launch_ctas = batch * 4
     elem_bytes = 1 if kv_dtype == "fp8" else 2
     bytes_read = batch * 4 * int(cache_len) * 128 * elem_bytes * 2
-    return graph, launch_ctas, bytes_read
+    return graph, launch_ctas, bytes_read, binding
 
 
 def _summarize(samples_us: list[float]) -> tuple[float, float, float]:
@@ -368,7 +371,7 @@ def main(argv: list[str] | None = None) -> int:
     for batch in args.batches:
         for context in args.contexts:
             if not args.skip_dense:
-                graph, launch_ctas, bytes_read = _capture_dense_case(
+                graph, launch_ctas, bytes_read, binding = _capture_dense_case(
                     kv_dtype=args.kv_dtype,
                     batch=batch,
                     cache_len=context,
@@ -386,7 +389,7 @@ def main(argv: list[str] | None = None) -> int:
             for chunk_tokens in args.chunks:
                 if chunk_tokens % args.page_size != 0:
                     continue
-                graph, launch_ctas, bytes_read = _capture_msa_case(
+                graph, launch_ctas, bytes_read, binding = _capture_msa_case(
                     page_size=args.page_size,
                     kv_dtype=args.kv_dtype,
                     batch=batch,

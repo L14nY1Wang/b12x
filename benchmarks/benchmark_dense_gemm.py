@@ -596,6 +596,13 @@ def main():
             "1/2/4/8/4096 for FP8."
         ),
     )
+    parser.add_argument("--n", type=int, default=None, help="Override output width N.")
+    parser.add_argument("--k", type=int, default=None, help="Override reduction width K.")
+    parser.add_argument(
+        "--shape-name",
+        default="custom",
+        help="Label used with --n/--k.",
+    )
     parser.add_argument(
         "--dtype",
         choices=("fp4", "fp8", "fp8-e2e", "all"),
@@ -634,6 +641,20 @@ def main():
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
+    if (args.n is None) != (args.k is None):
+        raise ValueError("--n and --k must be provided together")
+    if args.n is not None and (args.n <= 0 or args.k <= 0):
+        raise ValueError("--n and --k must be positive")
+
+    custom_specs = None
+    if args.n is not None:
+        custom_specs = (
+            (args.shape_name, args.k, args.n, "explicit CLI shape"),
+        )
+
+    def selected_specs(mode: str):
+        return custom_specs if custom_specs is not None else gemm_specs_for_mode(mode)
+
     torch.empty(1, device="cuda")
     l2_flush = make_l2_flush_fn(enabled=args.flush_l2, bytes_hint=args.l2_flush_bytes)
     l2_flush_bytes = resolve_l2_flush_bytes(args.l2_flush_bytes) if args.flush_l2 else 0
@@ -701,7 +722,7 @@ def main():
         print(f"  {mode.upper()} dense GEMM vs {section_references}")
         print(f"{'=' * 75}")
 
-        for name, K, N, note in gemm_specs_for_mode(mode):
+        for name, K, N, note in selected_specs(mode):
             print(f"  {name}  K={K} N={N}  [{note}]")
 
             for bs in batch_sizes:
@@ -805,7 +826,7 @@ def main():
                 continue
             if summary_label == "FlashInfer CUTLASS" and mode == "fp8-e2e":
                 continue
-            for name, _K, _N, _note in gemm_specs_for_mode(mode):
+            for name, _K, _N, _note in selected_specs(mode):
                 row = f"  {mode:<9} {name:<30}"
                 for bs in batch_sizes:
                     match = [
