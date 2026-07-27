@@ -5,13 +5,18 @@ from __future__ import annotations
 import math
 
 
+SITU = "situ"
+SITU_DEFAULT_BETA = 4.0
+SITU_DEFAULT_LINEAR_BETA = 25.0
 SWIGLUOAI_UNINTERLEAVE = "swigluoai_uninterleave"
 SWIGLUOAI_DEFAULT_LIMIT = 7.0
 SWIGLUOAI_DEFAULT_ALPHA = 1.702
 SWIGLUOAI_DEFAULT_BETA = 1.0
 
-SUPPORTED_MOE_ACTIVATIONS = frozenset({"silu", "relu2", SWIGLUOAI_UNINTERLEAVE})
-GATED_MOE_ACTIVATIONS = frozenset({"silu", SWIGLUOAI_UNINTERLEAVE})
+SUPPORTED_MOE_ACTIVATIONS = frozenset(
+    {"silu", SITU, "relu2", SWIGLUOAI_UNINTERLEAVE}
+)
+GATED_MOE_ACTIVATIONS = frozenset({"silu", SITU, SWIGLUOAI_UNINTERLEAVE})
 
 
 def normalize_moe_activation(activation: str) -> str:
@@ -36,6 +41,8 @@ def normalize_swiglu_limit_for_activation(
     activation = normalize_moe_activation(activation)
     if swiglu_limit is None:
         return SWIGLUOAI_DEFAULT_LIMIT if activation == SWIGLUOAI_UNINTERLEAVE else None
+    if activation == SITU:
+        raise ValueError("swiglu_limit is not part of the situ activation contract")
     if activation not in GATED_MOE_ACTIVATIONS:
         raise ValueError("swiglu_limit requires a gated MoE activation")
     limit = float(swiglu_limit)

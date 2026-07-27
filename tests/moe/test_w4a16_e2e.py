@@ -107,7 +107,7 @@ def _make_weights(
     intermediate_size: int,
     activation: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    is_gated = activation == "silu"
+    is_gated = activation in {"silu", "situ"}
     w13_rows = intermediate_size * (2 if is_gated else 1)
     w13 = torch.randint(
         0,
@@ -1359,6 +1359,48 @@ def test_w4a16_moe_matches_oracle(
     )
     torch.cuda.synchronize()
 
+    _assert_matches_oracle(actual, expected, activation=activation)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_w4a16_situ_moe_matches_oracle() -> None:
+    torch.manual_seed(20260726)
+    experts, hidden_size, intermediate_size = 8, 128, 128
+    m, topk = 16, 2
+    activation = "situ"
+    weights = _make_weights(
+        experts=experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation=activation,
+    )
+    x = (torch.randn(m, hidden_size, device="cuda") * 0.25).to(torch.bfloat16)
+    topk_ids = torch.randint(
+        0,
+        experts,
+        (m, topk),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    topk_weights = torch.softmax(torch.randn(m, topk, device="cuda"), dim=-1)
+
+    actual = _run_w4a16(
+        x,
+        *weights,
+        topk_ids,
+        topk_weights,
+        activation=activation,
+    )
+    expected = _reference_w4a16(
+        x,
+        *weights,
+        topk_ids,
+        topk_weights,
+        activation=activation,
+    )
+    torch.cuda.synchronize()
+
+    assert actual.abs().sum().item() > 0
     _assert_matches_oracle(actual, expected, activation=activation)
 
 

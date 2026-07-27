@@ -53,7 +53,7 @@ def _make_activation_case(
     topk_ids = torch.zeros(m, topk, device=device, dtype=torch.int32)
     topk_weights = torch.ones(m, topk, device=device, dtype=torch.float32)
 
-    w1_rows = 2 * n if activation == "silu" else n
+    w1_rows = 2 * n if activation in {"silu", "situ"} else n
     w1 = torch.randn(E, w1_rows, k, device=device, dtype=torch.bfloat16) * 0.5
     w2 = torch.randn(E, k, n, device=device, dtype=torch.bfloat16) * 0.25
     a1_gscale = torch.ones(E, device=device, dtype=torch.float32)
@@ -171,7 +171,7 @@ def _run_single_token_multi_expert_case(
     topk_logits = torch.tensor([[0.2, -0.1, 0.4]], device=device, dtype=torch.float32)
     topk_weights = torch.softmax(topk_logits, dim=-1)
 
-    w1_rows = 2 * n if activation == "silu" else n
+    w1_rows = 2 * n if activation in {"silu", "situ"} else n
     w1 = torch.randn(E, w1_rows, k, device=device, dtype=torch.bfloat16) * 0.5
     w2 = torch.randn(E, k, n, device=device, dtype=torch.bfloat16) * 0.25
     a1_gscale = torch.ones(E, device=device, dtype=torch.float32)
@@ -293,6 +293,35 @@ def test_single_token_multi_expert_micro_matches_int32_with_int64_topk_ids(
 
     metrics = compare_to_reference(output_i64, reference)
     assert metrics.cos > 0.9999, f"{activation}: {metrics}"
+
+
+def test_single_token_multi_expert_situ_avoids_micro_and_matches_reference() -> None:
+    implementation, _, _ = tp_moe._resolve_workspace_layout(
+        num_tokens=1,
+        weight_E=4,
+        num_topk=3,
+        k=128,
+        n=128,
+        activation="situ",
+        quant_mode="nvfp4",
+    )
+    assert implementation == "dynamic"
+
+    output_i64, reference = _run_single_token_multi_expert_case(
+        activation="situ",
+        topk_ids_dtype=torch.int64,
+        micro_dynamic_cutover=128,
+    )
+    output_i32, _ = _run_single_token_multi_expert_case(
+        activation="situ",
+        topk_ids_dtype=torch.int32,
+        micro_dynamic_cutover=128,
+    )
+    pair_metrics = compare_to_reference(output_i64, output_i32)
+    assert pair_metrics.cos > 0.9999, f"situ int64 vs int32: {pair_metrics}"
+
+    metrics = compare_to_reference(output_i64, reference)
+    assert metrics.cos > 0.9999, f"situ: {metrics}"
 
 
 @pytest.mark.parametrize("m", [1, 2, 4])

@@ -619,8 +619,10 @@ def plan_moe_weight_preparation(
             )
             continue
         if spec.quant_mode == "w4a8_mx":
-            if spec.activation != "silu":
-                raise ValueError("W4A8-MX preparation currently requires silu")
+            if spec.activation not in {"silu", "situ"}:
+                raise ValueError(
+                    "W4A8-MX preparation currently requires silu or situ"
+                )
             # The rp storage ceil-tiles partial 256/128 tiles (zero-filled),
             # so 32-aligned shards (352 = 2048/TP6, 192 = 3072/TP16) prepare
             # fine; consumers bound their reads by the logical sizes.

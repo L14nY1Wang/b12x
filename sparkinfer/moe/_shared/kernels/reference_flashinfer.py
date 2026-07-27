@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import torch
 
 from .activations import (
+    SITU,
     SWIGLUOAI_UNINTERLEAVE,
     is_gated_moe_activation,
     moe_activation_w1_rows,
@@ -114,9 +115,9 @@ def prepare_flashinfer_trtllm_fp4_e8m0_k32_weights(
     FlashInfer's ABI carrier for the interleaved byte storage.
     """
     activation = normalize_moe_activation(activation)
-    if activation == SWIGLUOAI_UNINTERLEAVE:
+    if activation in {SITU, SWIGLUOAI_UNINTERLEAVE}:
         raise NotImplementedError(
-            "FlashInfer TRT-LLM FP4 preparation does not support swigluoai_uninterleave"
+            f"FlashInfer TRT-LLM FP4 preparation does not support {activation}"
         )
     _validate_reference_inputs(w13_fp4, I_tp, activation)
     if not w13_fp4.is_cuda or not w2_fp4.is_cuda:
@@ -255,9 +256,9 @@ def moe_reference_w4a16_fp4_e8m0_k32_flashinfer(
     scale_byte_clamp: int | None = _E8M0_K32_BF16_MAX_SCALE_BYTE,
 ) -> torch.Tensor:
     activation = normalize_moe_activation(activation)
-    if activation == SWIGLUOAI_UNINTERLEAVE:
+    if activation in {SITU, SWIGLUOAI_UNINTERLEAVE}:
         raise NotImplementedError(
-            "FlashInfer TRT-LLM FP4 oracle does not support swigluoai_uninterleave"
+            f"FlashInfer TRT-LLM FP4 oracle does not support {activation}"
         )
     _validate_reference_inputs(w1_fp4, I_tp, activation)
     if int(E) != int(w1_fp4.shape[0]) or int(E) != int(w2_fp4.shape[0]):
@@ -367,4 +368,3 @@ def moe_reference_w4a16_fp4_e8m0_k32_flashinfer_prepared(
         tune_max_num_tokens=max(16, int(x.shape[0])),
     )
     return result[0]
-

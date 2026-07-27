@@ -92,6 +92,9 @@ from sparkinfer._lib.runtime_control import (
     raise_if_kernel_resolution_frozen,
 )
 from sparkinfer.moe._shared.kernels.activations import (
+    SITU,
+    SITU_DEFAULT_BETA,
+    SITU_DEFAULT_LINEAR_BETA,
     SWIGLUOAI_UNINTERLEAVE,
     is_gated_moe_activation,
     normalize_moe_activation,
@@ -4272,6 +4275,7 @@ class W4A16FusedMoeKernel:
         self.moe_block_size = int(moe_block_size)
         self.activation = activation
         self.activation_is_gated = is_gated
+        self.activation_is_situ = activation == SITU
         self.activation_is_swigluoai = activation == SWIGLUOAI_UNINTERLEAVE
         self.has_swiglu_limit = swiglu_limit is not None
         self.swiglu_limit = 0.0 if swiglu_limit is None else swiglu_limit
@@ -4355,6 +4359,7 @@ class W4A16FusedMoeKernel:
             self.top_k,
             self.activation,
             self.activation_is_gated,
+            self.activation_is_situ,
             self.activation_is_swigluoai,
             self.has_swiglu_limit,
             self.swiglu_limit,
@@ -4873,8 +4878,26 @@ class W4A16FusedMoeKernel:
                     exp_neg_gate = cute.math.exp(-sigmoid_arg, fastmath=True)
                 else:
                     exp_neg_gate = cute.math.exp(-sigmoid_arg, fastmath=False)
-                silu = gate / (cutlass.Float32(1.0) + exp_neg_gate)
-                if cutlass.const_expr(self.activation_is_swigluoai):
+                sigmoid = cutlass.Float32(1.0) / (
+                    cutlass.Float32(1.0) + exp_neg_gate
+                )
+                silu = gate * sigmoid
+                if cutlass.const_expr(self.activation_is_situ):
+                    beta = cutlass.Float32(SITU_DEFAULT_BETA)
+                    linear_beta = cutlass.Float32(SITU_DEFAULT_LINEAR_BETA)
+                    situ_gate = (
+                        beta
+                        * cute.math.tanh(gate / beta, fastmath=self.fast_math)
+                        * sigmoid
+                    )
+                    situ_up = linear_beta * cute.math.tanh(
+                        up / linear_beta,
+                        fastmath=self.fast_math,
+                    )
+                    activated_bf16_flat[idx] = self._cast_elem(
+                        situ_gate * situ_up
+                    )
+                elif cutlass.const_expr(self.activation_is_swigluoai):
                     activated_bf16_flat[idx] = self._cast_elem(silu * up_term)
                 else:
                     activated_bf16_flat[idx] = self._cast_elem(
@@ -5371,6 +5394,7 @@ class W4A16ActivationKernel:
         self.intermediate_size = int(intermediate_size)
         self.activation = activation
         self.is_gated = is_gated
+        self.is_situ = activation == SITU
         self.is_swigluoai = activation == SWIGLUOAI_UNINTERLEAVE
         self.has_swiglu_limit = swiglu_limit is not None
         self.swiglu_limit = 0.0 if swiglu_limit is None else swiglu_limit
@@ -5387,6 +5411,7 @@ class W4A16ActivationKernel:
             self.intermediate_size,
             self.activation,
             self.is_gated,
+            self.is_situ,
             self.is_swigluoai,
             self.has_swiglu_limit,
             self.swiglu_limit,
@@ -5466,8 +5491,26 @@ class W4A16ActivationKernel:
                     exp_neg_gate = cute.math.exp(-sigmoid_arg, fastmath=True)
                 else:
                     exp_neg_gate = cute.math.exp(-sigmoid_arg, fastmath=False)
-                silu = gate / (cutlass.Float32(1.0) + exp_neg_gate)
-                if cutlass.const_expr(self.is_swigluoai):
+                sigmoid = cutlass.Float32(1.0) / (
+                    cutlass.Float32(1.0) + exp_neg_gate
+                )
+                silu = gate * sigmoid
+                if cutlass.const_expr(self.is_situ):
+                    beta = cutlass.Float32(SITU_DEFAULT_BETA)
+                    linear_beta = cutlass.Float32(SITU_DEFAULT_LINEAR_BETA)
+                    situ_gate = (
+                        beta
+                        * cute.math.tanh(gate / beta, fastmath=self.fast_math)
+                        * sigmoid
+                    )
+                    situ_up = linear_beta * cute.math.tanh(
+                        up / linear_beta,
+                        fastmath=self.fast_math,
+                    )
+                    activated_flat[idx] = self._cast_elem(
+                        situ_gate * situ_up
+                    )
+                elif cutlass.const_expr(self.is_swigluoai):
                     activated_flat[idx] = self._cast_elem(silu * up_term)
                 else:
                     activated_flat[idx] = self._cast_elem(

@@ -98,7 +98,7 @@ def _run_w4a8_dynamic(
         raise ValueError("return_state requires return_launcher=True")
     device = torch.device("cuda")
     torch.manual_seed(seed)
-    is_gated = activation == "silu"
+    is_gated = activation in {"silu", "situ"}
     w1_n = 2 * n if is_gated else n
 
     x = (torch.randn(m, K, device=device) * 2.0).to(torch.bfloat16)
@@ -720,7 +720,7 @@ def _run_w4a8_dynamic(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("recipe", ["w4a8_mx", "w4a8_nvfp4"])
-@pytest.mark.parametrize("activation", ["silu", "relu2"])
+@pytest.mark.parametrize("activation", ["silu", "situ", "relu2"])
 def test_w4a8_dynamic_matches_oracle(recipe: str, activation: str) -> None:
     require_sparkinfer()
     out, ref = _run_w4a8_dynamic(
@@ -735,7 +735,7 @@ def test_w4a8_dynamic_matches_oracle(recipe: str, activation: str) -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("activation", ["silu", "relu2"])
+@pytest.mark.parametrize("activation", ["silu", "situ", "relu2"])
 def test_w4a8_dynamic_small_tile_parallel_regime_matches_oracle(
     activation: str,
 ) -> None:

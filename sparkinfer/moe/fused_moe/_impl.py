@@ -47,7 +47,12 @@ from sparkinfer.moe._shared.kernels.silu import (
     MoEMicroKernelSilu,
     MoEMicroKernelSwiGLUOAI,
 )
+from sparkinfer.moe._shared.kernels.situ import (
+    MoEDynamicKernelSitu,
+    MoEMicroKernelSitu,
+)
 from sparkinfer.moe._shared.kernels.activations import (
+    SITU,
     SWIGLUOAI_UNINTERLEAVE,
     is_gated_moe_activation,
     moe_activation_w1_rows,
@@ -1118,6 +1123,12 @@ _ACTIVATION_KERNEL_SPECS = {
         micro_kernel_cls=MoEMicroKernelSilu,
         dynamic_kernel_cls=MoEDynamicKernelSilu,
     ),
+    SITU: _ActivationKernelSpec(
+        activation=SITU,
+        is_gated=True,
+        micro_kernel_cls=MoEMicroKernelSitu,
+        dynamic_kernel_cls=MoEDynamicKernelSitu,
+    ),
     SWIGLUOAI_UNINTERLEAVE: _ActivationKernelSpec(
         activation=SWIGLUOAI_UNINTERLEAVE,
         is_gated=True,
@@ -1534,7 +1545,7 @@ def _w4a8_dynamic_dense_candidate(
 
     return bool(
         _normalize_quant_mode(quant_mode) == "w4a8_mx"
-        and activation == "silu"
+        and activation in {"silu", SITU}
         and k % 256 == 0
         # Half-aligned ceil-tiled rp storage keeps the up/gate halves on
         # 128-row tile boundaries, so the per-tile pairing works for any
@@ -1565,7 +1576,7 @@ def _w4a8_dynamic_decode_candidate(
 
     return bool(
         _normalize_quant_mode(quant_mode) == "w4a8_mx"
-        and activation == "silu"
+        and activation in {"silu", SITU}
         and 0 < routed_rows <= _W4A8_DECODE_MAX_ROUTED_ROWS
         and _select_dynamic_tile_mn(
             routed_rows,
@@ -1597,7 +1608,8 @@ def _w4a8_dynamic_direct_candidate(
         # re-streaming weights when speculative tokens share experts.
         direct_limit = 0
     return bool(
-        routed_rows <= direct_limit
+        activation == "silu"
+        and routed_rows <= direct_limit
         and _w4a8_dynamic_decode_candidate(
             quant_mode=quant_mode,
             activation=activation,

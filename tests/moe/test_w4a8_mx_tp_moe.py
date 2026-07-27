@@ -50,9 +50,7 @@ def test_w4a8_mx_dynamic_tile_density_boundaries(
 
 
 @pytest.mark.parametrize("routed_rows", [384, 768, 1536, 2304])
-def test_w4a8_mx_ds4_tp2_batch_m_uses_m32(
-    monkeypatch, routed_rows: int
-) -> None:
+def test_w4a8_mx_ds4_tp2_batch_m_uses_m32(monkeypatch, routed_rows: int) -> None:
     import sparkinfer.moe.fused_moe._impl as tp_moe
 
     monkeypatch.delenv("SPARKINFER_DYNAMIC_TILE_MN", raising=False)
@@ -83,9 +81,7 @@ def test_w4a8_mx_ds4_tp2_batch_m_tactic_is_band_limited(
 
 
 @pytest.mark.parametrize("m", [1024, 4096, 8192, 16384])
-def test_w4a8_mx_ds4_tp2_sm121_prefill_uses_fused_m32(
-    monkeypatch, m: int
-) -> None:
+def test_w4a8_mx_ds4_tp2_sm121_prefill_uses_fused_m32(monkeypatch, m: int) -> None:
     import sparkinfer.moe.fused_moe._impl as tp_moe
 
     monkeypatch.delenv("SPARKINFER_DYNAMIC_TILE_MN", raising=False)
@@ -100,9 +96,7 @@ def test_w4a8_mx_ds4_tp2_sm121_prefill_uses_fused_m32(
 
 
 @pytest.mark.parametrize("m", [4096, 8192, 16384])
-def test_w4a8_mx_ds4_tp2_sm120_prefill_keeps_coarse_tactic(
-    monkeypatch, m: int
-) -> None:
+def test_w4a8_mx_ds4_tp2_sm120_prefill_keeps_coarse_tactic(monkeypatch, m: int) -> None:
     import sparkinfer.moe.fused_moe._impl as tp_moe
 
     monkeypatch.delenv("SPARKINFER_DYNAMIC_TILE_MN", raising=False)
@@ -124,20 +118,27 @@ def _skip_if_unavailable() -> None:
 def _weights(*, n: int = _N, seed: int = 21):
     """Create one checkpoint allocation whose ownership may be transferred."""
 
-    return make_synthetic_mxfp4_moe(
-        _E, _K, n, seed=seed, device=torch.device("cuda")
-    )
+    return make_synthetic_mxfp4_moe(_E, _K, n, seed=seed, device=torch.device("cuda"))
 
 
-def _prepare(weights: dict, *, n: int = _N, w13_layout: str = "w13"):
+def _prepare(
+    weights: dict,
+    *,
+    n: int = _N,
+    w13_layout: str = "w13",
+    activation: str = "silu",
+):
     """Destructively turn checkpoint storage into the sole runtime layout."""
 
-    from sparkinfer.moe.fused_moe._impl import plan_sparkinfer_fp4_moe_weights, prepare_sparkinfer_fp4_moe_weights
+    from sparkinfer.moe.fused_moe._impl import (
+        plan_sparkinfer_fp4_moe_weights,
+        prepare_sparkinfer_fp4_moe_weights,
+    )
 
     plan = plan_sparkinfer_fp4_moe_weights(
         quant_modes="w4a8_mx",
         source_format="fp4_e8m0_k32",
-        activation="silu",
+        activation=activation,
         params_dtype=torch.bfloat16,
         num_experts=_E,
         hidden_size=_K,
@@ -252,11 +253,256 @@ def test_w4a8_mx_dynamic_matches_oracle(n: int) -> None:
     assert 0.8 < n_out / n_ref < 1.25, (n_out, n_ref)
 
 
-def test_w4a8_mx_w31_layout_flip() -> None:
+@pytest.mark.parametrize("m", [8, 144])
+def test_w4a8_mx_situ_public_path_matches_oracle(m: int) -> None:
+    _skip_if_unavailable()
+    from sparkinfer.moe._shared.kernels.reference import moe_reference_w4a8_mx
+
+    n = 128
+    weights = _weights(n=n, seed=20260726)
+    x, topk_ids, topk_weights = _routed_inputs(m, 33)
+    ref = moe_reference_w4a8_mx(
+        x.float(),
+        weights["w13_fp4"],
+        weights["w13_mx"],
+        None,
+        weights["alphas"],
+        weights["w2_fp4"],
+        weights["w2_mx"],
+        None,
+        weights["alphas"],
+        topk_ids,
+        topk_weights,
+        _E,
+        _K,
+        n,
+        activation="situ",
+    )
+    prepared = _prepare(weights, n=n, activation="situ")
+    out = _run(m, prepared)
+
+    assert out.abs().sum().item() > 0
+    cos = torch.nn.functional.cosine_similarity(
+        out.float().flatten(),
+        ref.float().flatten(),
+        dim=0,
+    ).item()
+    assert cos > 0.998, cos
+
+
+@pytest.mark.parametrize("m", [1, 144])
+def test_w4a8_mx_situ_cuda_graph_replay_matches_oracle(m: int) -> None:
+    _skip_if_unavailable()
+    from sparkinfer.moe._shared.kernels.reference import moe_reference_w4a8_mx
+    from sparkinfer.moe.fused_moe._impl import sparkinfer_moe_fp4
+    from tests._reference.helpers import make_tp_moe_fp4_binding
+
+    n = 128
+    weights = _weights(n=n, seed=20260728)
+    x, topk_ids, topk_weights = _routed_inputs(m, 20260729)
+    new_x, new_ids, new_weights = _routed_inputs(m, 20260730)
+    expected = moe_reference_w4a8_mx(
+        new_x.float(),
+        weights["w13_fp4"],
+        weights["w13_mx"],
+        None,
+        weights["alphas"],
+        weights["w2_fp4"],
+        weights["w2_mx"],
+        None,
+        weights["alphas"],
+        new_ids,
+        new_weights,
+        _E,
+        _K,
+        n,
+        activation="situ",
+    )
+    prepared = _prepare(weights, n=n, activation="situ")
+    output = torch.zeros(m, _K, dtype=torch.bfloat16, device="cuda")
+    binding = make_tp_moe_fp4_binding(
+        a=x,
+        experts=prepared,
+        topk_weights=topk_weights.contiguous(),
+        topk_ids=topk_ids.contiguous(),
+        output=output,
+        input_scales_static=True,
+        quant_mode="w4a8_mx",
+    )
+
+    sparkinfer_moe_fp4(binding=binding)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(capture_stream), torch.cuda.graph(graph):
+        sparkinfer_moe_fp4(binding=binding)
+    torch.cuda.current_stream().wait_stream(capture_stream)
+    torch.cuda.synchronize()
+
+    x.copy_(new_x)
+    topk_ids.copy_(new_ids)
+    topk_weights.copy_(new_weights)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert output.abs().sum().item() > 0
+    cos = torch.nn.functional.cosine_similarity(
+        output.float().flatten(),
+        expected.float().flatten(),
+        dim=0,
+    ).item()
+    assert cos > 0.998, cos
+
+
+def test_w4a8_mx_kimi_k3_tp8_situ_reuses_checkpoint_storage() -> None:
+    """K3 TP8: K=3584, N=3072/8=384, gate/up checkpoint order."""
+
+    _skip_if_unavailable()
+    from sparkinfer.moe._shared.kernels.reference import moe_reference_w4a8_mx
+    from sparkinfer.moe.fused_moe import (
+        plan_weights,
+        prepare_weights,
+        run,
+    )
+    from tests._reference.helpers import make_tp_moe_fp4_binding
+
+    experts_count = 16
+    hidden_size = 3584
+    intermediate_size = 384
+    topk = 16
+    m = 8
+    device = torch.device("cuda")
+    weights = make_synthetic_mxfp4_moe(
+        experts_count,
+        hidden_size,
+        intermediate_size,
+        seed=20260731,
+        device=device,
+    )
+
+    # The synthetic helper emits [up; gate]. K3 stores [w1/gate; w3/up].
+    for name in ("w13_fp4", "w13_mx"):
+        tensor = weights[name]
+        first = tensor[:, :intermediate_size].clone()
+        tensor[:, :intermediate_size].copy_(tensor[:, intermediate_size:])
+        tensor[:, intermediate_size:].copy_(first)
+
+    gen = torch.Generator(device=device)
+    gen.manual_seed(20260801)
+    x = torch.randn(
+        m,
+        hidden_size,
+        dtype=torch.bfloat16,
+        generator=gen,
+        device=device,
+    )
+    logits = torch.randn(m, experts_count, generator=gen, device=device)
+    topk_logits, topk_ids = torch.topk(logits, topk, dim=-1)
+    topk_weights = torch.softmax(topk_logits, dim=-1).float().contiguous()
+    topk_ids = topk_ids.to(torch.int32).contiguous()
+    expected = moe_reference_w4a8_mx(
+        x.float(),
+        weights["w13_fp4"],
+        weights["w13_mx"],
+        None,
+        weights["alphas"],
+        weights["w2_fp4"],
+        weights["w2_mx"],
+        None,
+        weights["alphas"],
+        topk_ids,
+        topk_weights,
+        experts_count,
+        hidden_size,
+        intermediate_size,
+        activation="situ",
+        w13_layout="w31",
+    )
+    source_ptrs = tuple(
+        weights[name].untyped_storage().data_ptr()
+        for name in ("w13_fp4", "w13_mx", "w2_fp4", "w2_mx")
+    )
+    weight_plan = plan_weights(
+        quant_modes="w4a8_mx",
+        source_format="fp4_e8m0_k32",
+        activation="situ",
+        params_dtype=torch.bfloat16,
+        num_experts=experts_count,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        w13_layout="w31",
+    )
+    prepared = prepare_weights(
+        plan=weight_plan,
+        w1_fp4=weights["w13_fp4"],
+        w1_blockscale=weights["w13_mx"],
+        w1_global_scale=weights["alphas"],
+        a1_gscale=weights["input_scale"],
+        w2_fp4=weights["w2_fp4"],
+        w2_blockscale=weights["w2_mx"],
+        w2_global_scale=weights["alphas"],
+        a2_gscale=weights["input_scale"],
+        params_dtype=torch.bfloat16,
+    )
+    runtime = prepared.representation_for("w4a8_mx")
+    runtime_ptrs = tuple(
+        tensor.untyped_storage().data_ptr()
+        for tensor in (
+            runtime.w13_rp,
+            runtime.w13_sfb,
+            runtime.w2_rp,
+            runtime.w2_sfb,
+        )
+    )
+    assert runtime_ptrs == source_ptrs
+
+    output = torch.zeros(m, hidden_size, dtype=torch.bfloat16, device=device)
+    binding = make_tp_moe_fp4_binding(
+        a=x,
+        experts=prepared,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        output=output,
+        input_scales_static=True,
+        quant_mode="w4a8_mx",
+    )
+    run(binding=binding)
+    torch.cuda.synchronize()
+
+    assert output.isfinite().all()
+    assert output.abs().sum().item() > 0
+    cos = torch.nn.functional.cosine_similarity(
+        output.float().flatten(),
+        expected.float().flatten(),
+        dim=0,
+    ).item()
+    assert cos > 0.998, cos
+
+    graph = torch.cuda.CUDAGraph()
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(capture_stream), torch.cuda.graph(graph):
+        run(binding=binding)
+    torch.cuda.current_stream().wait_stream(capture_stream)
+    torch.cuda.synchronize()
+    output.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    replay_cos = torch.nn.functional.cosine_similarity(
+        output.float().flatten(),
+        expected.float().flatten(),
+        dim=0,
+    ).item()
+    assert replay_cos > 0.998, replay_cos
+
+
+@pytest.mark.parametrize("activation", ["silu", "situ"])
+def test_w4a8_mx_w31_layout_flip(activation: str) -> None:
     _skip_if_unavailable()
     weights = _weights()
     m = 16
-    prepared = _prepare(weights)
+    prepared = _prepare(weights, activation=activation)
     baseline = _run(m, prepared)
     repeat = _run(m, prepared)
 
@@ -275,7 +521,7 @@ def test_w4a8_mx_w31_layout_flip() -> None:
     mx[:, :_N].copy_(mx[:, _N:])
     mx[:, _N:].copy_(tmp)
     del tmp
-    prepared = _prepare(weights, w13_layout="w31")
+    prepared = _prepare(weights, w13_layout="w31", activation=activation)
     flipped = _run(m, prepared)
     # Idempotency: a second pass over the same storage must not re-flip.
     flipped2 = _run(m, prepared)
@@ -297,7 +543,9 @@ def test_w4a8_mx_small_band_matches_fp32_oracle(m: int, n: int) -> None:
     _skip_if_unavailable()
     from sparkinfer.moe.fused_moe._impl import plan_sparkinfer_fp4_moe_weights
     import sparkinfer.moe.fused_moe._impl as tp_moe
-    from sparkinfer.moe._shared.kernels.reference import moe_reference_w4a16_fp4_e8m0_k32
+    from sparkinfer.moe._shared.kernels.reference import (
+        moe_reference_w4a16_fp4_e8m0_k32,
+    )
 
     weights = _weights(n=n)
     weight_plan = plan_sparkinfer_fp4_moe_weights(
@@ -420,7 +668,10 @@ def test_w4a8_mx_prepared_dynamic_runs_with_compacted_sources() -> None:
     """The serving representation must not retain logical checkpoint weights."""
 
     _skip_if_unavailable()
-    from sparkinfer.moe.fused_moe._impl import plan_sparkinfer_fp4_moe_weights, prepare_sparkinfer_fp4_moe_weights
+    from sparkinfer.moe.fused_moe._impl import (
+        plan_sparkinfer_fp4_moe_weights,
+        prepare_sparkinfer_fp4_moe_weights,
+    )
     from sparkinfer.moe._shared.kernels.reference import moe_reference_w4a8_mx
     from tests._reference.helpers import run_tp_moe_fp4
 

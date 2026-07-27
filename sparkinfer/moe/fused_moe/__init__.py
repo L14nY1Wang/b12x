@@ -3,7 +3,7 @@ scatter, in one launch family.
 
 Recipes (``META.recipes``) are arguments, not separate ops: nvfp4, mxfp4,
 w4a8_mx, w4a8_nvfp4, w4a16 (weight layouts packed/modelopt/nf3_2p1).  Activations:
-silu, relu2, swigluoai_uninterleave.  Kernel
+silu, situ, relu2, swigluoai_uninterleave.  Kernel
 regimes (micro / dynamic / tiny-decode / w4a16) are selected declaratively by
 ``plan_execution``.
 

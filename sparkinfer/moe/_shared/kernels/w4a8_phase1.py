@@ -3,7 +3,8 @@
 The dynamic front-end still owns routing, input quantization, and publication
 of a compact expert-major M64 or M128 source domain.  This kernel consumes that
 domain as M64xN128 tasks, computes gate and up together in one K sweep, applies
-SiLU, and writes the existing caller-owned MXFP8 intermediate workspace.
+the selected gated activation, and writes the existing caller-owned MXFP8
+intermediate workspace.
 
 Keeping the compute body separate from routing and FC2 removes the monolithic
 kernel's register/shared-memory union.  The launch has a fixed two-CTA-per-SM
@@ -34,6 +35,11 @@ from sparkinfer._lib.intrinsics import (
     quantize_block_fp8_mx,
     shared_ptr_to_u32,
     st_shared_u32,
+)
+from sparkinfer.moe._shared.kernels.activations import (
+    SITU,
+    SITU_DEFAULT_BETA,
+    SITU_DEFAULT_LINEAR_BETA,
 )
 
 
@@ -79,6 +85,7 @@ class W4A8MaterializedPhase1Kernel:
         source_tile_m: int = 128,
         deterministic_output: bool = False,
         num_topk: int = 1,
+        activation: str = "silu",
     ):
         if source_tile_m not in (64, 128):
             raise ValueError(
@@ -91,6 +98,12 @@ class W4A8MaterializedPhase1Kernel:
         if int(num_topk) <= 0:
             raise ValueError(f"num_topk must be positive, got {num_topk}")
         self.num_topk = int(num_topk)
+        if activation not in {"silu", SITU}:
+            raise ValueError(
+                "materialized W4A8 phase 1 requires silu or situ, "
+                f"got {activation!r}"
+            )
+        self.is_situ = activation == SITU
 
     @cute.jit
     def __call__(
@@ -320,6 +333,19 @@ class W4A8MaterializedPhase1Kernel:
         sigmoid = cute.arch.rcp_approx(
             cutlass.Float32(1.0) + cute.math.exp(-gate, fastmath=self.fast_math)
         )
+        if cutlass.const_expr(self.is_situ):
+            beta = cutlass.Float32(SITU_DEFAULT_BETA)
+            linear_beta = cutlass.Float32(SITU_DEFAULT_LINEAR_BETA)
+            situ_gate = (
+                beta
+                * cute.math.tanh(gate / beta, fastmath=self.fast_math)
+                * sigmoid
+            )
+            situ_up = linear_beta * cute.math.tanh(
+                up / linear_beta,
+                fastmath=self.fast_math,
+            )
+            return situ_gate * situ_up
         return gate * sigmoid * up
 
     @cute.jit

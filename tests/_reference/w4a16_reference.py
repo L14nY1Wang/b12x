@@ -76,14 +76,28 @@ def _validate_reference_inputs(
     I_tp: int,
     activation: str,
 ) -> None:
-    if activation not in {"silu", "relu2"}:
+    if activation not in {"silu", "situ", "relu2"}:
         raise ValueError(f"unsupported activation {activation!r}")
-    expected_w1_rows = 2 * I_tp if activation == "silu" else I_tp
+    expected_w1_rows = 2 * I_tp if activation in {"silu", "situ"} else I_tp
     if w1_fp4.shape[1] != expected_w1_rows:
         raise ValueError(
             f"expected w1_fp4.shape[1] == {expected_w1_rows} for activation "
             f"{activation!r}, got {w1_fp4.shape[1]}"
         )
+
+
+def _apply_gated_activation(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    activation: str,
+) -> torch.Tensor:
+    if activation == "situ":
+        beta = 4.0
+        linear_beta = 25.0
+        situ_gate = beta * torch.tanh(gate / beta) * torch.sigmoid(gate)
+        situ_up = linear_beta * torch.tanh(up / linear_beta)
+        return situ_gate * situ_up
+    return torch.sigmoid(gate) * gate * up
 
 
 def _make_fp4_lut(device: torch.device) -> torch.Tensor:
@@ -165,7 +179,7 @@ def _trace_nvfp4_route(
     block_size = 16
     fp8_e4m3_max = float(torch.finfo(torch.float8_e4m3fn).max)
     fp4_lut = _make_fp4_lut(x_f32.device)
-    is_gated = activation == "silu"
+    is_gated = activation in {"silu", "situ"}
 
     x_dequant = _quantize_vec_to_fp4_dequant(
         x_f32,
@@ -196,7 +210,11 @@ def _trace_nvfp4_route(
         )
         gate_out = (gate_dequant @ x_dequant) * alpha_fc1
         up_out = (up_dequant @ x_dequant) * alpha_fc1
-        intermediate = (torch.sigmoid(gate_out) * gate_out * up_out).to(torch.bfloat16).float()
+        intermediate = _apply_gated_activation(
+            gate_out,
+            up_out,
+            activation,
+        ).to(torch.bfloat16).float()
     else:
         w1_sf = unswizzle_block_scale(w1_blockscale_eid, I_tp, K // block_size)
         fc1_dequant = _apply_block_scales(
@@ -265,7 +283,7 @@ def _trace_w4a16_route(
 ) -> MoERouteTrace:
     block_size = 16
     fp4_lut = _make_fp4_lut(x_f32.device)
-    is_gated = activation == "silu"
+    is_gated = activation in {"silu", "situ"}
 
     x_bf16 = x_f32.to(torch.bfloat16).float()
     w2_sf = unswizzle_block_scale(w2_blockscale_eid, K, I_tp // block_size)
@@ -294,7 +312,11 @@ def _trace_w4a16_route(
         if swiglu_limit is not None:
             gate_out = torch.clamp(gate_out, max=swiglu_limit)
             up_out = torch.clamp(up_out, min=-swiglu_limit, max=swiglu_limit)
-        intermediate = (torch.sigmoid(gate_out) * gate_out * up_out).to(torch.bfloat16).float()
+        intermediate = _apply_gated_activation(
+            gate_out,
+            up_out,
+            activation,
+        ).to(torch.bfloat16).float()
     else:
         w1_sf = unswizzle_block_scale(w1_blockscale_eid, I_tp, K // block_size)
         fc1_dequant = _apply_block_scales(
@@ -457,7 +479,7 @@ def moe_reference_f32(
 ) -> torch.Tensor:
     _validate_reference_inputs(w1_fp4, I_tp, activation)
     del E
-    is_gated = activation == "silu"
+    is_gated = activation in {"silu", "situ"}
     block_size = 16
     fp8_e4m3_max = float(torch.finfo(torch.float8_e4m3fn).max)
 
@@ -524,7 +546,11 @@ def moe_reference_f32(
                 )
                 gate_out = (gate_dequant @ x_dequant) * alpha_fc1
                 up_out = (up_dequant @ x_dequant) * alpha_fc1
-                intermediate = torch.sigmoid(gate_out) * gate_out * up_out
+                intermediate = _apply_gated_activation(
+                    gate_out,
+                    up_out,
+                    activation,
+                )
             else:
                 w1_sf = unswizzle_block_scale(w1_blockscale[eid], I_tp, K // block_size)
                 fc1_dequant = apply_block_scales(

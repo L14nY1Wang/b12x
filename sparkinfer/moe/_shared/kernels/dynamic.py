@@ -114,6 +114,9 @@ from sparkinfer._lib.intrinsics import (
     scatter_add_v4_bf16x2,
 )
 from sparkinfer.moe._shared.kernels.activations import (
+    SITU,
+    SITU_DEFAULT_BETA,
+    SITU_DEFAULT_LINEAR_BETA,
     SWIGLUOAI_UNINTERLEAVE,
     is_gated_moe_activation,
     normalize_moe_activation,
@@ -714,6 +717,7 @@ class MoEDynamicKernelBackend:
         self.fast_math = fast_math
         self.activation = activation
         self.is_gated = is_gated_moe_activation(activation)
+        self.is_situ = activation == SITU
         self.is_swigluoai = activation == SWIGLUOAI_UNINTERLEAVE
         self.has_swiglu_limit = swiglu_limit is not None
         self.swiglu_limit = 0.0 if swiglu_limit is None else float(swiglu_limit)
@@ -818,6 +822,7 @@ class MoEDynamicKernelBackend:
             source_tile_m=materialized_source_tile_m,
             deterministic_output=bool(deterministic_output),
             num_topk=self.num_topk,
+            activation=self.activation,
         )
         self.materialized_phase2_kernel = W4A8MaterializedPhase2Kernel(
             source_tile_m=materialized_source_tile_m,
@@ -1396,6 +1401,19 @@ class MoEDynamicKernelBackend:
         sigmoid = cute.arch.rcp_approx(
             cutlass.Float32(1.0) + cute.math.exp(-sigmoid_arg, fastmath=self.fast_math)
         )
+        if cutlass.const_expr(self.is_situ):
+            beta = cutlass.Float32(SITU_DEFAULT_BETA)
+            linear_beta = cutlass.Float32(SITU_DEFAULT_LINEAR_BETA)
+            situ_gate = (
+                beta
+                * cute.math.tanh(gate / beta, fastmath=self.fast_math)
+                * sigmoid
+            )
+            situ_up = linear_beta * cute.math.tanh(
+                up / linear_beta,
+                fastmath=self.fast_math,
+            )
+            return situ_gate * situ_up
         return gate * sigmoid * up_term
 
     @cute.jit

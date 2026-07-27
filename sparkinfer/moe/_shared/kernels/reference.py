@@ -8,6 +8,9 @@ import torch
 # reference_flashinfer.py, kept separate so this module stays pure-torch.
 from sparkinfer._lib.intrinsics import fp4_quantize_values_torch
 from sparkinfer.moe._shared.kernels.activations import (
+    SITU,
+    SITU_DEFAULT_BETA,
+    SITU_DEFAULT_LINEAR_BETA,
     SWIGLUOAI_UNINTERLEAVE,
     is_gated_moe_activation,
     moe_activation_w1_rows,
@@ -157,6 +160,16 @@ def _apply_gated_activation(
         return (
             gate * torch.sigmoid(float(swiglu_alpha) * gate) * (up + float(swiglu_beta))
         )
+    if activation == SITU:
+        situ_gate = (
+            SITU_DEFAULT_BETA
+            * torch.tanh(gate / SITU_DEFAULT_BETA)
+            * torch.sigmoid(gate)
+        )
+        situ_up = SITU_DEFAULT_LINEAR_BETA * torch.tanh(
+            up / SITU_DEFAULT_LINEAR_BETA
+        )
+        return situ_gate * situ_up
     return gate * torch.sigmoid(gate) * up
 
 
