@@ -4882,21 +4882,25 @@ def prepare_sparkinfer_fp4_moe_weights(
             )
         assert gate_suh is not None and up_suh is not None
         assert intermediate_rotations is not None and down_svh is not None
-        for name, tensor, shape in (
-            ("gate_suh", gate_suh, (plan.num_experts, plan.hidden_size)),
-            ("up_suh", up_suh, (plan.num_experts, plan.hidden_size)),
+        h_side_shapes = (
+            (plan.num_experts, plan.hidden_size),
+            (1, plan.hidden_size),
+        )
+        for name, tensor, shapes in (
+            ("gate_suh", gate_suh, h_side_shapes),
+            ("up_suh", up_suh, h_side_shapes),
             (
                 "intermediate_rotations",
                 intermediate_rotations,
-                (plan.num_experts, 3 * plan.intermediate_size),
+                ((plan.num_experts, 3 * plan.intermediate_size),),
             ),
-            ("down_svh", down_svh, (plan.num_experts, plan.hidden_size)),
+            ("down_svh", down_svh, h_side_shapes),
         ):
             if tensor.dtype != torch.float16:
                 raise TypeError(f"{name} must be torch.float16, got {tensor.dtype}")
-            if tuple(tensor.shape) != shape:
+            if tuple(tensor.shape) not in shapes:
                 raise ValueError(
-                    f"{name} must have shape {shape}, got {tuple(tensor.shape)}"
+                    f"{name} must have shape {shapes}, got {tuple(tensor.shape)}"
                 )
             if tensor.device != w1_fp4.device:
                 raise ValueError(
@@ -4904,6 +4908,10 @@ def prepare_sparkinfer_fp4_moe_weights(
                 )
             if not tensor.is_contiguous():
                 raise ValueError(f"{name} must be contiguous")
+        if (gate_suh.shape[0] == 1) != (up_suh.shape[0] == 1):
+            raise ValueError(
+                "gate_suh and up_suh must both be per-expert or both broadcast"
+            )
         from sparkinfer.moe._shared.kernels.w4a16.prepare import (
             prepare_trellis256_moe_weights,
         )
@@ -6303,41 +6311,54 @@ def _prewarm_w4a16_planned_launches(
             )
             max_m_blocks = (route_slots + block_size_m - 1) // block_size_m
             t_shape = time.perf_counter() if _SPARKINFER_TIMING else 0.0
-            fused_launches[
-                (weight_layout, scale_format, token_count, collect_activation_amax)
-            ] = compile_w4a16_fused_moe(
-                size_m=token_count,
-                hidden_size=workspace.k,
-                intermediate_size=workspace.n,
-                num_experts=workspace.weight_E,
-                top_k=workspace.num_topk,
-                activation=workspace.activation,
-                apply_router_weight_on_input=bool(apply_router_weight_on_input),
-                zero_fc2_output=False,
-                moe_block_size=block_size_m,
-                max_m_blocks=max_m_blocks,
-                element_dtype=element_dtype,
-                sms=sms,
-                max_shared_mem=max_shared_mem,
-                swiglu_limit=swiglu_limit,
-                swiglu_alpha=swiglu_alpha,
-                swiglu_beta=swiglu_beta,
-                weight_layout=weight_layout,
-                scale_format=scale_format,
-                w13_layout=w13_layout,
-                collect_activation_amax=collect_activation_amax,
-                trellis_bits=workspace.trellis_bits,
-                force_tile_config=workspace.trellis_tile_config,
-                intermediate_rotation=full_rotation,
-                full_rotation=full_rotation,
-                rotation_input_dtype=input_element_dtype,
+            fused_key = (
+                weight_layout,
+                scale_format,
+                token_count,
+                collect_activation_amax,
             )
+            # Rotation-table row count belongs to the prepared artifact, which
+            # is not bound until after the workspace is frozen. Resolve both
+            # full-rotation specializations now so either artifact contract is
+            # graph-safe and allocation-free at bind/run time.
+            broadcast_suh_options = (False, True) if full_rotation else (False,)
+            for broadcast_suh in broadcast_suh_options:
+                resolved_fused = compile_w4a16_fused_moe(
+                    size_m=token_count,
+                    hidden_size=workspace.k,
+                    intermediate_size=workspace.n,
+                    num_experts=workspace.weight_E,
+                    top_k=workspace.num_topk,
+                    activation=workspace.activation,
+                    apply_router_weight_on_input=bool(apply_router_weight_on_input),
+                    zero_fc2_output=False,
+                    moe_block_size=block_size_m,
+                    max_m_blocks=max_m_blocks,
+                    element_dtype=element_dtype,
+                    sms=sms,
+                    max_shared_mem=max_shared_mem,
+                    swiglu_limit=swiglu_limit,
+                    swiglu_alpha=swiglu_alpha,
+                    swiglu_beta=swiglu_beta,
+                    weight_layout=weight_layout,
+                    scale_format=scale_format,
+                    w13_layout=w13_layout,
+                    collect_activation_amax=collect_activation_amax,
+                    trellis_bits=workspace.trellis_bits,
+                    force_tile_config=workspace.trellis_tile_config,
+                    intermediate_rotation=full_rotation,
+                    full_rotation=full_rotation,
+                    rotation_input_dtype=input_element_dtype,
+                    broadcast_suh=broadcast_suh,
+                )
+                if not broadcast_suh:
+                    fused_launches[fused_key] = resolved_fused
             t_fused = time.perf_counter() if _SPARKINFER_TIMING else 0.0
             if full_rotation:
                 for ids_dtype in (torch.int32, torch.int64):
                     for mapped in (False, True):
-                        topk_sum_launches[(token_count, ids_dtype, mapped)] = (
-                            compile_w4a16_topk_sum(
+                        for broadcast_svh in (False, True):
+                            resolved_topk_sum = compile_w4a16_topk_sum(
                                 m=token_count,
                                 topk=workspace.num_topk,
                                 hidden_size=workspace.k,
@@ -6347,8 +6368,12 @@ def _prewarm_w4a16_planned_launches(
                                 route_num_experts=(workspace.route_E if mapped else 0),
                                 route_ids_dtype=ids_dtype,
                                 use_expert_map=mapped,
+                                broadcast_svh=broadcast_svh,
                             )
-                        )
+                            if not broadcast_svh:
+                                topk_sum_launches[
+                                    (token_count, ids_dtype, mapped)
+                                ] = resolved_topk_sum
             else:
                 topk_sum_launches[token_count] = compile_w4a16_topk_sum(
                     m=token_count,

@@ -257,11 +257,11 @@ def test_planned_route_block_overrides_live_batch_heuristic() -> None:
         )
 
 
-def _cpu_weight_tensors() -> tuple[torch.Tensor, ...]:
-    w13 = torch.zeros((2, 1, 8, 8, 48), dtype=torch.int16)
-    w2 = torch.zeros((1, 8, 8, 48), dtype=torch.int16)
+def _cpu_weight_tensors(num_experts: int = 1) -> tuple[torch.Tensor, ...]:
+    w13 = torch.zeros((2, num_experts, 8, 8, 48), dtype=torch.int16)
+    w2 = torch.zeros((num_experts, 8, 8, 48), dtype=torch.int16)
     edge = torch.ones((1, 128), dtype=torch.float16)
-    intermediate = torch.ones((1, 384), dtype=torch.float16)
+    intermediate = torch.ones((num_experts, 384), dtype=torch.float16)
     return w13, w2, edge, edge.clone(), intermediate, edge.clone()
 
 
@@ -311,6 +311,18 @@ def test_prepare_weights_validates_all_rotation_shapes() -> None:
             gate_suh=gate_suh,
             up_suh=up_suh,
             intermediate_rotations=intermediate[:, :-1].contiguous(),
+            down_svh=down_svh,
+            tile_config=(64, 128, 64, 128),
+        )
+
+    w13, w2, gate_suh, _, intermediate, down_svh = _cpu_weight_tensors(2)
+    with pytest.raises(ValueError, match="must both be per-expert or both broadcast"):
+        _prepare_weights(
+            w13,
+            w2,
+            gate_suh=gate_suh,
+            up_suh=gate_suh.expand(2, -1).contiguous(),
+            intermediate_rotations=intermediate,
             down_svh=down_svh,
             tile_config=(64, 128, 64, 128),
         )
@@ -442,17 +454,18 @@ def _reference_full_rotation(
     for token in range(int(x.shape[0])):
         for slot in range(int(local_ids.shape[1])):
             expert = int(local_ids[token, slot])
+            h_side_expert = 0 if int(gate_suh.shape[0]) == 1 else expert
             source = x[token : token + 1].to(torch.float16)
             gate_a = _had128(
                 source,
                 hadamard,
-                suh=gate_suh[expert],
+                suh=gate_suh[h_side_expert],
                 store_fp16=True,
             )
             up_a = _had128(
                 source,
                 hadamard,
-                suh=up_suh[expert],
+                suh=up_suh[h_side_expert],
                 store_fp16=True,
             )
             gate = (gate_a.float() @ gate_weights[expert].float()).to(torch.float16)
@@ -491,7 +504,7 @@ def _reference_full_rotation(
             route = _had128(
                 down,
                 hadamard,
-                svh=down_svh[expert],
+                svh=down_svh[0 if int(down_svh.shape[0]) == 1 else expert],
                 store_fp16=False,
             )
             output[token] += router_weights[token, slot] * route[0]
@@ -591,10 +604,10 @@ def test_planned_full_rotation_matches_reference_and_captures(
     def scales(shape: tuple[int, ...]) -> torch.Tensor:
         return (0.875 + 0.25 * torch.rand(shape, device=device)).to(torch.float16)
 
-    gate_suh = scales((experts, hidden)).contiguous()
-    up_suh = scales((experts, hidden)).contiguous()
+    gate_suh = scales((1, hidden)).contiguous()
+    up_suh = scales((1, hidden)).contiguous()
     intermediate_rotations = scales((experts, 3 * intermediate)).contiguous()
-    down_svh = scales((experts, hidden)).contiguous()
+    down_svh = scales((1, hidden)).contiguous()
     weights = _prepare_weights(
         w13,
         w2,

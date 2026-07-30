@@ -4602,6 +4602,7 @@ class W4A16FusedMoeKernel:
         intermediate_rotation: bool = False,
         full_rotation: bool = False,
         rotation_input_dtype: str = "fp16",
+        broadcast_suh: bool = False,
     ):
         activation = normalize_moe_activation(activation)
         is_gated = validate_activation(activation)
@@ -4684,6 +4685,9 @@ class W4A16FusedMoeKernel:
                     "intermediate_rotation requires intermediate_size % 128 == 0"
                 )
         self.full_rotation = bool(full_rotation)
+        # suh tables hold one shared row (kquant shared-su artifacts): index
+        # them with a zero expert stride.
+        self.broadcast_suh = bool(broadcast_suh)
         self.rotation_input_dtype = str(rotation_input_dtype)
         self.rotation_input_is_fp16 = self.rotation_input_dtype == "fp16"
         if self.full_rotation:
@@ -4801,6 +4805,7 @@ class W4A16FusedMoeKernel:
             self.intermediate_rotation,
             self.dual_a,
             self.full_rotation,
+            self.broadcast_suh,
             self.rotation_input_dtype,
             self.fc1.__cache_key__,
             self.fc2.__cache_key__,
@@ -5263,7 +5268,10 @@ class W4A16FusedMoeKernel:
                 token = route // Int32(self.top_k)
                 col0 = blk * Int32(128) + elem
                 x_base = token * Int32(self.hidden_size) + col0
-                s_base = expert * Int32(self.hidden_size) + col0
+                if cutlass.const_expr(self.broadcast_suh):
+                    s_base = col0
+                else:
+                    s_base = expert * Int32(self.hidden_size) + col0
                 out_base = route * Int32(self.hidden_size) + col0
 
                 x0 = cutlass.Float16(
@@ -6379,6 +6387,7 @@ class W4A16TopKSumKernel:
         num_experts: int = 0,
         route_num_experts: int = 0,
         use_expert_map: bool = False,
+        broadcast_svh: bool = False,
     ):
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
@@ -6392,6 +6401,9 @@ class W4A16TopKSumKernel:
         self.num_experts = int(num_experts)
         self.route_num_experts = int(route_num_experts)
         self.use_expert_map = bool(use_expert_map)
+        # svh_table holds a single row shared by every expert (kquant
+        # shared-su artifacts); index it with a zero expert stride.
+        self.broadcast_svh = bool(broadcast_svh)
         if self.full_rotation:
             if self.element_dtype != "fp16":
                 raise ValueError("full-rotation top-k sum requires fp16 route values")
@@ -6515,8 +6527,13 @@ class W4A16TopKSumKernel:
                         v1 = fc2_flat[base + Int32(1)].to(cutlass.Float32)
                         v2 = fc2_flat[base + Int32(2)].to(cutlass.Float32)
                         v3 = fc2_flat[base + Int32(3)].to(cutlass.Float32)
-                        h0, h1, h2, h3 = self._had128_quad(v0, v1, v2, v3, lane)
-                        sbase = expert * Int32(self.hidden_size) + col0
+                        h0, h1, h2, h3 = self._had128_quad(
+                            v0, v1, v2, v3, lane
+                        )
+                        if cutlass.const_expr(self.broadcast_svh):
+                            sbase = col0
+                        else:
+                            sbase = expert * Int32(self.hidden_size) + col0
                         s0 = svh_flat[sbase + Int32(0)].to(cutlass.Float32)
                         s1 = svh_flat[sbase + Int32(1)].to(cutlass.Float32)
                         s2 = svh_flat[sbase + Int32(2)].to(cutlass.Float32)
@@ -7036,6 +7053,7 @@ def compile_w4a16_fused_moe(
     intermediate_rotation: bool = False,
     full_rotation: bool = False,
     rotation_input_dtype: str | None = None,
+    broadcast_suh: bool = False,
 ) -> W4A16FusedMoeCompileResult:
     scale_format = _normalize_scale_format(scale_format)
     intermediate_rotation = bool(intermediate_rotation)
@@ -7400,6 +7418,7 @@ def compile_w4a16_fused_moe(
         intermediate_rotation=intermediate_rotation,
         full_rotation=full_rotation,
         rotation_input_dtype=rotation_input_dtype,
+        broadcast_suh=broadcast_suh,
     )
     cache_key = (
         "w4a16_fused_moe",
@@ -8160,6 +8179,7 @@ def compile_w4a16_topk_sum(
     route_num_experts: int = 0,
     route_ids_dtype: torch.dtype = torch.int32,
     use_expert_map: bool = False,
+    broadcast_svh: bool = False,
 ) -> W4A16TopKSumCompileResult:
     cutlass_dtype = _cutlass_element_dtype(element_dtype)
     if route_ids_dtype not in (torch.int32, torch.int64):
@@ -8177,6 +8197,7 @@ def compile_w4a16_topk_sum(
         int(route_num_experts),
         str(route_ids_dtype),
         bool(use_expert_map),
+        bool(broadcast_svh),
     )
     cached = _SUM_CACHE.get(cache_key)
     if cached is not None:
@@ -8207,6 +8228,7 @@ def compile_w4a16_topk_sum(
         num_experts=num_experts,
         route_num_experts=route_num_experts,
         use_expert_map=use_expert_map,
+        broadcast_svh=broadcast_svh,
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=kernel, cache_key=cache_key
@@ -8515,6 +8537,7 @@ def _w4a16_fused_moe_launch_flat(
         raise ValueError("full_rotation launch requires the raw rotation input")
     if rotation_input is None:
         rotation_input = a_input
+    broadcast_suh = False
     if full_rotation:
         if suh_gate_table is None or suh_up_table is None:
             raise ValueError(
@@ -8522,6 +8545,13 @@ def _w4a16_fused_moe_launch_flat(
             )
         suh_gate_arg = suh_gate_table.reshape(-1)
         suh_up_arg = suh_up_table.reshape(-1)
+        broadcast_suh = (
+            num_experts > 1 and suh_gate_arg.numel() == hidden_size
+        )
+        if broadcast_suh != (suh_up_arg.numel() == hidden_size):
+            raise ValueError(
+                "suh gate/up tables must both be per-expert or both broadcast"
+            )
         rotation_input_dtype = _normalize_element_dtype(rotation_input.dtype)
     else:
         suh_gate_arg = _rot_scales_dummy(w13_global_scale.device)
@@ -8559,6 +8589,7 @@ def _w4a16_fused_moe_launch_flat(
         intermediate_rotation=intermediate_rotation,
         full_rotation=full_rotation,
         rotation_input_dtype=rotation_input_dtype,
+        broadcast_suh=broadcast_suh,
     )
     fused.compiled(
         make_ptr(
@@ -9022,6 +9053,12 @@ def _w4a16_topk_sum_launch_flat(
         torch.int32 if route_expert_ids is None else route_expert_ids.dtype
     )
     route_num_experts = 0 if expert_map is None else int(expert_map.numel())
+    broadcast_svh = (
+        full_rotation
+        and svh_table is not None
+        and num_experts > 1
+        and svh_table.numel() == hidden_size
+    )
     sum_kernel = compile_w4a16_topk_sum(
         m=m,
         topk=topk,
@@ -9032,6 +9069,7 @@ def _w4a16_topk_sum_launch_flat(
         route_num_experts=route_num_experts,
         route_ids_dtype=route_ids_dtype,
         use_expert_map=expert_map is not None,
+        broadcast_svh=broadcast_svh,
     )
     dummy_addr = output.data_ptr()
     weights_addr = dummy_addr if topk_weights is None else topk_weights.data_ptr()
@@ -9878,14 +9916,28 @@ def run_w4a16_moe(
             )
         num_local_experts = int(prepared.num_experts)
         intermediate_size_full = int(prepared.intermediate_size)
-        for name, table, shape in (
-            ("suh_gate_table", suh_gate_table, (num_local_experts, hidden_size)),
-            ("suh_up_table", suh_up_table, (num_local_experts, hidden_size)),
-            ("svh_table", svh_table, (num_local_experts, hidden_size)),
+        # H-side tables may hold a single broadcast row (kquant shared-su
+        # artifacts); the kernels index them with a zero expert stride.
+        for name, table, shapes in (
+            (
+                "suh_gate_table",
+                suh_gate_table,
+                ((num_local_experts, hidden_size), (1, hidden_size)),
+            ),
+            (
+                "suh_up_table",
+                suh_up_table,
+                ((num_local_experts, hidden_size), (1, hidden_size)),
+            ),
+            (
+                "svh_table",
+                svh_table,
+                ((num_local_experts, hidden_size), (1, hidden_size)),
+            ),
             (
                 "intermediate_rotation_scales",
                 intermediate_rotation_scales,
-                (num_local_experts, 3 * intermediate_size_full),
+                ((num_local_experts, 3 * intermediate_size_full),),
             ),
         ):
             if table is None:
@@ -9893,11 +9945,11 @@ def run_w4a16_moe(
             if (
                 table.dtype != torch.float16
                 or table.device != a_input.device
-                or tuple(table.shape) != shape
+                or tuple(table.shape) not in shapes
                 or not table.is_contiguous()
             ):
                 raise ValueError(
-                    f"{name} must be contiguous fp16 {shape} on {a_input.device}; "
+                    f"{name} must be contiguous fp16 {shapes} on {a_input.device}; "
                     f"got {tuple(table.shape)}/{table.dtype}/{table.device}/"
                     f"contiguous={table.is_contiguous()}"
                 )

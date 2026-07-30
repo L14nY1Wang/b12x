@@ -1849,13 +1849,25 @@ def prepare_trellis256_moe_weights(
                 raise TypeError(
                     f"trellis3_t256 {name} must be torch.float16, got {scale.dtype}"
                 )
-            if tuple(scale.shape) != (num_experts, hidden_size):
+            # (1, hidden_size) is a broadcast row shared by all experts
+            # (kquant shared-su artifacts); kernels index it with expert
+            # stride 0.
+            if tuple(scale.shape) not in (
+                (num_experts, hidden_size),
+                (1, hidden_size),
+            ):
                 raise ValueError(
                     f"trellis3_t256 {name} must have shape "
-                    f"{(num_experts, hidden_size)}, got {tuple(scale.shape)}"
+                    f"{(num_experts, hidden_size)} or {(1, hidden_size)}, "
+                    f"got {tuple(scale.shape)}"
                 )
             if not scale.is_contiguous():
                 raise ValueError(f"trellis3_t256 {name} must be contiguous")
+        if (gate_suh.shape[0] == 1) != (up_suh.shape[0] == 1):
+            raise ValueError(
+                "trellis3_t256 gate_suh and up_suh must both be per-expert "
+                "or both broadcast"
+            )
 
     have_full_rotation = any(
         value is not None
@@ -1871,13 +1883,17 @@ def prepare_trellis256_moe_weights(
         )
     if have_full_rotation:
         assert intermediate_rotations is not None and down_svh is not None
-        for name, scale, shape in (
+        for name, scale, shapes in (
             (
                 "intermediate_rotations",
                 intermediate_rotations,
-                (num_experts, 3 * intermediate_size),
+                ((num_experts, 3 * intermediate_size),),
             ),
-            ("down_svh", down_svh, (num_experts, hidden_size)),
+            (
+                "down_svh",
+                down_svh,
+                ((num_experts, hidden_size), (1, hidden_size)),
+            ),
         ):
             if scale.device != resolved_device:
                 raise ValueError(
@@ -1887,9 +1903,10 @@ def prepare_trellis256_moe_weights(
                 raise TypeError(
                     f"trellis3_t256 {name} must be torch.float16, got {scale.dtype}"
                 )
-            if tuple(scale.shape) != shape:
+            if tuple(scale.shape) not in shapes:
                 raise ValueError(
-                    f"trellis3_t256 {name} must have shape {shape}, got {tuple(scale.shape)}"
+                    f"trellis3_t256 {name} must have shape {shapes}, "
+                    f"got {tuple(scale.shape)}"
                 )
             if not scale.is_contiguous():
                 raise ValueError(f"trellis3_t256 {name} must be contiguous")
