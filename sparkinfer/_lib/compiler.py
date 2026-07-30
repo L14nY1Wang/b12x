@@ -657,6 +657,16 @@ def _cute_compile_disk_cache_enabled() -> bool:
     return raw.lower() not in {"0", "false", "no", ""}
 
 
+def _cute_compile_disk_cache_enabled_for_payload(
+    cache_payload: tuple[object, ...],
+) -> bool:
+    return (
+        _cute_compile_disk_cache_enabled()
+        and len(cache_payload) > 4
+        and cache_payload[4] is not None
+    )
+
+
 def _cute_compile_cache_dir() -> Path:
     root = os.environ.get("SPARKINFER_COMPILE_CACHE_DIR")
     if root:
@@ -1072,12 +1082,16 @@ def _compile_cache_payload_log_value(
 ) -> dict[str, Any]:
     if payload is None:
         return {}
-    if len(payload) == 10 and payload[0] == "sparkinfer_cute_compile_cache_v5_explicit_spec":
+    if (
+        len(payload) == 11
+        and payload[0] == "sparkinfer_cute_compile_cache_v6_explicit_spec"
+    ):
         (
             _version,
             target_key,
             _sparkinfer_fingerprint,
             toolchain_key,
+            _device_uuid,
             spec_hash,
             spec_json,
             kwargs_hash,
@@ -1146,13 +1160,14 @@ def _compile_cache_payload_log_value(
                 summary["toolchain"] = toolchain_summary
         return summary
 
-    if len(payload) != 8:
+    if len(payload) != 9:
         return {}
     (
         _version,
         target_key,
         _sparkinfer_fingerprint,
         toolchain_key,
+        _device_uuid,
         args_key,
         kwargs_key,
         options_key,
@@ -1183,8 +1198,8 @@ def _compile_cache_payload_log_value(
 def _is_explicit_spec_payload(payload: tuple[object, ...] | None) -> bool:
     return (
         payload is not None
-        and len(payload) == 10
-        and payload[0] == "sparkinfer_cute_compile_cache_v5_explicit_spec"
+        and len(payload) == 11
+        and payload[0] == "sparkinfer_cute_compile_cache_v6_explicit_spec"
     )
 
 
@@ -1443,6 +1458,58 @@ def _distribution_version(name: str) -> str:
         return ""
 
 
+_DEVICE_UUID_KEYS: dict[int, tuple[str, str]] = {}
+_DEVICE_COMPILE_CACHE_CONTEXTS: dict[tuple[Any, int], tuple[object, ...]] = {}
+
+
+def _current_device_ordinal() -> int | None:
+    """Ordinal of the device this process is currently compiling for."""
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        return int(torch.cuda.current_device())
+    except Exception:  # noqa: BLE001 - cache identity probing must fail closed
+        return None
+
+
+def _device_uuid_key(device_ordinal: int | None = None) -> tuple[str, str] | None:
+    """Return the physical CUDA device UUID, memoized by visible ordinal.
+
+    Ordinals and distributed ranks are process-local and can be remapped by
+    ``CUDA_VISIBLE_DEVICES``. The UUID is the persistent identity used by the
+    disk payload (and therefore by non-explicit memory keys). Explicit-spec
+    memory hits stay on their existing spec-only hot path. Probe failures return
+    ``None`` and are deliberately not memoized so callers can disable disk
+    reuse and retry on the next compile.
+    """
+    index = None if device_ordinal is None else int(device_ordinal)
+    if index is not None:
+        cached = _DEVICE_UUID_KEYS.get(index)
+        if cached is not None:
+            return cached
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        if index is None:
+            index = int(torch.cuda.current_device())
+        cached = _DEVICE_UUID_KEYS.get(index)
+        if cached is not None:
+            return cached
+        raw_uuid = getattr(torch.cuda.get_device_properties(index), "uuid", None)
+        device_uuid = "" if raw_uuid is None else str(raw_uuid).strip()
+        if not device_uuid:
+            return None
+    except Exception:  # noqa: BLE001 - cache identity probing must fail closed
+        return None
+    key = ("device_uuid", device_uuid)
+    _DEVICE_UUID_KEYS[index] = key
+    return key
+
+
 @lru_cache(maxsize=1)
 def _runtime_toolchain_key() -> tuple[object, ...]:
     from .runtime_patches import cutlass_runtime_patch_status
@@ -1541,6 +1608,36 @@ def _static_compile_cache_context(compile_callable: Any) -> tuple[object, ...]:
         _compile_options_cache_key(compile_callable),
         _compile_environment_key(),
     )
+
+
+def _device_compile_cache_context(compile_callable: Any) -> tuple[object, ...]:
+    """Return the full static context, caching only successful UUID probes."""
+    device_ordinal = _current_device_ordinal()
+    context_key = (
+        None if device_ordinal is None else (compile_callable, int(device_ordinal))
+    )
+    if context_key is not None:
+        cached = _DEVICE_COMPILE_CACHE_CONTEXTS.get(context_key)
+        if cached is not None:
+            return cached
+
+    (
+        package_fingerprint,
+        runtime_toolchain,
+        compile_options,
+        compile_environment,
+    ) = _static_compile_cache_context(compile_callable)
+    device_uuid = _device_uuid_key(device_ordinal)
+    context = (
+        package_fingerprint,
+        runtime_toolchain,
+        device_uuid,
+        compile_options,
+        compile_environment,
+    )
+    if context_key is not None and device_uuid is not None:
+        _DEVICE_COMPILE_CACHE_CONTEXTS[context_key] = context
+    return context
 
 
 def _function_fingerprint(func: Any) -> tuple[str, str, str]:
@@ -1849,16 +1946,18 @@ def _compile_disk_cache_payload(
     (
         package_fingerprint,
         runtime_toolchain,
+        device_uuid,
         compile_options,
         compile_environment,
-    ) = _static_compile_cache_context(compile_callable)
+    ) = _device_compile_cache_context(compile_callable)
     if compile_spec is not None:
         kwargs_json_key, kwargs_hash_key = _compile_kwargs_json_key(kwargs)
         return (
-            "sparkinfer_cute_compile_cache_v5_explicit_spec",
+            "sparkinfer_cute_compile_cache_v6_explicit_spec",
             _explicit_spec_compile_target(func),
             package_fingerprint,
             runtime_toolchain,
+            device_uuid,
             compile_spec.hash_key,
             compile_spec.json_key,
             kwargs_hash_key,
@@ -1867,10 +1966,11 @@ def _compile_disk_cache_payload(
             compile_environment,
         )
     return (
-        "sparkinfer_cute_compile_cache_v2",
+        "sparkinfer_cute_compile_cache_v3",
         _normalize_compile_target(func, set()),
         package_fingerprint,
         runtime_toolchain,
+        device_uuid,
         _structural_cache_key(args),
         _structural_cache_key(kwargs),
         compile_options,
@@ -2007,26 +2107,30 @@ def _semantic_compile_manifest_payload(
     semantic: dict[str, Any] = {
         "cache_format": cache_format,
         "target": _semantic_target_key(cache_payload[1]),
+        # device_uuid is cache_payload index 4 in both the v6_explicit_spec and
+        # v3 formats. The persistent identity intentionally isolates artifacts
+        # by physical GPU rather than by process-local ordinal or rank.
+        "device_uuid": _manifest_json_value(cache_payload[4]),
     }
-    if cache_format == "sparkinfer_cute_compile_cache_v5_explicit_spec":
-        semantic["compile_spec_hash"] = cache_payload[4]
+    if cache_format == "sparkinfer_cute_compile_cache_v6_explicit_spec":
+        semantic["compile_spec_hash"] = cache_payload[5]
         try:
-            semantic["compile_spec"] = json.loads(str(cache_payload[5]))
+            semantic["compile_spec"] = json.loads(str(cache_payload[6]))
         except (TypeError, ValueError, json.JSONDecodeError):
-            semantic["compile_spec"] = str(cache_payload[5])
-        if cache_payload[6]:
-            semantic["compile_kwargs_hash"] = cache_payload[6]
+            semantic["compile_spec"] = str(cache_payload[6])
+        if cache_payload[7]:
+            semantic["compile_kwargs_hash"] = cache_payload[7]
             try:
-                semantic["compile_kwargs"] = json.loads(str(cache_payload[7]))
+                semantic["compile_kwargs"] = json.loads(str(cache_payload[8]))
             except (TypeError, ValueError, json.JSONDecodeError):
-                semantic["compile_kwargs"] = str(cache_payload[7])
-        semantic["compile_options"] = _manifest_json_value(cache_payload[8])
-        semantic["compile_environment"] = _manifest_json_value(cache_payload[9])
+                semantic["compile_kwargs"] = str(cache_payload[8])
+        semantic["compile_options"] = _manifest_json_value(cache_payload[9])
+        semantic["compile_environment"] = _manifest_json_value(cache_payload[10])
     else:
-        semantic["args"] = _semantic_structural_key(cache_payload[4])
-        semantic["kwargs"] = _semantic_structural_key(cache_payload[5])
-        semantic["compile_options"] = _manifest_json_value(cache_payload[6])
-        semantic["compile_environment"] = _manifest_json_value(cache_payload[7])
+        semantic["args"] = _semantic_structural_key(cache_payload[5])
+        semantic["kwargs"] = _semantic_structural_key(cache_payload[6])
+        semantic["compile_options"] = _manifest_json_value(cache_payload[7])
+        semantic["compile_environment"] = _manifest_json_value(cache_payload[8])
     return semantic
 
 
@@ -2260,9 +2364,9 @@ def _build_compile_manifest(
         allow_nan=False,
     )
     cache_format = str(cache_payload[0]) if cache_payload else "unknown"
-    explicit = cache_format == "sparkinfer_cute_compile_cache_v5_explicit_spec"
-    options_index = 8 if explicit else 6
-    environment_index = 9 if explicit else 7
+    explicit = cache_format == "sparkinfer_cute_compile_cache_v6_explicit_spec"
+    options_index = 9 if explicit else 7
+    environment_index = 10 if explicit else 8
     launch_metadata = (
         _extract_launch_dynamic_smem_bytes(compiled)
         if compiled is not None
@@ -2308,12 +2412,12 @@ def _build_compile_manifest(
         ).hexdigest(),
     }
     if explicit:
-        manifest["compile_spec_hash"] = str(cache_payload[4])
-        manifest["compile_spec_json"] = str(cache_payload[5])
-        manifest["compile_kwargs_hash"] = str(cache_payload[6])
-        manifest["compile_kwargs_json"] = str(cache_payload[7])
+        manifest["compile_spec_hash"] = str(cache_payload[5])
+        manifest["compile_spec_json"] = str(cache_payload[6])
+        manifest["compile_kwargs_hash"] = str(cache_payload[7])
+        manifest["compile_kwargs_json"] = str(cache_payload[8])
         try:
-            spec = json.loads(str(cache_payload[5]))
+            spec = json.loads(str(cache_payload[6]))
         except (TypeError, ValueError, json.JSONDecodeError):
             spec = None
         if isinstance(spec, dict):
@@ -2402,7 +2506,9 @@ def _load_cute_compile_from_disk(cache_key: str):
         # CUTLASS may finalize or patch the ELF while loading it.  The cache
         # object is content-addressed and its digest is recorded in the compile
         # manifest, so never expose that canonical object to the loader.
-        with tempfile.TemporaryDirectory(prefix="sparkinfer-cute-cache-load-") as raw_stage:
+        with tempfile.TemporaryDirectory(
+            prefix="sparkinfer-cute-cache-load-"
+        ) as raw_stage:
             staged_object = Path(raw_stage) / object_path.name
             shutil.copy2(object_path, staged_object)
             module = ExternalBinaryModule(str(staged_object))
@@ -2470,6 +2576,8 @@ def clear_compile_cache() -> None:
     global _COMPILE_PROGRESS_TOTAL_SECONDS
     _compile_environment_key.cache_clear()
     _static_compile_cache_context.cache_clear()
+    _DEVICE_UUID_KEYS.clear()
+    _DEVICE_COMPILE_CACHE_CONTEXTS.clear()
     with _MEMORY_CACHE_LOCK:
         _MEMORY_CACHE.clear()
         _MEMORY_CACHE_HITS = 0
@@ -2546,8 +2654,9 @@ def compile(
         compile_callable, func, args, kwargs, compile_spec
     )
     cache_key = hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
+    disk_cache_enabled = _cute_compile_disk_cache_enabled_for_payload(payload)
 
-    if _cute_compile_disk_cache_enabled():
+    if disk_cache_enabled:
         compiled = _load_cute_compile_from_disk(cache_key)
         if compiled is not None:
             with suppress(Exception):
@@ -2641,7 +2750,11 @@ def compile(
             _memory_cache_put(memory_cache_key, compiled)
             return compiled
     else:
-        cache_status = "disk-cache-disabled"
+        cache_status = (
+            "disk-cache-device-uuid-unavailable"
+            if _cute_compile_disk_cache_enabled()
+            else "disk-cache-disabled"
+        )
 
     if _cute_compile_log_enabled() or post_engine_start_log:
         with suppress(Exception):
@@ -2675,7 +2788,7 @@ def compile(
         compile_spec=compile_spec,
         cache_key=cache_key,
     )
-    if _cute_compile_disk_cache_enabled():
+    if disk_cache_enabled:
         with suppress(Exception):
             _store_cute_compile_to_disk(
                 cache_key,
