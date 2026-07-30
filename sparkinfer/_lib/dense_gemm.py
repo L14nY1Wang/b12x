@@ -83,6 +83,7 @@ from sparkinfer._lib.intrinsics import (
     ld_global_b16,
     ld_global_v4_u32,
     ld_shared_v4_u32,
+    mma_m16n8k32_f32_e4m3,
     pow2_ceil_ue8m0,
     quantize_block_fp8_mx,
     scatter_add_bf16,
@@ -261,6 +262,40 @@ def _reshape_acc_to_mn(acc: cute.Tensor, transpose: bool = False) -> cute.Tensor
     return cute.make_tensor(
         acc.iterator, _convert_layout_acc_mn(acc.layout, transpose=transpose)
     )
+
+
+@cute.jit
+def _emit_plain_fp8_dense_mma_k_block(
+    accumulators: cute.Tensor,
+    tCrA: cute.Tensor,
+    tCrB: cute.Tensor,
+    mt: int,
+    nt: int,
+    k_block_idx: int,
+) -> None:
+    acc = accumulators[None, mt, nt]
+    a_frag = cute.flatten(
+        cute.recast_tensor(tCrA[None, mt, k_block_idx], cutlass.Uint32)
+    )
+    b_frag = cute.flatten(
+        cute.recast_tensor(tCrB[None, nt, k_block_idx], cutlass.Uint32)
+    )
+    d0, d1, d2, d3 = mma_m16n8k32_f32_e4m3(
+        acc[0],
+        acc[1],
+        acc[2],
+        acc[3],
+        a_frag[0],
+        a_frag[1],
+        a_frag[2],
+        a_frag[3],
+        b_frag[0],
+        b_frag[1],
+    )
+    acc[0] = d0
+    acc[1] = d1
+    acc[2] = d2
+    acc[3] = d3
 
 
 @dataclass(frozen=True)
@@ -593,6 +628,7 @@ class DenseGemmKernel:
         mxfp6_fmt_a: Optional[str] = None,
         mxfp6_fmt_b: Optional[str] = None,
         b_packed: bool = False,
+        plain_fp8: bool = False,
     ):
         # When set, A/B operands are MX codes carried in Float8E4M3FN
         # byte-containers: the whole kernel runs the MXFP8 smem/TMA/ldmatrix
@@ -607,6 +643,12 @@ class DenseGemmKernel:
             raise ValueError("mxfp6_fmt_a and mxfp6_fmt_b must both be set or both None")
         self.mxfp6_fmt_a = mxfp6_fmt_a
         self.mxfp6_fmt_b = mxfp6_fmt_b
+        self.plain_fp8 = bool(plain_fp8)
+        if self.plain_fp8:
+            assert mxfp6_fmt_a is None
+            assert not b_packed
+            assert not fused_quant_a
+            assert not quantize_c
         if mxfp6_fmt_a is not None:
             # Upstream mainloop variants not wired for the FP6 byte-container
             # path; fail loudly instead of silently miscomputing.
@@ -2098,7 +2140,16 @@ class DenseGemmKernel:
                         # Manual atom unroll: avoids hasAuxTensor address space bug
                         for _mt in range(self.num_m_tiles):
                             for _nt in range(self.num_n_tiles):
-                                if cutlass.const_expr(self.mxfp6_fmt_a is not None):
+                                if cutlass.const_expr(self.plain_fp8):
+                                    _emit_plain_fp8_dense_mma_k_block(
+                                        accumulators,
+                                        tCrA,
+                                        tCrB,
+                                        _mt,
+                                        _nt,
+                                        k_block_idx,
+                                    )
+                                elif cutlass.const_expr(self.mxfp6_fmt_a is not None):
                                     emit_mxfp6_dense_mma_k_block(
                                         accumulators,
                                         tCrA,
@@ -2217,7 +2268,16 @@ class DenseGemmKernel:
                     # Manual atom unroll: avoids hasAuxTensor address space bug
                     for _mt in range(self.num_m_tiles):
                         for _nt in range(self.num_n_tiles):
-                            if cutlass.const_expr(self.mxfp6_fmt_a is not None):
+                            if cutlass.const_expr(self.plain_fp8):
+                                _emit_plain_fp8_dense_mma_k_block(
+                                    accumulators,
+                                    tCrA,
+                                    tCrB,
+                                    _mt,
+                                    _nt,
+                                    k_block_idx,
+                                )
+                            elif cutlass.const_expr(self.mxfp6_fmt_a is not None):
                                 emit_mxfp6_dense_mma_k_block(
                                     accumulators,
                                     tCrA,
@@ -4172,6 +4232,7 @@ class _DenseGemmLaunch:
         direct_sfa_live16: bool = False,
         direct_m1_wo_a_inputs: bool = False,
         target_occupancy: int = 1,
+        plain_fp8: bool = False,
     ):
         self._n = n
         self._k = k
@@ -4205,6 +4266,7 @@ class _DenseGemmLaunch:
         self._direct_sfa_live16 = direct_sfa_live16
         self._direct_m1_wo_a_inputs = direct_m1_wo_a_inputs
         self._target_occupancy = target_occupancy
+        self._plain_fp8 = bool(plain_fp8)
         if b_tile_major:
             if (n, k, l) == (1024, 4096, 4):
                 self._b_tile_n = 64
@@ -4290,6 +4352,7 @@ class _DenseGemmLaunch:
             self._direct_sfa_live16,
             self._direct_m1_wo_a_inputs,
             self._target_occupancy,
+            self._plain_fp8,
         )
 
     @cute.jit
@@ -4399,6 +4462,7 @@ class _DenseGemmLaunch:
             direct_sfa_live16=self._direct_sfa_live16,
             direct_m1_wo_a_inputs=self._direct_m1_wo_a_inputs,
             target_occupancy=self._target_occupancy,
+            plain_fp8=self._plain_fp8,
         )(
             a_tensor,
             a_tensor,
@@ -5551,6 +5615,7 @@ def _get_compiled_dense_gemm(
     alpha_is_one: bool = False,
     direct_sfa_live16: bool = False,
     direct_m1_wo_a_inputs: bool = False,
+    plain_fp8: bool = False,
 ) -> Callable:
     def _make_runtime_pointers(
         input_tensors: Optional[List[torch.Tensor]],
@@ -5660,6 +5725,7 @@ def _get_compiled_dense_gemm(
         alpha_is_one=alpha_is_one,
         direct_sfa_live16=direct_sfa_live16,
         direct_m1_wo_a_inputs=direct_m1_wo_a_inputs,
+        plain_fp8=plain_fp8,
         target_occupancy=_dense_gemm_target_occupancy(
             n=n,
             k=k,
@@ -5686,7 +5752,7 @@ def _get_compiled_dense_gemm(
         *_make_runtime_pointers(None),
         1,
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("gemm.dense", 3, compile_key),
+        compile_spec=KernelCompileSpec.from_key("gemm.dense", 4, compile_key),
     )
 
     def tensor_api(
@@ -6619,6 +6685,7 @@ def dense_gemm(
     b_fmt: Optional[str] = None,
     x_bf16: Optional[torch.Tensor] = None,
     w_gscale: Optional[torch.Tensor] = None,
+    plain_fp8: bool = False,
 ) -> torch.Tensor:
     """Execute dense block-scaled GEMM for one expert-major batch stack.
 
@@ -6653,6 +6720,10 @@ def dense_gemm(
 
     ``x_bf16`` / ``w_gscale``: fused BF16 activation-quant inputs, only used
     when SPARKINFER_DENSE_FUSED_QUANT is enabled on an m=1 MX-FP6 launch.
+
+    ``plain_fp8``: emit non-block-scaled E4M3 warp MMA while reusing the
+    SM12x dense pipeline. The scalar ``alpha`` carries the combined activation
+    and weight dequantization scale.
     """
     a_torch, sfa_torch = lhs
     b_torch, sfb_torch = rhs
@@ -6699,6 +6770,14 @@ def dense_gemm(
                 raise ValueError(f"unsupported {name}={fmt!r}")
     else:
         raise TypeError(f"dense_gemm unsupported ab_dtype: {ab_dtype}")
+    if plain_fp8 and not is_mxfp8:
+        raise ValueError("plain_fp8 requires ab_dtype='float8_e4m3fn'")
+    if plain_fp8 and (
+        rhs_values_tiled is not None or _quantized_c is not None or sfb_k_replicated
+    ):
+        raise ValueError(
+            "plain_fp8 does not support tiled/quantized output or replicated scales"
+        )
     if b_packed:
         if mxfp6_fmt_b is None:
             raise ValueError("b_packed requires an MX-FP6 ab_dtype")
@@ -6999,7 +7078,7 @@ def dense_gemm(
             quant_c_scale_rows_gpu=quant_c_scale_rows,
             quant_c_scale_mma_gpu=quant_c_scale_mma,
         )
-    if out is None:
+    if out is None and not plain_fp8:
         # No caller-owned output buffer: functional launch (allocate + return
         # inside the opaque op). The compile graph then carries no
         # auto_functionalized dense node mutating a (possibly strided) caller
@@ -7079,41 +7158,79 @@ def dense_gemm(
         out if split_k_atomic_bf16 else split_scratch if split_k_output else out
     )
     assert c_tensor_gpu is not None
-    torch.ops.sparkinfer.dense_gemm_launch(
-        a_torch,
-        b_launch_torch,
-        sfa_torch,
-        sfb_torch,
-        c_tensor_gpu,
-        alpha,
-        n,
-        k,
-        l,
-        kernel_c_l,
-        ab_dtype,
-        sf_dtype,
-        kernel_c_dtype_name,
-        alpha_dtype,
-        sf_vec_size,
-        mma_k,
-        tile_k,
-        mma_tiler_mn[0],
-        mma_tiler_mn[1],
-        cluster_shape_mn[0],
-        cluster_shape_mn[1],
-        sm_count,
-        policy.single_work_tile_per_cta,
-        policy.direct_one_m_tile_scheduler,
-        policy.use_m1_non_tma,
-        policy.split_k_slices,
-        policy.split_k_atomic_bf16,
-        policy.large_m_unroll,
-        load_path,
-        swap_ab,
-        sfb_k_reuse,
-        alpha_is_one,
-        stream_int,
-    )
+    if plain_fp8:
+        compiled_plain_fp8 = _get_compiled_dense_gemm(
+            n=n,
+            k=k,
+            l=l,
+            c_l=kernel_c_l,
+            a_major="k",
+            b_major="k",
+            c_major="n",
+            ab_dtype=ab_cutlass_dtype,
+            sf_dtype=get_cutlass_dtype(sf_dtype),
+            c_dtype=get_cutlass_dtype(kernel_c_dtype_name),
+            alpha_dtype=get_cutlass_dtype(alpha_dtype),
+            sf_vec_size=sf_vec_size,
+            mma_k=mma_k,
+            tile_k=tile_k,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
+            policy=policy,
+            sm_count=sm_count,
+            sm_version="sm_120",
+            load_path=load_path,
+            swap_ab=swap_ab,
+            sfb_k_reuse=False,
+            b_tile_major=False,
+            alpha_is_one=alpha_is_one,
+            plain_fp8=True,
+        )
+        compiled_plain_fp8(
+            a_tensor_gpu=a_torch,
+            b_tensor_gpu=b_launch_torch,
+            sfa_tensor_gpu=sfa_torch,
+            sfb_tensor_gpu=sfb_torch,
+            c_tensor_gpu=c_tensor_gpu,
+            alpha_tensor_gpu=alpha,
+            stream_int=stream_int,
+        )
+    else:
+        torch.ops.sparkinfer.dense_gemm_launch(
+            a_torch,
+            b_launch_torch,
+            sfa_torch,
+            sfb_torch,
+            c_tensor_gpu,
+            alpha,
+            n,
+            k,
+            l,
+            kernel_c_l,
+            ab_dtype,
+            sf_dtype,
+            kernel_c_dtype_name,
+            alpha_dtype,
+            sf_vec_size,
+            mma_k,
+            tile_k,
+            mma_tiler_mn[0],
+            mma_tiler_mn[1],
+            cluster_shape_mn[0],
+            cluster_shape_mn[1],
+            sm_count,
+            policy.single_work_tile_per_cta,
+            policy.direct_one_m_tile_scheduler,
+            policy.use_m1_non_tma,
+            policy.split_k_slices,
+            policy.split_k_atomic_bf16,
+            policy.large_m_unroll,
+            load_path,
+            swap_ab,
+            sfb_k_reuse,
+            alpha_is_one,
+            stream_int,
+        )
     result = out
     if split_k_output and not split_k_atomic_bf16:
         assert split_scratch is not None

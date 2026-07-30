@@ -5,6 +5,7 @@
 - ``blockscaled``: one-shot dense block-scaled GEMM (NVFP4 / MXFP4 / MXFP8).
 - ``block_fp8_linear``: DeepSeek-style serialized block-FP8 linear via MXFP8.
 - ``mxfp8_linear``: ModelOpt MXFP8 linear (one-shot).
+- ``tensor_fp8_linear``: static per-tensor FP8 linear via the SM12x dense GEMM.
 - ``mla_query_projection``: fused MXFP8 MLA query projection and assembly.
 - ``wo_projection``: fused MLA WO-A/WO-B projections (+ inverse-RoPE variant).
 """
@@ -18,6 +19,7 @@ _OP_MODULES = (
     "blockscaled",
     "block_fp8_linear",
     "mxfp8_linear",
+    "tensor_fp8_linear",
     "mla_query_projection",
     "wo_projection",
 )

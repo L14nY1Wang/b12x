@@ -49,6 +49,7 @@ _OPS: tuple[str, ...] = (
     "gemm.block_fp8_linear",
     "gemm.bmm",
     "gemm.mxfp8_linear",
+    "gemm.tensor_fp8_linear",
     "gemm.mla_query_projection",
     "gemm.wo_projection",
     "moe.fused_moe",
