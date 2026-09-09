@@ -75,7 +75,7 @@ def _bf16_lookup_kernel(
     SHARD_START: tl.constexpr,
     SHARD_END: tl.constexpr,
     BLOCK_D: tl.constexpr,
-    SHARD_ROWS: tl.constexpr = 0,
+    COMPACT_ROWS: tl.constexpr = False,
 ):
     token = tl.program_id(0)
     head = tl.program_id(1)
@@ -96,12 +96,8 @@ def _bf16_lookup_kernel(
         embedding_id - tl.full((), SHARD_START, tl.int64),
         0,
     ).to(tl.int64)
-    if SHARD_ROWS:
-        shard = tl.where(local, embedding_id // SHARD_ROWS, 0)
-        address = tl.load(weight_ptr + shard, mask=local, other=0)
-        local = local & (address != 0)
-        weight_ptr = address.to(tl.pointer_type(tl.bfloat16))
-        local_row = tl.where(local, embedding_id % SHARD_ROWS, 0).to(tl.int64)
+    if COMPACT_ROWS:
+        local_row = id_offset
     row_base = local_row * tl.full((), HEAD_DIM, tl.int64)
     value = tl.load(
         weight_ptr + row_base + columns.to(tl.int64),
@@ -131,7 +127,7 @@ def _fp8_lookup_kernel(
     SHARD_START: tl.constexpr,
     SHARD_END: tl.constexpr,
     BLOCK_D: tl.constexpr,
-    SHARD_ROWS: tl.constexpr = 0,
+    COMPACT_ROWS: tl.constexpr = False,
 ):
     token = tl.program_id(0)
     head = tl.program_id(1)
@@ -154,12 +150,8 @@ def _fp8_lookup_kernel(
         embedding_id - tl.full((), SHARD_START, tl.int64),
         0,
     ).to(tl.int64)
-    if SHARD_ROWS:
-        shard = tl.where(local, embedding_id // SHARD_ROWS, 0)
-        address = tl.load(weight_ptr + shard, mask=local, other=0)
-        local = local & (address != 0)
-        weight_ptr = address.to(tl.pointer_type(tl.float8e4nv))
-        local_row = tl.where(local, embedding_id % SHARD_ROWS, 0).to(tl.int64)
+    if COMPACT_ROWS:
+        local_row = id_offset
     row_base = local_row * tl.full((), HEAD_DIM, tl.int64)
     quantized = tl.load(
         weight_ptr + row_base + columns.to(tl.int64),
@@ -196,7 +188,7 @@ def _nvfp4_lookup_kernel(
     SHARD_START: tl.constexpr,
     SHARD_END: tl.constexpr,
     BLOCK_D: tl.constexpr,
-    SHARD_ROWS: tl.constexpr = 0,
+    COMPACT_ROWS: tl.constexpr = False,
 ):
     token = tl.program_id(0)
     head = tl.program_id(1)
@@ -217,14 +209,8 @@ def _nvfp4_lookup_kernel(
         embedding_id - tl.full((), SHARD_START, tl.int64),
         0,
     ).to(tl.int64)
-    if SHARD_ROWS:
-        shard = tl.where(local, embedding_id // SHARD_ROWS, 0)
-        address = tl.load(weight_ptr + shard, mask=local, other=0)
-        scale_address = tl.load(weight_scale_ptr + shard, mask=local, other=0)
-        local = local & (address != 0) & (scale_address != 0)
-        weight_ptr = address.to(tl.pointer_type(tl.uint8))
-        weight_scale_ptr = scale_address.to(tl.pointer_type(tl.float8e4nv))
-        local_row = tl.where(local, embedding_id % SHARD_ROWS, 0).to(tl.int64)
+    if COMPACT_ROWS:
+        local_row = id_offset
 
     packed_row_base = local_row * tl.full((), HEAD_DIM // 2, tl.int64)
     packed = tl.load(
@@ -298,7 +284,7 @@ def _launch_bf16_lookup(
     table_vocab_size: int,
     shard_start: int,
     shard_end: int,
-    shard_rows: int = 0,
+    compact_rows: bool = False,
 ) -> None:
     grid = (out.shape[0], head_count, triton.cdiv(head_dim, _BLOCK_D))
     _bf16_lookup_kernel[grid](
@@ -314,7 +300,7 @@ def _launch_bf16_lookup(
         SHARD_START=shard_start,
         SHARD_END=shard_end,
         BLOCK_D=_BLOCK_D,
-        SHARD_ROWS=shard_rows,
+        COMPACT_ROWS=compact_rows,
         num_warps=4,
     )
 
@@ -332,7 +318,7 @@ def _launch_fp8_lookup(
     table_vocab_size: int,
     shard_start: int,
     shard_end: int,
-    shard_rows: int = 0,
+    compact_rows: bool = False,
 ) -> None:
     grid = (out.shape[0], head_count, triton.cdiv(head_dim, _BLOCK_D))
     _fp8_lookup_kernel[grid](
@@ -349,7 +335,7 @@ def _launch_fp8_lookup(
         SHARD_START=shard_start,
         SHARD_END=shard_end,
         BLOCK_D=_BLOCK_D,
-        SHARD_ROWS=shard_rows,
+        COMPACT_ROWS=compact_rows,
         num_warps=4,
     )
 
@@ -368,7 +354,7 @@ def _launch_nvfp4_lookup(
     table_vocab_size: int,
     shard_start: int,
     shard_end: int,
-    shard_rows: int = 0,
+    compact_rows: bool = False,
 ) -> None:
     grid = (out.shape[0], head_count, triton.cdiv(head_dim, _BLOCK_D))
     _nvfp4_lookup_kernel[grid](
@@ -386,7 +372,7 @@ def _launch_nvfp4_lookup(
         SHARD_START=shard_start,
         SHARD_END=shard_end,
         BLOCK_D=_BLOCK_D,
-        SHARD_ROWS=shard_rows,
+        COMPACT_ROWS=compact_rows,
         num_warps=4,
     )
 
@@ -595,8 +581,9 @@ def _launch_hash(
     )
 
 
+# Schema-specific names prevent reuse of incompatible Inductor artifacts.
 @torch.library.custom_op(
-    "b12x::ple_embedding_bf16_pipeline",
+    "b12x::ple_embedding_bf16_gather_pipeline",
     mutates_args=("scratch", "out"),
 )
 def _bf16_pipeline_op(
@@ -626,7 +613,6 @@ def _bf16_pipeline_op(
     ids_offset_bytes: int,
     request_ids_offset_bytes: int,
     error_code_offset_bytes: int,
-    shard_rows: int = 0,
 ) -> None:
     ids, request_ids, error_code = _pipeline_scratch_views(
         scratch,
@@ -668,7 +654,6 @@ def _bf16_pipeline_op(
         table_vocab_size,
         shard_start,
         shard_end,
-        shard_rows,
     )
 
 
@@ -700,7 +685,6 @@ def _bf16_pipeline_fake(
     ids_offset_bytes: int,
     request_ids_offset_bytes: int,
     error_code_offset_bytes: int,
-    shard_rows: int = 0,
 ) -> None:
     del weight, token_ids, query_start_loc, committed_history
     del num_seqs, num_tokens, multipliers, prime_sizes, table_offsets
@@ -708,11 +692,10 @@ def _bf16_pipeline_fake(
     del max_seqs, max_tokens, head_count, head_dim, embedding_dim
     del table_vocab_size, shard_start, shard_end
     del ids_offset_bytes, request_ids_offset_bytes, error_code_offset_bytes
-    del shard_rows
 
 
 @torch.library.custom_op(
-    "b12x::ple_embedding_fp8_pipeline",
+    "b12x::ple_embedding_fp8_gather_pipeline",
     mutates_args=("scratch", "out"),
 )
 def _fp8_pipeline_op(
@@ -743,7 +726,6 @@ def _fp8_pipeline_op(
     ids_offset_bytes: int,
     request_ids_offset_bytes: int,
     error_code_offset_bytes: int,
-    shard_rows: int = 0,
 ) -> None:
     ids, request_ids, error_code = _pipeline_scratch_views(
         scratch,
@@ -786,7 +768,6 @@ def _fp8_pipeline_op(
         table_vocab_size,
         shard_start,
         shard_end,
-        shard_rows,
     )
 
 
@@ -819,7 +800,6 @@ def _fp8_pipeline_fake(
     ids_offset_bytes: int,
     request_ids_offset_bytes: int,
     error_code_offset_bytes: int,
-    shard_rows: int = 0,
 ) -> None:
     del weight, weight_scale, token_ids, query_start_loc, committed_history
     del num_seqs, num_tokens, multipliers, prime_sizes, table_offsets
@@ -827,11 +807,10 @@ def _fp8_pipeline_fake(
     del max_seqs, max_tokens, head_count, head_dim, embedding_dim
     del table_vocab_size, shard_start, shard_end
     del ids_offset_bytes, request_ids_offset_bytes, error_code_offset_bytes
-    del shard_rows
 
 
 @torch.library.custom_op(
-    "b12x::ple_embedding_nvfp4_pipeline",
+    "b12x::ple_embedding_nvfp4_gather_pipeline",
     mutates_args=("scratch", "out"),
 )
 def _nvfp4_pipeline_op(
@@ -863,7 +842,6 @@ def _nvfp4_pipeline_op(
     ids_offset_bytes: int,
     request_ids_offset_bytes: int,
     error_code_offset_bytes: int,
-    shard_rows: int = 0,
 ) -> None:
     ids, request_ids, error_code = _pipeline_scratch_views(
         scratch,
@@ -907,7 +885,6 @@ def _nvfp4_pipeline_op(
         table_vocab_size,
         shard_start,
         shard_end,
-        shard_rows,
     )
 
 
@@ -941,7 +918,6 @@ def _nvfp4_pipeline_fake(
     ids_offset_bytes: int,
     request_ids_offset_bytes: int,
     error_code_offset_bytes: int,
-    shard_rows: int = 0,
 ) -> None:
     del weight, weight_scale, weight_scale_2
     del token_ids, query_start_loc, committed_history
@@ -950,7 +926,6 @@ def _nvfp4_pipeline_fake(
     del max_seqs, max_tokens, head_count, head_dim, embedding_dim
     del table_vocab_size, shard_start, shard_end
     del ids_offset_bytes, request_ids_offset_bytes, error_code_offset_bytes
-    del shard_rows
 
 
 def run_pipeline(binding: Binding, *, token_count: int) -> None:
@@ -988,21 +963,18 @@ def run_pipeline(binding: Binding, *, token_count: int) -> None:
     )
     weight = binding.weight
     weight_scale = binding.weight_scale
-    if binding.mapped_table is not None:
-        weight = binding.mapped_table.weight_pointers
-        if caps.quant_mode == "nvfp4_group16":
-            weight_scale = binding.mapped_table.scale_pointers
-        hash_args += (binding.mapped_table.shard_rows,)
     assert weight is not None
     if caps.quant_mode == "bf16":
-        torch.ops.b12x.ple_embedding_bf16_pipeline(weight, *hash_args)
+        torch.ops.b12x.ple_embedding_bf16_gather_pipeline(weight, *hash_args)
     elif caps.quant_mode == "fp8_e4m3_per_tensor":
         assert weight_scale is not None
-        torch.ops.b12x.ple_embedding_fp8_pipeline(weight, weight_scale, *hash_args)
+        torch.ops.b12x.ple_embedding_fp8_gather_pipeline(
+            weight, weight_scale, *hash_args
+        )
     elif caps.quant_mode == "nvfp4_group16":
         assert weight_scale is not None
         assert binding.weight_scale_2 is not None
-        torch.ops.b12x.ple_embedding_nvfp4_pipeline(
+        torch.ops.b12x.ple_embedding_nvfp4_gather_pipeline(
             weight,
             weight_scale,
             binding.weight_scale_2,

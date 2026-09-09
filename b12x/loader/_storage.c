@@ -18,7 +18,7 @@
 typedef char require_64_bit_offsets[(sizeof(off_t) == 8 && sizeof(size_t) == 8) ? 1 : -1];
 
 enum storage_kind {
-    SYSTEM, PINNED, PINNED_WC, REGISTERED, MANAGED, FILE_MAPPING, FILE_READONLY
+    SYSTEM, PINNED, PINNED_WC, REGISTERED, MANAGED, FILE_MAPPING
 };
 
 typedef struct {
@@ -101,7 +101,6 @@ static bool parse_kind(const char *name, enum storage_kind *kind, failure_t *fai
     } kinds[] = {
         {"system", SYSTEM}, {"pinned", PINNED}, {"pinned_wc", PINNED_WC},
         {"registered", REGISTERED}, {"managed", MANAGED}, {"file", FILE_MAPPING},
-        {"file_readonly", FILE_READONLY},
     };
     for (size_t i = 0; i < sizeof(kinds) / sizeof(kinds[0]); i++) {
         if (strcmp(name, kinds[i].name) == 0) {
@@ -136,11 +135,6 @@ static storage_t *read_storage(int fd, int64_t offset, int64_t bytes,
     if (!parse_kind(name, &kind, failure)) return NULL;
     if (!cuda_ok(cudaGetDevice(&previous), "cudaGetDevice", failure)) return NULL;
     if (!cuda_ok(cudaSetDevice(device), "cudaSetDevice", failure)) goto done;
-    // HMM supports read-only file mappings without ATS host page tables.
-    if (kind == FILE_READONLY &&
-        !require_attribute(cudaDevAttrPageableMemoryAccess, device,
-                           "read-only file storage requires GPU pageable memory access",
-                           failure)) goto done;
     if ((kind == SYSTEM || kind == FILE_MAPPING) &&
         (!require_attribute(cudaDevAttrPageableMemoryAccess, device,
                             "system/file storage requires GPU access to pageable memory", failure) ||
@@ -187,7 +181,7 @@ static storage_t *read_storage(int fd, int64_t offset, int64_t bytes,
         int flags = MAP_PRIVATE | MAP_ANONYMOUS;
         int map_fd = -1;
         off_t map_offset = 0;
-        if ((kind == FILE_MAPPING || kind == FILE_READONLY) && bytes) {
+        if (kind == FILE_MAPPING && bytes) {
             long page = sysconf(_SC_PAGESIZE);
             if (page <= 0) {
                 snprintf(failure->message, sizeof(failure->message), "could not query host page size");
@@ -199,8 +193,7 @@ static storage_t *read_storage(int fd, int64_t offset, int64_t bytes,
             flags = MAP_PRIVATE;
         }
         storage->extent = length + delta;
-        int protection = kind == FILE_READONLY ? PROT_READ : PROT_READ | PROT_WRITE;
-        void *mapped = mmap(NULL, storage->extent, protection, flags, map_fd, map_offset);
+        void *mapped = mmap(NULL, storage->extent, PROT_READ | PROT_WRITE, flags, map_fd, map_offset);
         if (mapped == MAP_FAILED) {
             system_error(failure, "mmap");
             goto done;
@@ -215,7 +208,7 @@ static storage_t *read_storage(int fd, int64_t offset, int64_t bytes,
                          "cudaHostGetDevicePointer", failure)) goto done;
         }
     }
-    if (fd >= 0 && kind != FILE_MAPPING && kind != FILE_READONLY) {
+    if (fd >= 0 && kind != FILE_MAPPING) {
         int64_t completed = 0;
         while (completed < bytes) {
             size_t chunk = bytes - completed < (8 << 20) ? (size_t)(bytes - completed) : (8 << 20);
@@ -340,8 +333,14 @@ static PyObject *py_stats(PyObject *self, PyObject *args) {
 #include "_pool.c"
 #include "_direct.c"
 #include "_batch.c"
+#include "_ple_reader.c"
 
 static PyMethodDef methods[] = {
+    {"ple_reader", py_ple_reader, METH_VARARGS, NULL},
+    {"ple_reader_add", py_ple_reader_add, METH_VARARGS, NULL},
+    {"ple_reader_run", py_ple_reader_run, METH_VARARGS, NULL},
+    {"ple_reader_stats", py_ple_reader_stats, METH_O,
+     "Last-call counters; staging_bytes and metadata_bytes describe persistent allocations."},
     {"batch_executor", py_batch_executor, METH_VARARGS, NULL},
     {"batch_execute", py_batch_execute, METH_VARARGS, NULL},
     {"batch_stats", py_batch_stats, METH_O, NULL},

@@ -120,7 +120,7 @@ class B12xModelLoader(DefaultModelLoader):
             "ngram_heads_vocab_sizes",
         }
 
-    def _mmap_weights_iterator(self, files, source, index_path):
+    def _file_backed_weights_iterator(self, files, source, index_path):
         from vllm.model_executor.model_loader.ep_weight_filter import should_skip_weight
 
         weight_map = None
@@ -129,7 +129,7 @@ class B12xModelLoader(DefaultModelLoader):
         indexed_paths = {}
         for path in files:
             sources = safetensors_file_sources(path)
-            mapped_names = {name for name in sources if source.mmap_weight_filter(name)}
+            file_names = {name for name in sources if source.file_weight_filter(name)}
             resolved_path = Path(path).resolve()
             selected = []
             for name in sorted(sources):
@@ -149,13 +149,13 @@ class B12xModelLoader(DefaultModelLoader):
                         continue
                 if not should_skip_weight(name, self.local_expert_ids):
                     selected.append(name)
-            mapped = (
+            file_backed = (
                 (source.prefix + name, file_source_tensor(sources[name]))
                 for name in selected
-                if name in mapped_names
+                if name in file_names
             )
-            # Entirely mapped files never enter the native reader. In mixed
-            # files, skip mapped entries before metadata-value reads or routing.
+            # File-backed entries never enter the checkpoint direct reader, even
+            # for mixed files or before metadata-value reads and routing.
             ordinary = (
                 self._session.weights(
                     [path],
@@ -163,13 +163,13 @@ class B12xModelLoader(DefaultModelLoader):
                     prefix=source.prefix,
                     index_path=index_path,
                     needs_values=self._needs_values,
-                    skip=lambda name: name in mapped_names
+                    skip=lambda name: name in file_names
                     or should_skip_weight(name, self.local_expert_ids),
                 )
-                if any(name not in mapped_names for name in selected)
+                if any(name not in file_names for name in selected)
                 else ()
             )
-            yield from heapq.merge(mapped, ordinary, key=lambda item: item[0])
+            yield from heapq.merge(file_backed, ordinary, key=lambda item: item[0])
 
     def _get_weights_iterator(self, source):
         from vllm.model_executor.model_loader.ep_weight_filter import should_skip_weight
@@ -193,8 +193,8 @@ class B12xModelLoader(DefaultModelLoader):
             disable=not enable_tqdm(self.load_config.use_tqdm_on_load),
             bar_format=_BAR_FORMAT,
         ) as shards:
-            if source.mmap_weight_filter is not None:
-                yield from self._mmap_weights_iterator(
+            if source.file_weight_filter is not None:
+                yield from self._file_backed_weights_iterator(
                     shards,
                     source,
                     Path(folder) / "model.safetensors.index.json",

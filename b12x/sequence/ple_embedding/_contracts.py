@@ -21,12 +21,13 @@ from b12x.sequence import ple_hash
 from ._policy import PLE_EMBEDDING_POLICY, PleEmbeddingQuery
 
 if TYPE_CHECKING:
-    from ._storage import MMapTable, TableStorage
+    from ._disk import DiskTable
+    from ._storage import TableStorage
 
 
 _SIGNED_INT64_MAX = (1 << 63) - 1
 QuantMode = Literal["bf16", "fp8_e4m3_per_tensor", "nvfp4_group16"]
-TableMemory = Literal["device", "mapped_host", "mmap"]
+TableMemory = Literal["device", "mapped_host", "io_uring"]
 _BF16_MODE: QuantMode = "bf16"
 _FP8_QUANT_MODE: QuantMode = "fp8_e4m3_per_tensor"
 _NVFP4_QUANT_MODE: QuantMode = "nvfp4_group16"
@@ -35,7 +36,11 @@ _SUPPORTED_MODES: tuple[QuantMode, ...] = (
     _FP8_QUANT_MODE,
     _NVFP4_QUANT_MODE,
 )
-_SUPPORTED_TABLE_MEMORY: tuple[TableMemory, ...] = ("device", "mapped_host", "mmap")
+_SUPPORTED_TABLE_MEMORY: tuple[TableMemory, ...] = (
+    "device",
+    "mapped_host",
+    "io_uring",
+)
 
 
 def _canonical_device(device: torch.device | str) -> torch.device:
@@ -114,8 +119,9 @@ class Caps:
     ``scale_dtype`` is validated against the selected storage format.
     ``table_memory="mapped_host"`` places row payloads and row-associated
     scales in CUDA-mapped, write-combined host memory while scalar scales stay
-    device-resident. ``table_memory="mmap"`` reads immutable checkpoint shards
-    through demand-paged read-only file mappings owned by ``MMapTable``.
+    device-resident. ``table_memory="io_uring"`` reads selected rows with
+    O_DIRECT into a batch-sized mapped-host cache owned by ``DiskTable``;
+    its ``run`` must execute outside graph capture.
     """
 
     device: torch.device | str
@@ -187,7 +193,7 @@ class Caps:
                 f"table_memory must be one of {_SUPPORTED_TABLE_MEMORY!r}, "
                 f"got {self.table_memory!r}"
             )
-        if table_memory in ("mapped_host", "mmap") and self.device.type != "cuda":
+        if table_memory != "device" and self.device.type != "cuda":
             raise ValueError(
                 f"{table_memory} PLE table storage requires a CUDA device, "
                 f"got {self.device}"
@@ -328,7 +334,7 @@ class Binding:
     _ids: torch.Tensor
     _hash_scratch: torch.Tensor
     _hash_binding: ple_hash.Binding
-    mapped_table: MMapTable | None = None
+    disk_table: DiskTable | None = None
 
 
 def plan(
@@ -465,7 +471,7 @@ def bind(
     weight: torch.Tensor | None,
     weight_scale: torch.Tensor | None = None,
     weight_scale_2: torch.Tensor | None = None,
-    mapped_table: MMapTable | None = None,
+    disk_table: DiskTable | None = None,
     token_ids: torch.Tensor,
     query_start_loc: torch.Tensor,
     committed_history: torch.Tensor,
@@ -492,17 +498,17 @@ def bind(
         shape=plan._ids_shape,
         dtype=torch.int64,
     )
-    if caps.table_memory == "mmap":
-        from ._storage import MMapTable
+    if disk_table is not None and caps.table_memory != "io_uring":
+        raise ValueError("disk_table requires table_memory='io_uring'")
+    if caps.table_memory == "io_uring":
+        from ._disk import DiskTable
 
-        if not isinstance(mapped_table, MMapTable) or mapped_table.plan is not plan:
-            raise ValueError("mmap binding requires MMapTable belonging to this plan")
+        if not isinstance(disk_table, DiskTable) or disk_table.plan is not plan:
+            raise ValueError("disk binding requires DiskTable belonging to this plan")
         if weight is not None:
-            raise ValueError("mmap binding requires weight=None")
-        mapped_table._require_complete()
+            raise ValueError("disk binding requires weight=None")
+        disk_table._require_complete()
     else:
-        if mapped_table is not None:
-            raise ValueError("mapped_table requires table_memory='mmap'")
         if weight is None:
             raise ValueError("weight is required for resident table storage")
         _require_tensor(
@@ -515,7 +521,7 @@ def bind(
         if caps.table_memory == "mapped_host":
             _require_mapped_host_tensor("weight", weight, device=caps.device)
     if plan.weight_scale_shape is None or (
-        caps.table_memory == "mmap" and caps.quant_mode == _NVFP4_QUANT_MODE
+        caps.table_memory == "io_uring" and caps.quant_mode == _NVFP4_QUANT_MODE
     ):
         if weight_scale is not None:
             raise ValueError(
@@ -584,14 +590,10 @@ def bind(
     ]
     if weight is not None:
         read_tensors.append(("weight", weight))
-    if mapped_table is not None:
-        read_tensors.append(("weight_pointers", mapped_table.weight_pointers))
-        if mapped_table.scale_pointers is not None:
-            read_tensors.append(("scale_pointers", mapped_table.scale_pointers))
-        read_tensors.extend(
-            (f"mapped_shard_{key}", tensor)
-            for key, tensor in mapped_table._mappings.items()
-        )
+    if disk_table is not None:
+        read_tensors.append(("disk_weight", disk_table.weight))
+        if disk_table.weight_scale is not None:
+            read_tensors.append(("disk_weight_scale", disk_table.weight_scale))
     if weight_scale is not None:
         read_tensors.append(("weight_scale", weight_scale))
     if weight_scale_2 is not None:
@@ -607,8 +609,8 @@ def bind(
             )
     if _overlaps(scratch_storage, out):
         raise ValueError("mutable scratch and out must not overlap")
-    if mapped_table is not None:
-        mapped_table._frozen = True
+    if disk_table is not None:
+        disk_table._frozen = True
     return Binding(
         plan=plan,
         scratch=scratch_storage,
@@ -625,7 +627,7 @@ def bind(
         _ids=ids,
         _hash_scratch=hash_scratch,
         _hash_binding=hash_binding,
-        mapped_table=mapped_table,
+        disk_table=disk_table,
     )
 
 
@@ -645,7 +647,10 @@ def run(binding: Binding, *, token_count: int | None = None) -> torch.Tensor:
         token_count = binding.plan.caps.max_tokens
     if not 0 <= token_count <= binding.plan.caps.max_tokens:
         raise ValueError("token_count must fit the planned token capacity")
-    run_pipeline(binding, token_count=token_count)
+    if binding.disk_table is not None:
+        binding.disk_table._run(binding, token_count=token_count)
+    else:
+        run_pipeline(binding, token_count=token_count)
     return binding.out[:token_count]
 
 

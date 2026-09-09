@@ -14,7 +14,8 @@ from ._contracts import (
     plan,
     run,
 )
-from ._storage import MMapTable, TableStorage, allocate_storage
+from ._disk import DiskTable
+from ._storage import TableStorage, allocate_storage
 from ._policy import PleEmbeddingConfig, PleEmbeddingQuery
 
 
@@ -27,7 +28,7 @@ __all__ = [
     "QuantMode",
     "TableMemory",
     "TableStorage",
-    "MMapTable",
+    "DiskTable",
     "Caps",
     "Plan",
     "Binding",

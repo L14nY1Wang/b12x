@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-import operator
 import sys
 from contextlib import suppress
 from dataclasses import dataclass
@@ -125,115 +124,6 @@ class _MappedHostAllocation:
             self.close()
 
 
-class MMapTable:
-    """Own immutable checkpoint mappings and fixed device shard-pointer arrays.
-
-    Only pointer metadata is allocated on the GPU. Mappings use read-only,
-    private, demand-paged file storage, including on CUDA HMM devices. Keep
-    this owner (normally through a Binding) alive for all graph replays and
-    keep the checkpoint files immutable for its entire lifetime.
-    """
-
-    def __init__(self, plan: Plan, shard_rows: int) -> None:
-        from ._contracts import Plan
-
-        if not isinstance(plan, Plan):
-            raise TypeError("plan must be Plan")
-        if plan.caps.table_memory != "mmap":
-            raise ValueError("MMapTable requires table_memory='mmap'")
-        shard_rows = operator.index(shard_rows)
-        if shard_rows <= 0 or shard_rows > (1 << 63) - 1:
-            raise ValueError("shard_rows must be a positive signed int64")
-        device = plan.caps.device
-        if device.type != "cuda" or device.index is None:
-            raise ValueError("mmap PLE storage requires an indexed CUDA device")
-        error, pageable = cudart.cudaDeviceGetAttribute(
-            cudart.cudaDeviceAttr.cudaDevAttrPageableMemoryAccess, device.index
-        )
-        _check_cuda(error, "cudaDeviceGetAttribute")
-        if not pageable:
-            raise RuntimeError("mmap PLE storage requires GPU pageable memory access")
-        self.plan = plan
-        self.shard_rows = shard_rows
-        self.shard_count = (plan.padded_vocab_size + shard_rows - 1) // shard_rows
-        self.weight_pointers = torch.zeros(
-            self.shard_count, dtype=torch.int64, device=device
-        )
-        self.scale_pointers = (
-            torch.zeros(self.shard_count, dtype=torch.int64, device=device)
-            if plan.caps.quant_mode == "nvfp4_group16"
-            else None
-        )
-        self._mappings: dict[tuple[bool, int], torch.Tensor] = {}
-        self._frozen = False
-        self.mapped_file_nbytes = 0
-
-    def map_shard(
-        self, shard_index: int, path: str, offset: int, *, scale: bool = False
-    ) -> None:
-        """Map a complete checkpoint shard when it overlaps this TP rank.
-
-        Geometry comes from the plan, not from untrusted file metadata. File
-        range and dtype alignment are checked by the owning native reader
-        before mmap. This call never reads or copies tensor payload bytes.
-        """
-        from b12x.loader import read_tensor
-
-        if self._frozen:
-            raise RuntimeError("cannot change mmap shards after binding")
-        shard_index = operator.index(shard_index)
-        offset = operator.index(offset)
-        if shard_index < 0 or shard_index >= self.shard_count:
-            raise ValueError("checkpoint shard index is out of range")
-        if offset < 0:
-            raise ValueError("checkpoint file offset must be nonnegative")
-        if scale and self.scale_pointers is None:
-            raise ValueError("only NVFP4 has mapped row scales")
-        key = (scale, shard_index)
-        if key in self._mappings:
-            raise ValueError("checkpoint shard is already mapped")
-        start = shard_index * self.shard_rows
-        end = min(start + self.shard_rows, self.plan.padded_vocab_size)
-        if end <= self.plan.shard_start or start >= self.plan.shard_end:
-            return
-        if scale:
-            assert self.plan.weight_scale_shape is not None
-            assert self.plan.weight_scale_dtype is not None
-            width = self.plan.weight_scale_shape[1]
-            dtype = self.plan.weight_scale_dtype
-            pointers = self.scale_pointers
-        else:
-            width = self.plan.weight_shape[1]
-            dtype = self.plan.weight_dtype
-            pointers = self.weight_pointers
-        tensor = read_tensor(
-            path,
-            shape=(end - start, width),
-            dtype=dtype,
-            offset=offset,
-            allocation="file_readonly",
-            device=self.plan.caps.device.index,
-        )
-        assert pointers is not None
-        # Publish only the address; never pass the unregistered mapping as a
-        # Triton argument (its launcher may reject pageable host pointers).
-        pointers[shard_index].fill_(tensor.data_ptr())
-        self._mappings[key] = tensor
-        self.mapped_file_nbytes += tensor.numel() * tensor.element_size()
-
-    def _require_complete(self) -> None:
-        first = self.plan.shard_start // self.shard_rows
-        last = (self.plan.shard_end + self.shard_rows - 1) // self.shard_rows
-        for shard_index in range(first, last):
-            if (False, shard_index) not in self._mappings:
-                raise ValueError(f"missing mmap weight shard {shard_index}")
-            if (
-                self.scale_pointers is not None
-                and (True, shard_index) not in self._mappings
-            ):
-                raise ValueError(f"missing mmap scale shard {shard_index}")
-
-
 @dataclass(kw_only=True)
 class TableStorage:
     """Owning persistent table tensors and their checkpoint loading views.
@@ -271,8 +161,8 @@ def allocate_storage(plan: Plan) -> TableStorage:
     if not isinstance(plan, Plan):
         raise TypeError(f"plan must be Plan, got {type(plan)!r}")
     caps = plan.caps
-    if caps.table_memory == "mmap":
-        raise ValueError("mmap tables must be loaded with MMapTable(plan, shard_rows)")
+    if caps.table_memory == "io_uring":
+        raise ValueError("disk tables must be loaded with DiskTable(plan, shard_rows)")
 
     allocations: list[_MappedHostAllocation] = []
 
@@ -323,4 +213,4 @@ def allocate_storage(plan: Plan) -> TableStorage:
     )
 
 
-__all__ = ["MMapTable", "TableStorage", "allocate_storage"]
+__all__ = ["TableStorage", "allocate_storage"]
