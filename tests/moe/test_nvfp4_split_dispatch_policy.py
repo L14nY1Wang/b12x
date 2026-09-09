@@ -56,10 +56,15 @@ class TestNvfp4SplitPredicate:
             os.environ[_DYNAMIC_NVFP4_MATERIALIZED_ENV] = saved
 
     def test_accepted_dense(self):
-        """Reference dense prefill satisfies both candidate and enabled."""
+        """Reference dense prefill satisfies both candidate and enabled
+        (auto-on for matching shapes after measured win)."""
         assert _nvfp4_dynamic_dense_candidate(**_dense_args()) is True
-        # Enabled requires the env flag (default OFF) + share_input.
+        # Default auto-on: predicate + share_input → enabled without env.
+        assert _nvfp4_dynamic_materialized_enabled(**_enabled_args()) is True
+        # Explicit toggle-off works.
+        os.environ[_DYNAMIC_NVFP4_MATERIALIZED_ENV] = "0"
         assert _nvfp4_dynamic_materialized_enabled(**_enabled_args()) is False
+        # Explicit toggle-on works.
         os.environ[_DYNAMIC_NVFP4_MATERIALIZED_ENV] = "1"
         assert _nvfp4_dynamic_materialized_enabled(**_enabled_args()) is True
 
@@ -92,14 +97,20 @@ class TestNvfp4SplitPredicate:
         args_on = _dense_args(share_input_across_experts=False)
         assert _nvfp4_dynamic_materialized_enabled(**args_on) is False
 
-    def test_env_default_off(self):
-        """Without any env set, the enabled gate stays False."""
+    def test_env_auto_on_for_matching(self):
+        """Without any env set, predicate+share_input → auto-on (matching shapes)."""
         os.environ.pop(_DYNAMIC_NVFP4_MATERIALIZED_ENV, None)
-        assert _nvfp4_dynamic_materialized_enabled(**_enabled_args()) is False
+        assert _nvfp4_dynamic_materialized_enabled(**_enabled_args()) is True
 
     def test_env_off_explicitly(self):
         os.environ[_DYNAMIC_NVFP4_MATERIALIZED_ENV] = "0"
         assert _nvfp4_dynamic_materialized_enabled(**_enabled_args()) is False
+
+    def test_non_matching_defaults_false(self):
+        """Non-matching shapes (no share_input) default False even without env."""
+        args = _dense_args()
+        os.environ.pop(_DYNAMIC_NVFP4_MATERIALIZED_ENV, None)
+        assert _nvfp4_dynamic_materialized_enabled(**_enabled_args(share_input_across_experts=False)) is False
 
 
 class TestNvfp4SplitWorkspace:

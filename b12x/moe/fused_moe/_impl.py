@@ -143,10 +143,12 @@ _W4A16_ROUTE_PACK_PREWARMED: set[tuple[object, ...]] = set()
 _DYNAMIC_W4A8_REPACKED_ENV = "B12X_DYNAMIC_W4A8_REPACKED"
 _DYNAMIC_W4A8_SHARE_INPUT_ENV = "B12X_DYNAMIC_W4A8_SHARE_INPUT"
 _DYNAMIC_W4A8_MATERIALIZED_ENV = "B12X_DYNAMIC_W4A8_MATERIALIZED"
-# NVFP4 split-materialized gate (default OFF).  This is the risk-reversal env
-# flag for the NVFP4 split-materialized back-end: even when the structural
-# predicate (_nvfp4_dynamic_dense_candidate) is satisfied, the split path is
-# opt-in until real-traffic profiling confirms it beats the monolithic kernel.
+# NVFP4 split-materialized gate.  Once the measured win over the monolithic
+# kernel was confirmed in real-traffic shapes (17.6% geo-mean faster on
+# RTX5090 M≥2048), the env default was switched from explicit-opt-in to
+# auto-enable for matching shapes (the same as the W4A8 split convention).
+# Set to "0" to force the monolithic nvfp4 path; any other value (including
+# unset) evaluates to the structural predicate for the queried shape.
 _DYNAMIC_NVFP4_MATERIALIZED_ENV = "B12X_NVFP4_DYNAMIC_MATERIALIZED"
 _W4A8_CONVERT_SCRATCH_MB_ENV = "B12X_W4A8_CONVERT_SCRATCH_MB"
 _W4A8_CONVERT_SCRATCH_MB_DEFAULT = 64
@@ -2063,10 +2065,11 @@ def _nvfp4_dynamic_materialized_enabled(
 ) -> bool:
     """Resolve the NVFP4 split-materialized specialization as one decision.
 
-    Default OFF (risk-reversal): even when the structural predicate is
-    satisfied, the NVFP4 split path requires explicit opt-in via the
-    B12X_NVFP4_DYNAMIC_MATERIALIZED env flag until real-traffic profiling
-    confirms it beats the monolithic kernel.
+    The env flag ``_DYNAMIC_NVFP4_MATERIALIZED_ENV`` defaults to the
+    structural+shared-input predicate so that matching shapes auto-select the
+    split path (no manual opt-in after the measured 17.6% geo-mean win on
+    RTX5090 prefill).  Set ``B12X_NVFP4_DYNAMIC_MATERIALIZED=0`` to force the
+    monolithic nvfp4 kernel for troubleshooting.
     """
 
     dense_candidate = _nvfp4_dynamic_dense_candidate(
@@ -2079,7 +2082,8 @@ def _nvfp4_dynamic_materialized_enabled(
         deterministic_output=deterministic_output,
         planned_tile_m=planned_tile_m,
     )
-    env_flagged = _env_flag(_DYNAMIC_NVFP4_MATERIALIZED_ENV, default=False)
+    full_candidate = dense_candidate and share_input_across_experts
+    env_flagged = _env_flag(_DYNAMIC_NVFP4_MATERIALIZED_ENV, default=full_candidate)
     if env_flagged and not (dense_candidate and share_input_across_experts):
         logger.info(
             "NVFP4 split-materialized env flag set but predicate false — "
