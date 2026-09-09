@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import dataclasses
+import heapq
+import json
 import math
 import time
 from pathlib import Path
@@ -11,7 +13,12 @@ import torch
 from tqdm.auto import tqdm
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
-from vllm.model_executor.model_loader.weight_utils import _BAR_FORMAT, enable_tqdm
+from vllm.model_executor.model_loader.weight_utils import (
+    _BAR_FORMAT,
+    enable_tqdm,
+    file_source_tensor,
+    safetensors_file_sources,
+)
 
 from b12x.loader import storage_stats
 from b12x.loader._checkpoint import DirectWeightSession
@@ -113,6 +120,57 @@ class B12xModelLoader(DefaultModelLoader):
             "ngram_heads_vocab_sizes",
         }
 
+    def _mmap_weights_iterator(self, files, source, index_path):
+        from vllm.model_executor.model_loader.ep_weight_filter import should_skip_weight
+
+        weight_map = None
+        if index_path.is_file():
+            weight_map = json.loads(index_path.read_text())["weight_map"]
+        indexed_paths = {}
+        for path in files:
+            sources = safetensors_file_sources(path)
+            mapped_names = {name for name in sources if source.mmap_weight_filter(name)}
+            resolved_path = Path(path).resolve()
+            selected = []
+            for name in sorted(sources):
+                if source.weight_name_prefixes and not name.startswith(
+                    source.weight_name_prefixes
+                ):
+                    continue
+                if weight_map is not None:
+                    indexed_file = weight_map.get(name)
+                    if indexed_file is None:
+                        continue
+                    if indexed_file not in indexed_paths:
+                        indexed_paths[indexed_file] = (
+                            index_path.parent / indexed_file
+                        ).resolve()
+                    if indexed_paths[indexed_file] != resolved_path:
+                        continue
+                if not should_skip_weight(name, self.local_expert_ids):
+                    selected.append(name)
+            mapped = (
+                (source.prefix + name, file_source_tensor(sources[name]))
+                for name in selected
+                if name in mapped_names
+            )
+            # Entirely mapped files never enter the native reader. In mixed
+            # files, skip mapped entries before metadata-value reads or routing.
+            ordinary = (
+                self._session.weights(
+                    [path],
+                    prefixes=source.weight_name_prefixes,
+                    prefix=source.prefix,
+                    index_path=index_path,
+                    needs_values=self._needs_values,
+                    skip=lambda name: name in mapped_names
+                    or should_skip_weight(name, self.local_expert_ids),
+                )
+                if any(name not in mapped_names for name in selected)
+                else ()
+            )
+            yield from heapq.merge(mapped, ordinary, key=lambda item: item[0])
+
     def _get_weights_iterator(self, source):
         from vllm.model_executor.model_loader.ep_weight_filter import should_skip_weight
 
@@ -135,6 +193,13 @@ class B12xModelLoader(DefaultModelLoader):
             disable=not enable_tqdm(self.load_config.use_tqdm_on_load),
             bar_format=_BAR_FORMAT,
         ) as shards:
+            if source.mmap_weight_filter is not None:
+                yield from self._mmap_weights_iterator(
+                    shards,
+                    source,
+                    Path(folder) / "model.safetensors.index.json",
+                )
+                return
             yield from self._session.weights(
                 shards,
                 prefixes=source.weight_name_prefixes,

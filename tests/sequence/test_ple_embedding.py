@@ -28,6 +28,7 @@ def _small_plan(
     tp_size: int = 2,
     max_tokens: int = 5,
     quant_mode: str = "fp8_e4m3_per_tensor",
+    table_memory: str = "device",
 ) -> ple_embedding.Plan:
     prime_sizes, table_offsets, multipliers = _small_geometry()
     return ple_embedding.plan(
@@ -46,6 +47,7 @@ def _small_plan(
             tp_rank=tp_rank,
             table_alignment=8,
             quant_mode=quant_mode,
+            table_memory=table_memory,
         ),
         prime_sizes=prime_sizes,
         table_offsets=table_offsets,
@@ -792,3 +794,86 @@ def test_cuda_large_local_row_uses_int64_scaled_addressing() -> None:
         rtol=0,
         atol=0,
     )
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("quant_mode", ["bf16", "fp8_e4m3_per_tensor", "nvfp4_group16"])
+def test_mmap_checkpoint_shards_cross_tp_boundary_and_survive_graph_replay(
+    quant_mode: str, tmp_path
+) -> None:
+    from b12x.loader import capabilities
+
+    device = require_b12x()
+    device_index = torch.cuda.current_device() if device.index is None else device.index
+    if not capabilities(device_index)["pageable_memory_access"]:
+        pytest.skip("GPU does not support pageable file mappings")
+    plan = _small_plan(device, quant_mode=quant_mode, table_memory="mmap")
+    oracle = _bind_small(_small_plan("cpu", quant_mode=quant_mode))
+    # Seven-row checkpoint shards straddle the TP boundary at row 20 and
+    # leave a short final shard. Neither offset convention may be TP-relative.
+    table = ple_embedding.MMapTable(plan, shard_rows=7)
+    payloads = [(False, oracle.weight)]
+    if quant_mode == "nvfp4_group16":
+        payloads.append((True, oracle.weight_scale))
+    mapped_bytes = 0
+    for scale, local_tensor in payloads:
+        full = torch.full(
+            (plan.padded_vocab_size, local_tensor.shape[1]),
+            2,
+            dtype=torch.float32,
+        ).to(local_tensor.dtype)
+        full[plan.shard_start : plan.shard_end].copy_(local_tensor)
+        for index, start in enumerate(range(0, plan.padded_vocab_size, 7)):
+            shard = full[start : start + 7].contiguous()
+            path = tmp_path / f"{scale}-{index}.bin"
+            # An unaligned-to-page payload exercises the native mmap delta.
+            path.write_bytes(b"header" + shard.view(torch.uint8).numpy().tobytes())
+            if start <= plan.shard_start < start + shard.shape[0]:
+                with pytest.raises(RuntimeError, match="range exceeds"):
+                    table.map_shard(index, str(path), path.stat().st_size, scale=scale)
+            table.map_shard(index, str(path), 6, scale=scale)
+            if start < plan.shard_end and start + shard.shape[0] > plan.shard_start:
+                mapped_bytes += shard.numel() * shard.element_size()
+    assert table.mapped_file_nbytes == mapped_bytes
+    with pytest.raises(ValueError, match="index"):
+        table.map_shard(table.shard_count, str(tmp_path / "absent"), 0)
+    scratch_spec = plan.scratch_specs()[0]
+    binding = plan.bind(
+        scratch=torch.empty(
+            scratch_spec.shape, dtype=scratch_spec.dtype, device=device
+        ),
+        weight=None,
+        weight_scale=(
+            oracle.weight_scale.to(device)
+            if quant_mode == "fp8_e4m3_per_tensor"
+            else None
+        ),
+        weight_scale_2=(
+            oracle.weight_scale_2.to(device)
+            if oracle.weight_scale_2 is not None
+            else None
+        ),
+        mapped_table=table,
+        token_ids=oracle.token_ids.to(device),
+        query_start_loc=oracle.query_start_loc.to(device),
+        committed_history=oracle.committed_history.to(device),
+        num_seqs=oracle.num_seqs.to(device),
+        num_tokens=oracle.num_tokens.to(device),
+        out=torch.empty(plan.output_shape, dtype=plan.output_dtype, device=device),
+    )
+    with pytest.raises(RuntimeError, match="after binding"):
+        table.map_shard(0, str(tmp_path / "absent"), 0)
+    expected = _reference(oracle)
+    torch.testing.assert_close(
+        ple_embedding.run(binding).cpu(), expected, rtol=0, atol=0
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = ple_embedding.run(binding)
+    # The binding must retain all owners even after the loader drops its table.
+    del table
+    oracle.token_ids[:2].copy_(torch.tensor([8, 9], dtype=torch.int64))
+    binding.token_ids.copy_(oracle.token_ids)
+    expected = _reference(oracle)
+    graph.replay()
+    torch.testing.assert_close(captured.cpu(), expected, rtol=0, atol=0)

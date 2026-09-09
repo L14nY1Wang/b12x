@@ -21,12 +21,12 @@ from b12x.sequence import ple_hash
 from ._policy import PLE_EMBEDDING_POLICY, PleEmbeddingQuery
 
 if TYPE_CHECKING:
-    from ._storage import TableStorage
+    from ._storage import MMapTable, TableStorage
 
 
 _SIGNED_INT64_MAX = (1 << 63) - 1
 QuantMode = Literal["bf16", "fp8_e4m3_per_tensor", "nvfp4_group16"]
-TableMemory = Literal["device", "mapped_host"]
+TableMemory = Literal["device", "mapped_host", "mmap"]
 _BF16_MODE: QuantMode = "bf16"
 _FP8_QUANT_MODE: QuantMode = "fp8_e4m3_per_tensor"
 _NVFP4_QUANT_MODE: QuantMode = "nvfp4_group16"
@@ -35,7 +35,7 @@ _SUPPORTED_MODES: tuple[QuantMode, ...] = (
     _FP8_QUANT_MODE,
     _NVFP4_QUANT_MODE,
 )
-_SUPPORTED_TABLE_MEMORY: tuple[TableMemory, ...] = ("device", "mapped_host")
+_SUPPORTED_TABLE_MEMORY: tuple[TableMemory, ...] = ("device", "mapped_host", "mmap")
 
 
 def _canonical_device(device: torch.device | str) -> torch.device:
@@ -114,7 +114,8 @@ class Caps:
     ``scale_dtype`` is validated against the selected storage format.
     ``table_memory="mapped_host"`` places row payloads and row-associated
     scales in CUDA-mapped, write-combined host memory while scalar scales stay
-    device-resident.
+    device-resident. ``table_memory="mmap"`` reads immutable checkpoint shards
+    through demand-paged read-only file mappings owned by ``MMapTable``.
     """
 
     device: torch.device | str
@@ -186,9 +187,9 @@ class Caps:
                 f"table_memory must be one of {_SUPPORTED_TABLE_MEMORY!r}, "
                 f"got {self.table_memory!r}"
             )
-        if table_memory == "mapped_host" and self.device.type != "cuda":
+        if table_memory in ("mapped_host", "mmap") and self.device.type != "cuda":
             raise ValueError(
-                "mapped-host PLE table storage requires a CUDA device, "
+                f"{table_memory} PLE table storage requires a CUDA device, "
                 f"got {self.device}"
             )
         object.__setattr__(self, "table_memory", table_memory)
@@ -314,7 +315,7 @@ class Binding:
 
     plan: Plan
     scratch: torch.Tensor
-    weight: torch.Tensor
+    weight: torch.Tensor | None
     weight_scale: torch.Tensor | None
     weight_scale_2: torch.Tensor | None
     token_ids: torch.Tensor
@@ -327,6 +328,7 @@ class Binding:
     _ids: torch.Tensor
     _hash_scratch: torch.Tensor
     _hash_binding: ple_hash.Binding
+    mapped_table: MMapTable | None = None
 
 
 def plan(
@@ -460,9 +462,10 @@ def bind(
     plan: Plan,
     *,
     scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
-    weight: torch.Tensor,
+    weight: torch.Tensor | None,
     weight_scale: torch.Tensor | None = None,
     weight_scale_2: torch.Tensor | None = None,
+    mapped_table: MMapTable | None = None,
     token_ids: torch.Tensor,
     query_start_loc: torch.Tensor,
     committed_history: torch.Tensor,
@@ -489,16 +492,31 @@ def bind(
         shape=plan._ids_shape,
         dtype=torch.int64,
     )
-    _require_tensor(
-        "weight",
-        weight,
-        shape=plan.weight_shape,
-        dtype=plan.weight_dtype,
-        device=caps.device,
-    )
-    if caps.table_memory == "mapped_host":
-        _require_mapped_host_tensor("weight", weight, device=caps.device)
-    if plan.weight_scale_shape is None:
+    if caps.table_memory == "mmap":
+        from ._storage import MMapTable
+
+        if not isinstance(mapped_table, MMapTable) or mapped_table.plan is not plan:
+            raise ValueError("mmap binding requires MMapTable belonging to this plan")
+        if weight is not None:
+            raise ValueError("mmap binding requires weight=None")
+        mapped_table._require_complete()
+    else:
+        if mapped_table is not None:
+            raise ValueError("mapped_table requires table_memory='mmap'")
+        if weight is None:
+            raise ValueError("weight is required for resident table storage")
+        _require_tensor(
+            "weight",
+            weight,
+            shape=plan.weight_shape,
+            dtype=plan.weight_dtype,
+            device=caps.device,
+        )
+        if caps.table_memory == "mapped_host":
+            _require_mapped_host_tensor("weight", weight, device=caps.device)
+    if plan.weight_scale_shape is None or (
+        caps.table_memory == "mmap" and caps.quant_mode == _NVFP4_QUANT_MODE
+    ):
         if weight_scale is not None:
             raise ValueError(
                 f"weight_scale must be None for quant_mode={caps.quant_mode!r}"
@@ -555,7 +573,6 @@ def bind(
         out=ids,
     )
     read_tensors = [
-        ("weight", weight),
         ("token_ids", token_ids),
         ("query_start_loc", query_start_loc),
         ("committed_history", committed_history),
@@ -565,6 +582,16 @@ def bind(
         ("prime_sizes", plan.prime_sizes),
         ("table_offsets", plan.table_offsets),
     ]
+    if weight is not None:
+        read_tensors.append(("weight", weight))
+    if mapped_table is not None:
+        read_tensors.append(("weight_pointers", mapped_table.weight_pointers))
+        if mapped_table.scale_pointers is not None:
+            read_tensors.append(("scale_pointers", mapped_table.scale_pointers))
+        read_tensors.extend(
+            (f"mapped_shard_{key}", tensor)
+            for key, tensor in mapped_table._mappings.items()
+        )
     if weight_scale is not None:
         read_tensors.append(("weight_scale", weight_scale))
     if weight_scale_2 is not None:
@@ -580,6 +607,8 @@ def bind(
             )
     if _overlaps(scratch_storage, out):
         raise ValueError("mutable scratch and out must not overlap")
+    if mapped_table is not None:
+        mapped_table._frozen = True
     return Binding(
         plan=plan,
         scratch=scratch_storage,
@@ -596,6 +625,7 @@ def bind(
         _ids=ids,
         _hash_scratch=hash_scratch,
         _hash_binding=hash_binding,
+        mapped_table=mapped_table,
     )
 
 

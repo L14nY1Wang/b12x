@@ -27,25 +27,28 @@ def read_tensor(
 ):
     """Read a contiguous file range into final, shared CUDA tensor storage.
 
-    This experimental primitive uses buffered pread (or mmap for ``file``),
+    This experimental primitive uses buffered pread (or mmap for file kinds),
     independently of the vLLM adapter's O_DIRECT transport. It performs no dtype
     conversion or H2D copy.
     Reads finish before publishing the tensor. Its storage owns the allocation
     through tensor views and aliases; the final release waits for device work.
     Retain the tensor while replaying any graph that references its address.
-    Checkpoint files must remain immutable during loading. With ``file``
-    storage, they must remain immutable for the entire tensor lifetime.
-    Unregistered ``system``/``file`` pointers can be rejected by consumers
-    such as Triton's launcher; use ``registered`` for those consumers.
+    Checkpoint files must remain immutable during loading. With ``file`` or
+    ``file_readonly`` storage, they must remain immutable for the entire tensor
+    lifetime. ``file_readonly`` is MAP_PRIVATE|PROT_READ with no registration,
+    population, or payload copy. Its CUDA alias must never be written to.
+    Unregistered system/file pointers can be rejected by consumers such as
+    Triton's launcher; pass a device pointer table for read-only file gathers.
 
     Args:
         path: Local file containing the raw tensor bytes.
         shape: Contiguous tensor shape, including scalar and empty shapes.
         dtype: PyTorch dtype of the stored bytes.
         offset: Absolute byte offset in the file.
-        allocation: ``system``, ``pinned``, ``pinned_wc``, ``registered``, ``managed``, or
-            ``file``. System/file allocations require GPU host page tables.
-            File mappings may not meet an inference kernel's alignment needs.
+        allocation: ``system``, ``pinned``, ``pinned_wc``, ``registered``, ``managed``,
+            ``file``, or ``file_readonly``. System/file allocations require GPU
+            host page tables. Read-only files require pageable memory access
+            (ATS or HMM). File mappings may not meet a kernel's alignment needs.
         device: CUDA device index that will consume the tensor.
 
     Returns:
@@ -64,7 +67,7 @@ def read_tensor(
     nbytes = math.prod(shape) * dtype.itemsize
     if nbytes > 2**63 - 1 or offset > 2**63 - 1 - nbytes:
         raise OverflowError("tensor file range exceeds signed 64-bit addressing")
-    if allocation == "file" and offset % dtype.itemsize:
+    if allocation in ("file", "file_readonly") and offset % dtype.itemsize:
         raise ValueError("file mapping offset must be aligned to the dtype")
     torch.cuda.init()
     native = load()
