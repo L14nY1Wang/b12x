@@ -1,0 +1,145 @@
+"""Lockstep tests for the NVFP4 split-materialized dispatch policy.
+
+Covers the structural predicate (_nvfp4_dynamic_dense_candidate), the env gate
+(_nvfp4_dynamic_materialized_enabled), workspace sizing, and one e2e smoke
+test through the production dispatch.
+"""
+
+from __future__ import annotations
+
+import os
+import pytest
+import torch
+
+from b12x.moe.fused_moe._impl import (
+    _nvfp4_dynamic_dense_candidate,
+    _nvfp4_dynamic_materialized_enabled,
+    _plan_core_workspace,
+    _DYNAMIC_NVFP4_MATERIALIZED_ENV,
+)
+
+
+def _dense_args(**overrides):
+    """Canonical dense-prefill arguments that should match the predicate.
+    Only pass fields that the structural predicate accepts (no share_input)."""
+    args = dict(
+        quant_mode="nvfp4",
+        activation="silu",
+        routed_rows=4096,
+        num_experts=16,
+        k=4096,
+        n=2048,
+        deterministic_output=False,
+    )
+    args.update(overrides)
+    return args
+
+
+def _enabled_args(**overrides):
+    """Arguments for the enabled gate (structural + share_input_across_experts)."""
+    args = dict(
+        **_dense_args(),
+        share_input_across_experts=True,
+    )
+    args.update(overrides)
+    return args
+
+
+class TestNvfp4SplitPredicate:
+    @pytest.fixture(autouse=True)
+    def _env_backup(self):
+        saved = os.environ.get(_DYNAMIC_NVFP4_MATERIALIZED_ENV)
+        yield
+        if saved is None:
+            os.environ.pop(_DYNAMIC_NVFP4_MATERIALIZED_ENV, None)
+        else:
+            os.environ[_DYNAMIC_NVFP4_MATERIALIZED_ENV] = saved
+
+    def test_accepted_dense(self):
+        """Reference dense prefill satisfies both candidate and enabled."""
+        assert _nvfp4_dynamic_dense_candidate(**_dense_args()) is True
+        # Enabled requires the env flag (default OFF) + share_input.
+        assert _nvfp4_dynamic_materialized_enabled(**_enabled_args()) is False
+        os.environ[_DYNAMIC_NVFP4_MATERIALIZED_ENV] = "1"
+        assert _nvfp4_dynamic_materialized_enabled(**_enabled_args()) is True
+
+    def test_rejects_non_nvfp4(self):
+        # w4a8_mx is a valid quant_mode that is not nvfp4 → predicate False.
+        assert _nvfp4_dynamic_dense_candidate(**_dense_args(quant_mode="w4a8_mx")) is False
+        # w6a8_mx is also a valid non-nvfp4 mode.
+        assert _nvfp4_dynamic_dense_candidate(**_dense_args(quant_mode="w6a8_mx")) is False
+
+    def test_rejects_bad_activation(self):
+        assert _nvfp4_dynamic_dense_candidate(**_dense_args(activation="relu2")) is False
+
+    def test_rejects_k_not_divisible_by_128(self):
+        assert _nvfp4_dynamic_dense_candidate(**_dense_args(k=2047)) is False
+        assert _nvfp4_dynamic_dense_candidate(**_dense_args(k=2048)) is True
+
+    def test_rejects_n_not_divisible_by_128(self):
+        assert _nvfp4_dynamic_dense_candidate(**_dense_args(n=700)) is False
+        assert _nvfp4_dynamic_dense_candidate(**_dense_args(n=512)) is True
+
+    def test_rejects_deterministic_output(self):
+        assert _nvfp4_dynamic_dense_candidate(**_dense_args(deterministic_output=True)) is False
+
+    def test_rejects_non_shared_input_even_with_env(self):
+        """Without share_input_across_experts the enabled gate rejects even with env."""
+        os.environ[_DYNAMIC_NVFP4_MATERIALIZED_ENV] = "1"
+        # Predicate is satisfied (share_input is not a predicate check).
+        assert _nvfp4_dynamic_dense_candidate(**_dense_args()) is True
+        # But the enabled gate demands share_input.
+        args_on = _dense_args(share_input_across_experts=False)
+        assert _nvfp4_dynamic_materialized_enabled(**args_on) is False
+
+    def test_env_default_off(self):
+        """Without any env set, the enabled gate stays False."""
+        os.environ.pop(_DYNAMIC_NVFP4_MATERIALIZED_ENV, None)
+        assert _nvfp4_dynamic_materialized_enabled(**_enabled_args()) is False
+
+    def test_env_off_explicitly(self):
+        os.environ[_DYNAMIC_NVFP4_MATERIALIZED_ENV] = "0"
+        assert _nvfp4_dynamic_materialized_enabled(**_enabled_args()) is False
+
+
+class TestNvfp4SplitWorkspace:
+    """The plan-time workspace sizing for NVFP4 intermediate must cover
+    payload + scale planes: rows_padded * (n//128) * 72 bytes."""
+
+    @pytest.fixture(autouse=True)
+    def _env_backup(self):
+        saved = os.environ.get(_DYNAMIC_NVFP4_MATERIALIZED_ENV)
+        yield
+        if saved is None:
+            os.environ.pop(_DYNAMIC_NVFP4_MATERIALIZED_ENV, None)
+        else:
+            os.environ[_DYNAMIC_NVFP4_MATERIALIZED_ENV] = saved
+
+    def test_intermediate_bytes_sufficient(self):
+        os.environ[_DYNAMIC_NVFP4_MATERIALIZED_ENV] = "1"
+        plan = _plan_core_workspace(
+            implementation="b12x",
+            quant_mode="nvfp4",
+            state_E=8,
+            weight_E=8,
+            k=4096,
+            n=2048,
+            num_topk=2,
+            device=torch.device("cuda"),
+            dtype=torch.bfloat16,
+            routed_rows=256,
+            max_rows=512,
+        )
+        # The plan sets dynamic_physical_tiles and dynamic_tile_m.
+        tile_m = plan.dynamic_tile_m
+        phys_tiles = plan.dynamic_physical_tiles
+        assert phys_tiles is not None and tile_m is not None
+        rows_padded = phys_tiles * tile_m
+        needed = rows_padded * (plan.n // 128) * 72
+        for spec in plan.tensor_specs:
+            if spec.name == "materialized_intermediate":
+                elt = torch.tensor([], dtype=plan.dtype).element_size()
+                allocated = spec.shape[0] * spec.shape[1] * elt
+                assert allocated >= needed, f"NVFP4 intermediate allocated {allocated}B < needed {needed}B"
+                return
+        pytest.fail("materialized_intermediate tensor spec not found in plan")
