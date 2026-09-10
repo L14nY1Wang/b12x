@@ -16,6 +16,7 @@ from b12x.moe.fused_moe._impl import (
     _nvfp4_dynamic_materialized_enabled,
     _plan_core_workspace,
     _DYNAMIC_NVFP4_MATERIALIZED_ENV,
+    _DYNAMIC_WORK_SOURCE_ENV,
 )
 
 
@@ -87,6 +88,21 @@ class TestNvfp4SplitPredicate:
 
     def test_rejects_deterministic_output(self):
         assert _nvfp4_dynamic_dense_candidate(**_dense_args(deterministic_output=True)) is False
+
+    def test_tile_64_and_16(self):
+        """E=288 domains that drive the tile planner to 64 (accept) and
+        16 (reject): the split phase kernels only cover M64/M128 source tiles."""
+        big_e = dict(_dense_args(), num_experts=288)
+        assert _nvfp4_dynamic_dense_candidate(**{**big_e, "routed_rows": 80 * 288}) is True
+        assert _nvfp4_dynamic_dense_candidate(**{**big_e, "routed_rows": 10 * 288}) is False
+
+    def test_rejects_ready_queue_work_source(self):
+        """Streaming (ready_queue) work source is not supported by the split."""
+        os.environ[_DYNAMIC_WORK_SOURCE_ENV] = "ready_queue"
+        try:
+            assert _nvfp4_dynamic_dense_candidate(**_dense_args()) is False
+        finally:
+            os.environ.pop(_DYNAMIC_WORK_SOURCE_ENV, None)
 
     def test_rejects_non_shared_input_even_with_env(self):
         """Without share_input_across_experts the enabled gate rejects even with env."""
