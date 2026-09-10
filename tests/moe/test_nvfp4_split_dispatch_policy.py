@@ -65,9 +65,11 @@ class TestNvfp4SplitPredicate:
         assert _nvfp4_dynamic_materialized_enabled(**_enabled_args()) is True
         # Explicit toggle-off works.
         os.environ[_DYNAMIC_NVFP4_MATERIALIZED_ENV] = "0"
+        _nvfp4_materialized_env_refresh()
         assert _nvfp4_dynamic_materialized_enabled(**_enabled_args()) is False
         # Explicit toggle-on works.
         os.environ[_DYNAMIC_NVFP4_MATERIALIZED_ENV] = "1"
+        _nvfp4_materialized_env_refresh()
         assert _nvfp4_dynamic_materialized_enabled(**_enabled_args()) is True
 
     def test_rejects_non_nvfp4(self):

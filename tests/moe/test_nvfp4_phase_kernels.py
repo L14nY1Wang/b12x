@@ -670,11 +670,15 @@ def test_nvfp4_phase_frozen_resolution_two_counts() -> None:
     require_b12x()
     domain_a = _build_domain(E=8, K=256, n=128, m=64, top_k=2, seed=15)
     domain_b = _build_domain(E=8, K=256, n=128, m=256, top_k=2, seed=16)
-    # Ensure distinct live task counts despite shared compiled callables.
-    assert domain_a["phys_tiles"] != domain_b["phys_tiles"], (
-        f"domains must have different phys_tiles for a live-count test: "
+    # The compiled callable is capacity-specialized: sharing one callable
+    # requires the same physical-tile capacity.  The shared-callable claim is
+    # about LIVE task counts, which differ (128 vs 512 routed rows), so the
+    # capacities must match while the written work must not.
+    assert domain_a["phys_tiles"] == domain_b["phys_tiles"], (
+        f"shared-callable test requires equal capacity: "
         f"{domain_a['phys_tiles']} vs {domain_b['phys_tiles']}"
     )
+    assert domain_a["rows_capacity"] == domain_b["rows_capacity"]
     compiled_p1 = _compile_phase1(domain_a)
     compiled_p2 = _compile_phase2(domain_a)
 
@@ -688,11 +692,14 @@ def test_nvfp4_phase_frozen_resolution_two_counts() -> None:
     metrics_b = compare_to_reference(out_b.float(), domain_b["oracle"])
     assert metrics_b.cos > 0.9999, metrics_b
     assert out_b.abs().sum().item() > 0
-    # Phase tails (beyond the smaller domain's written region) must differ
-    # because domain_b writes more intermediate rows than domain_a.
-    tail_len = min(64, intermediate_a.numel(), intermediate_b.numel())
-    assert not torch.equal(intermediate_a[-tail_len:], intermediate_b[-tail_len:]), (
-        "intermediate tails should differ: domain_b writes more rows"
+    # The live routing materialized strictly more rows for domain_b, so it must
+    # leave strictly more nonzero intermediate words (payload + scale planes)
+    # while sharing the same compiled callable.
+    written_a = int((intermediate_a != 0).sum())
+    written_b = int((intermediate_b != 0).sum())
+    assert written_b > written_a, (
+        f"larger live count must write more intermediate words: "
+        f"b={written_b} vs a={written_a}"
     )
 
 
