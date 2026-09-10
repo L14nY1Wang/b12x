@@ -260,7 +260,7 @@ class Nvfp4MaterializedPhase2Kernel:
         intermediate_tiles: Int32,
         output_n128_tiles: Int32,
     ):
-        lane = tid & Int32(32 - 1)
+        lane = tid & Int32(31)
         q = lane >> Int32(2)
         c = lane & Int32(3)
 
@@ -359,10 +359,11 @@ class Nvfp4MaterializedPhase2Kernel:
                         + Int32(4) * c
                         + Int32(16) * (r >> Int32(1))
                     )
-                # The SFA word of lane 4q+c covers SF_A row 4*((4q+c)%8) +
-                # (4q+c)//8: rows 0..7 ride lanes with c in {0, 1}; lanes
-                # with c in {2, 3} hold SF words the hardware ignores for
-                # this atom (clamped to a live row).
+                # The SFA word of lane 4q+c covers SF_A row q + 8*(c&1):
+                # rows 0..7 ride lanes with c in {0, 2} and rows 8..15 ride
+                # lanes with c in {1, 3}; the c in {2, 3} lanes re-read the
+                # c in {0, 1} words (clamped to a live row) which the
+                # hardware ignores for this atom.
                 sf_row = Int32(16) * Int32(blk) + (lane >> Int32(2)) + Int32(
                     8
                 ) * (lane & Int32(1))

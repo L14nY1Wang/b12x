@@ -321,10 +321,6 @@ def _build_domain(*, E: int, K: int, n: int, m: int, top_k: int, seed: int):
     }
 
 
-def _fake_ptr_i32():
-    return make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
-
-
 def _compile_phase1(domain, *, spec_name="tests.nvfp4_phase_kernels.p1"):
     kernel = Nvfp4MaterializedPhase1Kernel(source_tile_m=_TILE_M)
     E, K, n = domain["E"], domain["K"], domain["n"]
@@ -543,7 +539,7 @@ def test_nvfp4_phase_chain_small() -> None:
     """Full phase1->phase2 chain vs the NVFP4 oracle (E=8, K=256, I=128)."""
     require_b12x()
     domain = _build_domain(E=8, K=256, n=128, m=64, top_k=2, seed=11)
-    out, intermediate = _run_phases(domain)
+    out, _ = _run_phases(domain)
     assert out.abs().sum().item() > 0, "kernel produced all zeros"
     metrics = compare_to_reference(out.float(), domain["oracle"])
     assert metrics.cos > 0.9999, metrics
@@ -591,7 +587,6 @@ def test_nvfp4_phase_intermediate_matches_torch() -> None:
     from b12x._lib.intrinsics import FLOAT8_E4M3_MAX, fp4_quantize_values_torch
 
     worst = 0.0
-    worst_cos = 1.0
     checked = 0
     for pair in range(domain["m"] * domain["top_k"]):
         t = pair // domain["top_k"]
@@ -606,7 +601,6 @@ def test_nvfp4_phase_intermediate_matches_torch() -> None:
         _, inter_q, _ = _quantize_nvfp4_rows(inter, 1.0)
         phys = int(domain["phys_of_pair"][pair])
         # decode device payload+scale for this row
-        dev_vals = []
         row_bytes = payload[phys]  # [n//2]
         # sf_plane is already sliced past the payload plane, so the byte
         # offset of (it, phys) is relative to the scale-plane base.

@@ -40,7 +40,6 @@ from b12x._lib.intrinsics import (
     cp_async4_shared_global,
     cp_async_u32_shared_global,
     fabs_f32,
-    fmax_f32,
     get_ptr_as_int64,
     ld_shared_bf16_to_f32,
     ld_shared_u32,
@@ -95,8 +94,6 @@ class Nvfp4MaterializedPhase1Kernel:
         *,
         fast_math: bool = False,
         source_tile_m: int = 128,
-        deterministic_output: bool = False,
-        num_topk: int = 1,
         activation: str = "silu",
     ):
         if source_tile_m not in (64, 128):
@@ -111,10 +108,6 @@ class Nvfp4MaterializedPhase1Kernel:
         self.fast_math = bool(fast_math)
         self.source_tile_m = int(source_tile_m)
         self.source_halves = self.source_tile_m // self.tile_m
-        self.deterministic_output = bool(deterministic_output)
-        if int(num_topk) <= 0:
-            raise ValueError(f"num_topk must be positive, got {num_topk}")
-        self.num_topk = int(num_topk)
 
     @cute.jit
     def __call__(
@@ -165,14 +158,12 @@ class Nvfp4MaterializedPhase1Kernel:
         scale_storage: cute.Tensor,
         w13_b_u32: cute.Tensor,
         sfb_w13: cute.Tensor,
-        token_map: cute.Tensor,
         smem_base: Int32,
         tid: Int32,
         source_m_tile: Int32,
         m_half: Int32,
         expert_idx: Int32,
         output_tile: Int32,
-        valid_rows: Int32,
         k64_slice: Int32,
         input_k128_tiles: Int32,
         intermediate_tiles: Int32,
@@ -192,11 +183,11 @@ class Nvfp4MaterializedPhase1Kernel:
         )
         words_per_token = input_k128_tiles * Int32(16)
 
-        # A payload: 64 rows x two 16-byte vectors per K64 slice.  The
-        # route/pack front-end materializes one row per routed physical row
-        # (expert-major), so phase1 reads it at the physical row directly.
-        # Invalid tail rows may read row zero safely; no output is published
-        # for them.  Pool-scaled physical-row offsets stay Int64.
+        # A payload: 64 rows x two 16-byte vectors per K64 slice.  Every row
+        # within the tile (including tail rows past valid_rows) is read; the
+        # front-end zero-pads the tile's physical rows through the 128-row
+        # atom, so out-of-range reads stay in-bounds.  No output is published
+        # for tail rows.  Pool-scaled physical-row offsets stay Int64.
         for i in cutlass.range_constexpr(
             (self.tile_m * 2 + self.threads_per_cta - 1) // self.threads_per_cta
         ):
@@ -321,7 +312,6 @@ class Nvfp4MaterializedPhase1Kernel:
         w13_b_u32: cute.Tensor,
         sfb_w13: cute.Tensor,
         intermediate_u32: cute.Tensor,
-        token_map: cute.Tensor,
         alpha: cute.Tensor,
         global_scale: cute.Tensor,
         smem_base: Int32,
@@ -346,14 +336,12 @@ class Nvfp4MaterializedPhase1Kernel:
             scale_storage,
             w13_b_u32,
             sfb_w13,
-            token_map,
             smem_base,
             tid,
             source_m_tile,
             m_half,
             expert_idx,
             output_tile,
-            valid_rows,
             Int32(0),
             input_k128_tiles,
             intermediate_tiles,
@@ -397,14 +385,12 @@ class Nvfp4MaterializedPhase1Kernel:
                     scale_storage,
                     w13_b_u32,
                     sfb_w13,
-                    token_map,
                     smem_base,
                     tid,
                     source_m_tile,
                     m_half,
                     expert_idx,
                     output_tile,
-                    valid_rows,
                     next_slice,
                     input_k128_tiles,
                     intermediate_tiles,
@@ -423,9 +409,12 @@ class Nvfp4MaterializedPhase1Kernel:
             # byte 4*c (+16 for reg 1) of staged weight row q.  A staged
             # K64 row is exactly 32 linear bytes, so k maps directly to
             # byte 4*c + 16*(half) + 4*(n//2) -- no swizzle needed.
-            # SFA word of lane L covers SF_A row 4*(L%8) + L//8; SFB word of
-            # lane L covers SF_B col L//4.
-            u_col = lane >> Int32(2)
+            # SFA word of lane L (q = L>>2, c = L&3) covers SF_A row
+            # q + 8*(c&1): the hardware reads rows 0..7 from lanes with
+            # c in {0, 2} and rows 8..15 from lanes with c in {1, 3}; the
+            # c in {2, 3} words duplicate the c in {0, 1} rows and are
+            # ignored by the instruction.  SFB word of lane L covers SF_B
+            # col L//4.
 
             # B fragments: per warp-local n8 group g (cols 8*(4*warp + g)).
             # Each staged weight row r holds the K64 slice linearly; the
@@ -478,10 +467,11 @@ class Nvfp4MaterializedPhase1Kernel:
                         + Int32(4) * c
                         + Int32(16) * (r >> Int32(1))
                     )
-                # The SFA word of lane 4q+c covers SF_A row 4*((4q+c)%8) +
-                # (4q+c)//8: rows 0..7 ride lanes with c in {0, 1}; lanes
-                # with c in {2, 3} hold SF words the hardware ignores for
-                # this atom (clamped to a live row).
+                # The SFA word of lane 4q+c covers SF_A row q + 8*(c&1):
+                # rows 0..7 ride lanes with c in {0, 2} and rows 8..15 ride
+                # lanes with c in {1, 3}; the c in {2, 3} lanes re-read the
+                # c in {0, 1} words (clamped to a live row) which the
+                # hardware ignores for this atom.
                 sf_row = Int32(16) * Int32(blk) + (lane >> Int32(2)) + Int32(
                     8
                 ) * (lane & Int32(1))
@@ -695,7 +685,6 @@ class Nvfp4MaterializedPhase1Kernel:
                     w13_b_u32,
                     sfb_w13,
                     intermediate_u32,
-                    token_map,
                     alpha,
                     global_scale,
                     smem_base,

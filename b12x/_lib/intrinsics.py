@@ -3969,10 +3969,11 @@ def nvfp4_mma_m16n8k64_f32_e2m1(
       row; regs 0/2 cover rows q (k halves 0/1) and regs 1/3 rows q+8, and
       the lane's c index selects the 8-value k group within each half.
     - B reg ``j`` nibble ``n`` holds ``B[q, 32*j + 8*c + n]`` (col = q).
-    - The SFA scale word of lane ``L`` holds ``SF_A[4*(L%8) + L//8, 0..3]``
-      packed into bytes 0..3 (rows 0..7 ride lanes 0, 4, ..., 28; rows
-      8..15 ride lanes 1, 5, ..., 29; lanes with ``L%4`` in {2, 3} are
-      ignored by the hardware).
+    - The SFA scale word of lane ``L`` carries the byte-scaled UE4M3 group
+      for one A row: rows 0..7 ride lanes 0, 4, ..., 28 (``L%4 == 0``), rows
+      8..15 ride lanes 1, 5, ..., 29 (``L%4 == 1``), and lanes with ``L%4``
+      in {2, 3} are ignored by the hardware.  Equivalently, for ``q = L>>2``
+      and ``c = L&3`` the row index is ``q + 8*(c&1)``.
     - The SFB scale word of lane ``L`` holds ``SF_B[L//4, 0..3]`` (all 32
       lanes valid; the hardware reads the word from lane ``4*col``).
     - Accumulator: ``d0 = D[q, 2c]``, ``d1 = D[q, 2c+1]``,

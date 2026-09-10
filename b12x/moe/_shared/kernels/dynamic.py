@@ -880,15 +880,18 @@ class MoEDynamicKernelBackend:
         self.nvfp4_split_materialized = bool(
             quant_recipe == "nvfp4"
             and self.materialize_intermediate
-            and mma_tiler_mn in {(64, 128), (128, 128)}
+            and mma_tiler_mn == (128, 128)
             and not self.w4a8_repacked
         )
-        # Dense M64/M128 retains this kernel as a routing/input-quantization
-        # front-end. Compact stream-ordered M64xN128 kernels compute FC1/FC2
-        # through the existing caller-owned MXFP8 workspace.  The split
+        # Dense M128 retains this kernel as a routing/input-quantization
+        # front-end.  Compact stream-ordered M128xN128 kernels compute FC1/FC2
+        # through the existing caller-owned materialized workspace.  The split
         # removes both GEMM bodies from the routing kernel's register/shared
         # union and is graph-safe: every grid is fixed from preplanned launch
-        # capacity and no host value is read between launches.
+        # capacity and no host value is read between launches.  The M64 source
+        # tile is deliberately NOT admitted: the phase kernels' 64-row
+        # multi-tile specialization is not yet validated and is known-wrong on
+        # multi-tile experts, so those shapes keep the monolithic path.
         self.external_materialized_fc1 = bool(
             self.w4a8_split_materialized or self.nvfp4_split_materialized
         )
@@ -911,8 +914,6 @@ class MoEDynamicKernelBackend:
             self.materialized_phase1_kernel = Nvfp4MaterializedPhase1Kernel(
                 fast_math=self.fast_math,
                 source_tile_m=materialized_source_tile_m,
-                deterministic_output=bool(deterministic_output),
-                num_topk=self.num_topk,
                 # The materialize_intermediate gate below only admits SiLU
                 # for nvfp4 splits, so self.activation is always the kernel's
                 # supported specialization here.
@@ -992,7 +993,7 @@ class MoEDynamicKernelBackend:
         nvfp4_materialized_ok = bool(
             quant_recipe == "nvfp4"
             and not self.w4a8_repacked
-            and mma_tiler_mn in {(64, 128), (128, 128)}
+            and mma_tiler_mn == (128, 128)
             and self.activation == "silu"
             and self.is_gated
             and share_input_across_experts

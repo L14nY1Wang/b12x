@@ -89,11 +89,16 @@ class TestNvfp4SplitPredicate:
     def test_rejects_deterministic_output(self):
         assert _nvfp4_dynamic_dense_candidate(**_dense_args(deterministic_output=True)) is False
 
-    def test_tile_64_and_16(self):
-        """E=288 domains that drive the tile planner to 64 (accept) and
-        16 (reject): the split phase kernels only cover M64/M128 source tiles."""
+    def test_rejects_tile_64_and_16(self):
+        """E=288 domains that drive the tile planner to 64 and 16 are both
+        rejected: the split phase kernels are validated only for the M128
+        source tile (the 64-row multi-tile path is known-wrong)."""
         big_e = dict(_dense_args(), num_experts=288)
-        assert _nvfp4_dynamic_dense_candidate(**{**big_e, "routed_rows": 80 * 288}) is True
+        # routed_rows >= 96*E -> tile 128 (accepted)
+        assert _nvfp4_dynamic_dense_candidate(**{**big_e, "routed_rows": 128 * 288}) is True
+        # routed_rows in [48*E, 96*E) -> tile 64 (now rejected, not validated)
+        assert _nvfp4_dynamic_dense_candidate(**{**big_e, "routed_rows": 80 * 288}) is False
+        # routed_rows < 48*E -> tile 16 (rejected)
         assert _nvfp4_dynamic_dense_candidate(**{**big_e, "routed_rows": 10 * 288}) is False
 
     def test_rejects_ready_queue_work_source(self):
@@ -165,7 +170,7 @@ class TestNvfp4SplitWorkspace:
         tile_m = plan.dynamic_tile_m
         phys_tiles = plan.dynamic_physical_tiles
         assert phys_tiles is not None and tile_m is not None
-        assert tile_m in {64, 128}, tile_m  # split predicate requires 64/128
+        assert tile_m == 128, tile_m  # split predicate requires the validated M128 tile
         rows_padded = phys_tiles * tile_m
         needed = rows_padded * (plan.n // 128) * 72
         for spec in plan.tensor_specs:
