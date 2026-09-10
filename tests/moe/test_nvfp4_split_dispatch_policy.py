@@ -59,10 +59,17 @@ class TestNvfp4SplitPredicate:
         _nvfp4_materialized_env_refresh()
 
     def test_accepted_dense(self):
-        """Reference dense prefill satisfies both candidate and enabled
-        (auto-on for matching shapes after measured win)."""
+        """Reference dense prefill satisfies both candidate and enabled.
+
+        ``_nvfp4_dynamic_materialized_enabled`` auto-enables matching
+        structural and ``share_input_across_experts`` arguments when
+        ``B12X_NVFP4_DYNAMIC_MATERIALIZED`` is unset, so establish that
+        default explicitly instead of relying on the inherited process env.
+        """
+        os.environ.pop(_DYNAMIC_NVFP4_MATERIALIZED_ENV, None)
+        _nvfp4_materialized_env_refresh()
         assert _nvfp4_dynamic_dense_candidate(**_dense_args()) is True
-        # Default auto-on: predicate + share_input → enabled without env.
+        # Default auto-on: predicate + share_input → enabled when env is unset.
         assert _nvfp4_dynamic_materialized_enabled(**_enabled_args()) is True
         # Explicit toggle-off works.
         os.environ[_DYNAMIC_NVFP4_MATERIALIZED_ENV] = "0"
@@ -107,11 +114,15 @@ class TestNvfp4SplitPredicate:
 
     def test_rejects_ready_queue_work_source(self):
         """Streaming (ready_queue) work source is not supported by the split."""
+        saved = os.environ.get(_DYNAMIC_WORK_SOURCE_ENV)
         os.environ[_DYNAMIC_WORK_SOURCE_ENV] = "ready_queue"
         try:
             assert _nvfp4_dynamic_dense_candidate(**_dense_args()) is False
         finally:
-            os.environ.pop(_DYNAMIC_WORK_SOURCE_ENV, None)
+            if saved is None:
+                os.environ.pop(_DYNAMIC_WORK_SOURCE_ENV, None)
+            else:
+                os.environ[_DYNAMIC_WORK_SOURCE_ENV] = saved
 
     def test_rejects_non_shared_input_even_with_env(self):
         """Without share_input_across_experts the enabled gate rejects even with env."""

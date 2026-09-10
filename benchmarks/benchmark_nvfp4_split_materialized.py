@@ -29,6 +29,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shlex
 import statistics
 import subprocess
 import sys
@@ -61,14 +62,18 @@ def _git(*args: str) -> str:
 
 
 def _source_hashes() -> dict[str, str]:
+    """Hash the MEASURED artifacts plus this orchestrator.
+
+    Validation tests are deliberately excluded: the receipt pins the identity
+    of the kernels and host adapter it timed, not the harness that gates them,
+    so refining a test does not invalidate a recorded measurement.
+    """
     tracked = [
         "b12x/moe/_shared/kernels/dynamic.py",
         "b12x/moe/_shared/kernels/nvfp4_phase1.py",
         "b12x/moe/_shared/kernels/nvfp4_phase2.py",
         "b12x/moe/fused_moe/_impl.py",
         "b12x/_lib/intrinsics.py",
-        "tests/moe/test_nvfp4_phase_kernels.py",
-        "tests/moe/test_nvfp4_split_backend.py",
         "benchmarks/benchmark_nvfp4_split_materialized.py",
     ]
     out = {}
@@ -197,13 +202,17 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required")
 
+    # Record a repository-root invocation with argument boundaries preserved:
+    # ``argv`` keeps the exact token list, ``command`` is its shell-quoted
+    # rendering, so paths containing spaces round-trip unambiguously.
+    script_rel = os.path.relpath(Path(sys.argv[0]).resolve(), ROOT)
+    argv = ["python", script_rel, *sys.argv[1:]]
     report = {
         "schema": "b12x.moe.nvfp4_split_materialized.benchmark",
         "version": 1,
         "generated_utc": datetime.now(timezone.utc).isoformat(),
-        "command": " ".join(
-            [Path(sys.argv[0]).name, *sys.argv[1:]]
-        ),
+        "argv": argv,
+        "command": shlex.join(argv),
         "commit": _git("rev-parse", "HEAD"),
         "commit_short": _git("rev-parse", "--short", "HEAD"),
         "worktree_status": _git("status", "--porcelain") or "clean",

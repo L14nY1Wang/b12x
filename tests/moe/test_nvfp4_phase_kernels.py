@@ -29,6 +29,10 @@ from tests._reference.helpers import require_b12x
 
 _TILE_M = 128
 _TILE_N = 128
+# Physical tile base that drives live row-scaled offsets past 2^31.  With
+# n=128 the intermediate payload stride is 16 u32 per row, so a live row id
+# above 2^31/16 is required; the extra tiles give a safety margin.
+_INT32_BOUNDARY_TILE_BASE = (2**31 // 16) // _TILE_M + 1024
 
 
 def _fake_i32(shape):
@@ -128,17 +132,22 @@ def _swizzle_scale_plane(scale_f32: torch.Tensor, rows: int) -> torch.Tensor:
     return flat
 
 
-def _route_domain(m, E, top_k, topk_ids):
+def _route_domain(m, E, top_k, topk_ids, tile_base=0):
     """Expert-major physical-row assignment mirroring the front-end contract.
 
     Experts occupy consecutive physical 128-row tiles; each routed pair
     claims the next free row of its expert; tasks are published as
     (source tile, intermediate tile) slots with per-slot valid-row counts.
+
+    ``tile_base`` shifts every expert's first physical tile to a high index.
+    The live rows then carry large physical row ids while only their tail of
+    the pool is written, which is how the Int64 offset contract is exercised
+    without allocating the untouched prefix.
     """
     row_counts = [0] * E
     for pair in range(m * top_k):
         row_counts[int(topk_ids.reshape(-1)[pair])] += 1
-    expert_tile_base = [0]
+    expert_tile_base = [tile_base]
     for e in range(E):
         tiles = (row_counts[e] + _TILE_M - 1) // _TILE_M
         expert_tile_base.append(expert_tile_base[-1] + tiles)
@@ -159,7 +168,8 @@ def _route_domain(m, E, top_k, topk_ids):
     return expert_tile_base, phys_tiles, rows_capacity, token_map, token_weights
 
 
-def _build_domain(*, E: int, K: int, n: int, m: int, top_k: int, seed: int):
+def _build_domain(*, E: int, K: int, n: int, m: int, top_k: int, seed: int,
+                  tile_base: int = 0):
     """Build synthetic weights + routed inputs + the expert-major domain."""
     from b12x.moe._shared.kernels.reference import moe_reference_nvfp4
 
@@ -218,7 +228,7 @@ def _build_domain(*, E: int, K: int, n: int, m: int, top_k: int, seed: int):
         rows_capacity,
         token_map_list,
         _,
-    ) = _route_domain(m, E, top_k, topk_ids)
+    ) = _route_domain(m, E, top_k, topk_ids, tile_base=tile_base)
 
     # token weights + physical row per pair
     token_map = torch.tensor(token_map_list, dtype=torch.int32, device=device)
@@ -259,8 +269,12 @@ def _build_domain(*, E: int, K: int, n: int, m: int, top_k: int, seed: int):
     # both directly by physical row; token_map is only used for FC2 scatter.
     packed_a = torch.zeros(rows_capacity * K // 2, dtype=torch.uint8, device=device)
     k4 = K // 64
+    # One F8_128x4 atom per 128 physical rows carries k4*512 bytes, so the
+    # single activation SFA plane is (rows_capacity//128)*k4*512 bytes.  The
+    # swizzle writes at (phys//128)*(k4*512) + ... and phase1 reads at
+    # sf_atom*(k4*512) + ...; both stay inside this exact extent.
     scale_flat = torch.zeros(
-        ((rows_capacity + 127) // 128) * 128 * k4 * 512,
+        ((rows_capacity + 127) // 128) * k4 * 512,
         dtype=torch.uint8,
         device=device,
     )
@@ -400,37 +414,20 @@ def _compile_phase2(domain, *, spec_name="tests.nvfp4_phase_kernels.p2"):
     )
 
 
-def _allocate_intermediate(domain, *, big_offset: bool):
-    """Allocate the intermediate workspace; optionally park it past 2^31.
+def _allocate_intermediate(domain):
+    """Allocate the intermediate workspace for the domain's full capacity.
 
     The phase1 kernel writes both payload and scale planes into one contiguous
     buffer: payload [rows_capacity * (n//128) * 16] u32 followed by scale
-    [(n//128) * rows_capacity * 2] u32.  One pool covers both.
+    [(n//128) * rows_capacity * 2] u32.  One pool covers both.  A high-``tile_base``
+    domain keeps its live rows in this pool's tail; the untouched prefix is
+    still allocated so the kernel's own row-scaled offsets stay in bounds.
     """
     rows_capacity = domain["rows_capacity"]
     intermediate_tiles = domain["intermediate_tiles"]
     words_per_row = intermediate_tiles * 16
     total_elements = rows_capacity * words_per_row + intermediate_tiles * rows_capacity * 2
-    if big_offset:
-        # Pool base parked past 2^31/stride so the kernel must use Int64
-        # arithmetic to compute the correct pointer.  Kernel-computed
-        # element offsets stay well below 2^31 for this synthetic domain
-        # (rows_capacity ~ hundreds); this test covers high base addresses
-        # only, not live kernel-generated offsets past the Int32 boundary.
-        pool_pad = 1 << 31  # elements (u32 words)
-        pool = torch.zeros(
-            pool_pad + total_elements,
-            dtype=torch.int32,
-            device="cuda",
-        )
-        intermediate_u32 = pool[pool_pad:]
-        return intermediate_u32, intermediate_u32, pool, None
-    intermediate_u32 = torch.zeros(
-        total_elements,
-        dtype=torch.int32,
-        device="cuda",
-    )
-    return intermediate_u32, intermediate_u32, None, None
+    return torch.zeros(total_elements, dtype=torch.int32, device="cuda")
 
 
 def _launch_phase1(compiled, domain, intermediate_u32, alpha_t, gs_t):
@@ -475,13 +472,11 @@ def _launch_phase2(compiled, domain, intermediate_u32, down_alpha_t, scatter_out
     )
 
 
-def _run_phases(domain, *, compiled_p1=None, compiled_p2=None, big_offset=False,
+def _run_phases(domain, *, compiled_p1=None, compiled_p2=None,
                 scatter_output=None):
     E = domain["E"]
     ones = torch.ones(E, device="cuda")
-    intermediate_u32, _sf, _pool_a, _pool_b = _allocate_intermediate(
-        domain, big_offset=big_offset
-    )
+    intermediate_u32 = _allocate_intermediate(domain)
     if compiled_p1 is None:
         compiled_p1 = _compile_phase1(domain)
     if compiled_p2 is None:
@@ -575,7 +570,7 @@ def test_nvfp4_phase_intermediate_matches_torch() -> None:
     domain = _build_domain(E=8, K=256, n=128, m=64, top_k=2, seed=13)
     E = domain["E"]
     ones = torch.ones(E, device="cuda")
-    intermediate_u32, _, _, _ = _allocate_intermediate(domain, big_offset=False)
+    intermediate_u32 = _allocate_intermediate(domain)
     compiled_p1 = _compile_phase1(domain)
     _launch_phase1(compiled_p1, domain, intermediate_u32, ones, ones)
     torch.cuda.synchronize()
@@ -646,22 +641,56 @@ def test_nvfp4_phase_intermediate_matches_torch() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_nvfp4_phase_big_offset_int64() -> None:
-    """High base addresses past 2^31 must not overflow Int32.
+def test_nvfp4_phase_live_row_beyond_int32_offset() -> None:
+    """A live physical row whose scaled pool offset exceeds 2^31 stays correct.
 
-    The pool base is parked past the 2^31/stride boundary so address
-    arithmetic in the kernel converts to Int64.  The synthetic domain
-    (E=4, K=256, n=128, M=64) keeps kernel-computed element offsets
-    well below 2^31 (rows_capacity ~ hundreds); this test covers high
-    *base* addresses only and does not exercise kernel-generated offsets
-    past the Int32 boundary.
+    The phase kernels scale a physical row id into pool offsets
+    (``physical_row * words_per_row`` for the payload, ``sf_atom * k4 * 512``
+    for the scale plane).  Parking the live domain at a high ``tile_base`` makes
+    those kernel-computed products cross the Int32 boundary while only the tail
+    of each pool is written, so Int32 truncation in either phase kernel would
+    corrupt the output.  Shifting merely the base pointer of a small pool does
+    not exercise the kernels' own offset math, so this test does not do that.
     """
     require_b12x()
-    domain = _build_domain(E=4, K=256, n=128, m=64, top_k=2, seed=14)
-    out, _ = _run_phases(domain, big_offset=True)
-    assert out.abs().sum().item() > 0
+    K = n = 128
+    m, top_k, E = 8, 1, 2
+    # Upper bound on the pools this domain allocates, so a smaller GPU skips
+    # instead of OOM-ing.  Live rows sit in the tail; the prefix is allocated.
+    rows_capacity = (_INT32_BOUNDARY_TILE_BASE + E) * _TILE_M
+    words_per_row = (n // _TILE_N) * 16
+    required_bytes = (
+        rows_capacity * (K // 2)  # packed_a
+        + (rows_capacity // _TILE_M) * (K // 64) * 512  # scale_flat
+        + rows_capacity * words_per_row * 4  # intermediate payload
+        + (n // _TILE_N) * rows_capacity * 2 * 4  # intermediate scale plane
+        + rows_capacity * 4 * 2  # token_map + token_weights
+    )
+    free_bytes, _ = torch.cuda.mem_get_info()
+    if free_bytes < required_bytes + 2 * 1024**3:
+        pytest.skip(
+            "Int32-boundary live-row test requires "
+            f"{required_bytes + 2 * 1024**3} bytes free, found {free_bytes}"
+        )
+    domain = _build_domain(
+        E=E, K=K, n=n, m=m, top_k=top_k, seed=17, tile_base=_INT32_BOUNDARY_TILE_BASE
+    )
+    assert domain["intermediate_tiles"] == 1, "premise: one intermediate tile"
+    max_live_phys = int(domain["phys_of_pair"].max())
+    # Prove the domain actually crosses the boundary the kernels must survive.
+    assert max_live_phys * words_per_row > 2**31, (
+        f"live intermediate offset does not exceed 2^31: "
+        f"{max_live_phys} * {words_per_row} = {max_live_phys * words_per_row}"
+    )
+    assert max_live_phys * (K // 2) > 2**31, (
+        "live activation byte offset must also exceed 2^31"
+    )
+    out, _ = _run_phases(domain)
+    assert out.abs().sum().item() > 0, "kernel produced all zeros"
     metrics = compare_to_reference(out.float(), domain["oracle"])
     assert metrics.cos > 0.9999, metrics
+    bound = _bf16_output_bound(domain["oracle"])
+    assert metrics.rmse <= bound, (metrics, bound)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
