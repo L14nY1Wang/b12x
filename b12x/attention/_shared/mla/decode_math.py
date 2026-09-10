@@ -1459,20 +1459,45 @@ def _nvfp4_pair_bfloat2(
     staged per candidate into the contiguous kv_sc buffer by the IO gather
     (record bytes [292, 296)).
     """
-    data_byte = _ld_u8_zext(
-        kv_fp4_base_addr,
-        entry * Int32(kv_smem_stride) + (dim_even // Int32(2)),
-    )
-    vals_h2 = fp4_decode_2(data_byte)
-    v0, v1 = f16x2_to_f32x2(vals_h2)
-    scale_group = dim_even // Int32(_NVFP4_SCALE_GROUP)
-    scale_byte = _ld_u8_zext(
-        kv_fp4_base_addr,
-        entry * Int32(kv_smem_stride) + Int32(_NVFP4_SCALE_OFFSET) + scale_group,
-    )
-    scale_f = cvt_e4m3_to_f32_via_f16(scale_byte)
+    swa = Int32(0)
+    if cutlass.const_expr(kv_smem_stride == 544):
+        # DSV41's sources share a staging layout, never a cache ABI.
+        swa = ld_shared_u32(
+            kv_fp4_base_addr + entry * Int32(544) + Int32(528)
+        ).to(Int32)
+    v0 = Float32(0.0)
+    v1 = Float32(0.0)
+    scale_f = Float32(0.0)
+    if swa == Int32(1):
+        v0 = cvt_e4m3_to_f32_via_f16(
+            _ld_u8_zext(kv_fp4_base_addr, entry * Int32(kv_smem_stride) + dim_even)
+        )
+        v1 = cvt_e4m3_to_f32_via_f16(
+            _ld_u8_zext(kv_fp4_base_addr, entry * Int32(kv_smem_stride) + dim_even + Int32(1))
+        )
+        scale_f = _ue8m0_byte_to_fp32(
+            _ld_u8_zext(
+                kv_fp4_base_addr,
+                entry * Int32(kv_smem_stride) + Int32(512) + dim_even // Int32(32),
+            )
+        )
+    elif swa == Int32(0):
+        data_byte = _ld_u8_zext(
+            kv_fp4_base_addr,
+            entry * Int32(kv_smem_stride) + (dim_even // Int32(2)),
+        )
+        vals_h2 = fp4_decode_2(data_byte)
+        v0, v1 = f16x2_to_f32x2(vals_h2)
+        scale_group = dim_even // Int32(_NVFP4_SCALE_GROUP)
+        scale_byte = _ld_u8_zext(
+            kv_fp4_base_addr,
+            entry * Int32(kv_smem_stride) + Int32(_NVFP4_SCALE_OFFSET) + scale_group,
+        )
+        scale_f = cvt_e4m3_to_f32_via_f16(scale_byte)
     outer = latent_scale
-    if cutlass.const_expr(latent_scale_per_token):
+    if cutlass.const_expr(kv_smem_stride == 544):
+        outer = Float32(1.0)
+    elif cutlass.const_expr(latent_scale_per_token):
         outer = ld_shared_f32(kv_sc_base_addr + entry * Int32(4))
     # This is the single NVFP4 decode dequant point shared by QK and P.V.
     # Apply the outer scale before BF16 packing so both MMAs consume the same

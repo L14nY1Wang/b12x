@@ -62,6 +62,7 @@ from .decode_math import (
     _d2_load_b_fp8,
     _exp2_approx_ftz_f32,
     _ld_u8_zext,
+    _nvfp4_pair_bfloat2,
     _ue8m0_zext_byte_to_fp32,
     ld_shared_f32,
     s0_quantize_q_to_smem,
@@ -835,6 +836,11 @@ def _nvfp4_pair_bfloat2_mg(
     ``latent_scale_per_token`` -- the record's own fp32 second-level scale
     ([292, 296)), staged per candidate into kv_sc by the MG IO gather.
     """
+    if cutlass.const_expr(kv_smem_stride == 544):
+        return _nvfp4_pair_bfloat2(
+            kv_fp4_base_addr, entry, dim_even, Float32(1.0),
+            kv_smem_stride=kv_smem_stride,
+        )
     data_byte = _ld_u8_zext(
         kv_fp4_base_addr,
         entry * Int32(kv_smem_stride) + (dim_even // Int32(2)),
@@ -2374,7 +2380,7 @@ class UnifiedPrefillMGKernel:
         # Q-rope registerized (aliased onto W_FP8). DSV4 is the scale_format==0 /
         # has_extra arm and is byte-identical.
         is_glm = cutlass.const_expr(
-            t.model_type in (ModelType.GLM_NSA, ModelType.GLM_NEXT)
+            t.model_type in (ModelType.GLM_NSA, ModelType.GLM_NEXT, ModelType.DSV41)
         )
         has_rope = cutlass.const_expr(t.d_rope > 0)
         # NVFP4 (E2M1 + E4M3 group-16) GLM-family arm: BF16-QK with native
@@ -2572,6 +2578,7 @@ class UnifiedPrefillMGKernel:
                         has_rope=has_rope,
                         per_token_latent_scale=t.latent_scale_per_token,
                         kv_sc_dst_addr=kv_sc_addr,
+                        dsv41=t.model_type == ModelType.DSV41,
                     )
                 else:
                     io_issue_gather_dsv4_nope(
@@ -2626,6 +2633,7 @@ class UnifiedPrefillMGKernel:
                                 bi=t.bi,
                                 kv_smem_stride=L.kv_smem_stride,
                                 io_threads=_PREFILL_IO_THREADS,
+                                dsv41_swa=False,
                             )
                         else:
                             g_start = next_lc * Int32(_CAND_WINDOW)
@@ -2673,6 +2681,7 @@ class UnifiedPrefillMGKernel:
                                 has_rope=has_rope,
                                 per_token_latent_scale=t.latent_scale_per_token,
                                 kv_sc_dst_addr=kv_sc_addr + buf * kv_sc_buf,
+                                dsv41=t.model_type == ModelType.DSV41,
                             )
                         else:
                             io_issue_gather_dsv4_nope(
@@ -2722,7 +2731,7 @@ class UnifiedPrefillMGKernel:
                     n_hg=n_hg,
                     valid_hpb=self.valid_hpb,
                 )
-                if cutlass.const_expr(is_nvfp4):
+                if cutlass.const_expr(is_nvfp4 and has_rope):
                     # NVFP4 QK-RoPE uses the GLM B-operand packing, so keep the
                     # Q-rope A operands as the GLM-style register ARRAYS (not
                     # the DSV4 scalar snapshot). W_FP8 is then free for the
@@ -2743,7 +2752,7 @@ class UnifiedPrefillMGKernel:
                     else:
                         q_rope_regs1 = q_rope_regs0  # never read when n_hg==1.
                     cute.arch.barrier(barrier_id=2, number_of_threads=self.math_threads)
-                elif cutlass.const_expr(not reload_bf16_qrope):
+                elif cutlass.const_expr(not is_nvfp4 and not reload_bf16_qrope):
                     (
                         q000,
                         q001,
@@ -2983,23 +2992,24 @@ class UnifiedPrefillMGKernel:
                         latent_scale_per_token=t.latent_scale_per_token,
                         kv_sc_base_addr=kv_sc_b,
                     )
-                    qk0, qk1 = s2_qk_rope_regs_mg_glm(
-                        qk0,
-                        qk1,
-                        q_rope_regs0,
-                        q_rope_regs1,
-                        rope_cache,
-                        index_base_ptr,
-                        warp_first_cand,
-                        lane,
-                        rope_pbs,
-                        rope_stride,
-                        d_rope=t.d_rope,
-                        n_hg=n_hg,
-                        valid_hpb=self.valid_hpb,
-                        scale_format=t.scale_format,
-                        fp8_rope=t.fp8_rope,
-                    )
+                    if cutlass.const_expr(has_rope):
+                        qk0, qk1 = s2_qk_rope_regs_mg_glm(
+                            qk0,
+                            qk1,
+                            q_rope_regs0,
+                            q_rope_regs1,
+                            rope_cache,
+                            index_base_ptr,
+                            warp_first_cand,
+                            lane,
+                            rope_pbs,
+                            rope_stride,
+                            d_rope=t.d_rope,
+                            n_hg=n_hg,
+                            valid_hpb=self.valid_hpb,
+                            scale_format=t.scale_format,
+                            fp8_rope=t.fp8_rope,
+                        )
                 elif cutlass.const_expr(bf16_qk):
                     if cutlass.const_expr(reload_bf16_qrope):
                         # Tile 0 consumes the S0 copy. S6 overwrites the aliased
@@ -4198,6 +4208,7 @@ def run_unified_prefill_mg(
         ModelType.DSV4: _DSV4_HEAD_DIM,
         ModelType.GLM_NSA: _GLM_HEAD_DIM,
         ModelType.GLM_NEXT: _GLM_NEXT_HEAD_DIM,
+        ModelType.DSV41: 512,
     }.get(model_type)
     if expected_qdim is None:
         raise ValueError(f"unsupported sparse MLA model_type={model_type}")
@@ -4257,12 +4268,15 @@ def run_unified_prefill_mg(
         attn_sink_t = topk_length.view(torch.float32)[:1]
 
     if stride_kv_block is None:
-        stride_kv_block = _cache_block_stride_bytes(
-            kv_cache,
-            page_size=int(page_block_size),
-            is_glm=bool(is_glm),
-            record_bytes=int(traits.kv_gmem_stride),
-        )
+        if model_type == ModelType.DSV41:
+            stride_kv_block = int(kv_cache.stride(0)) * kv_cache.element_size()
+        else:
+            stride_kv_block = _cache_block_stride_bytes(
+                kv_cache,
+                page_size=int(page_block_size),
+                is_glm=bool(is_glm),
+                record_bytes=int(traits.kv_gmem_stride),
+            )
 
     q = q.contiguous()
     topk_indices = topk_indices.contiguous()
@@ -4279,11 +4293,14 @@ def run_unified_prefill_mg(
         # its per-token length. row_xor = (pbs_extra == 2) (FI USE_WFP8_ROW_XOR).
         pbs_extra = int(extra_page_block_size)
         if stride_extra_kv_block is None:
-            stride_extra_kv_block = _cache_block_stride_bytes(
-                extra_kv_cache,
-                page_size=pbs_extra,
-                is_glm=False,
-            )
+            if model_type == ModelType.DSV41:
+                stride_extra_kv_block = int(extra_kv_cache.stride(0)) * extra_kv_cache.element_size()
+            else:
+                stride_extra_kv_block = _cache_block_stride_bytes(
+                    extra_kv_cache,
+                    page_size=pbs_extra,
+                    is_glm=False,
+                )
         extra_topk = int(extra_indices.shape[1])
         num_extra_tiles = (extra_topk + _CAND_WINDOW - 1) // _CAND_WINDOW
         num_tiles = num_main_tiles + num_extra_tiles

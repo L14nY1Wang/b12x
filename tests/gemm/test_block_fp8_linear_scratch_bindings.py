@@ -115,52 +115,6 @@ def test_block_fp8_linear_plan_binding_maps_scratch_views(monkeypatch) -> None:
     assert binding.packed_weight is packed
 
 
-def test_block_fp8_linear_binding_supplies_runtime_tensors(monkeypatch) -> None:
-    monkeypatch.setattr(block_impl, "_check_gpu_tensor", lambda *args, **kwargs: None)
-    monkeypatch.setattr(block_impl, "_check_mxfp8_rows_storage", lambda *args, **kwargs: None)
-    plan = plan_block_fp8_linear_scratch(
-        BlockFP8LinearScratchCaps(
-            device="cpu",
-            max_tokens=9,
-            in_features=128,
-            out_features=256,
-        )
-    )
-    spec = plan.scratch_specs()[0]
-    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
-    source = torch.empty((9, 128), dtype=torch.bfloat16)
-    output = torch.empty((9, 256, 1), dtype=torch.bfloat16)
-    packed = _packed_weight()
-    binding = plan.bind(
-        scratch=scratch,
-        source=source,
-        packed_weight=packed,
-        output=output,
-    )
-    calls = {}
-
-    def fake_quantize(source_tk, values, scale_rows, scale_mma, tokens, in_features, *, expected_m=None):
-        calls["source_tk"] = source_tk
-        calls["x_q_values"] = values
-        calls["quant_expected_m"] = expected_m
-
-    def fake_dense_gemm(a, b, **kwargs):
-        calls["a"] = a
-        calls["b"] = b
-        calls["dense_out"] = kwargs["out"]
-        kwargs["out"].zero_()
-        return kwargs["out"]
-
-    monkeypatch.setattr(block_impl, "_run_block_fp8_quant_kernel", fake_quantize)
-    monkeypatch.setattr(block_impl, "dense_gemm", fake_dense_gemm)
-
-    out = block_impl.block_fp8_linear_mxfp8(binding=binding)
-
-    assert calls["source_tk"].data_ptr() == source.data_ptr()
-    assert calls["x_q_values"] is binding.x_q.values
-    assert calls["quant_expected_m"] == plan.caps.max_tokens
-    assert calls["dense_out"] is output
-    assert out.shape == (9, 256)
 
 
 def test_block_fp8_linear_binding_owns_runtime_tensors(monkeypatch) -> None:

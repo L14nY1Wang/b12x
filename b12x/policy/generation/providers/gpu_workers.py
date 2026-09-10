@@ -1410,6 +1410,8 @@ def _compressed_cache(
     page_size: int,
     device: object,
     generator: object,
+    cache_format: str = "deepseek_v4",
+    cache_kind: str = "swa",
 ):
     import torch
 
@@ -1418,6 +1420,20 @@ def _compressed_cache(
         COMPRESSED_SPARSE_MLA_ROPE_DIM,
         pack_compressed_sparse_mla_kv_cache_reference,
     )
+    if cache_format == "deepseek_v41":
+        from b12x.attention._shared.mla.compressed_reference import (
+            pack_deepseek_v41_cache_reference,
+        )
+
+        kv = torch.randn(
+            (tokens, 512), dtype=torch.bfloat16, device=device, generator=generator,
+        )
+        # Independent source/group scales, including all last-64 coordinates.
+        groups = torch.linspace(0.02, 0.3, 32, device=device).repeat_interleave(16)
+        kv.mul_(groups * (4.0 if cache_kind == "indexed" else 1.0))
+        return pack_deepseek_v41_cache_reference(
+            kv, page_size=page_size, cache_kind=cache_kind,
+        )
 
     k_nope = torch.randn(
         (tokens, COMPRESSED_SPARSE_MLA_NOPE_DIM),
@@ -1493,7 +1509,8 @@ class _SparseMlaSession(AbstractContextManager["_SparseMlaSession"]):
             torch.cuda.get_device_capability(self._context.device_ordinal)
         )
         uses_single_pass = str(query["mode"]) != "decode" or (
-            capability == (12, 1)
+            str(query["cache_format"]) == "deepseek_v4"
+            and capability == (12, 1)
             and rows >= 16
             and int(query["num_q_heads"]) == 32
             and int(query["swa_page_size"]) == 64
@@ -1549,6 +1566,8 @@ class _SparseMlaSession(AbstractContextManager["_SparseMlaSession"]):
             page_size=swa_page_size,
             device=device,
             generator=generator,
+            cache_format=str(query["cache_format"]),
+            cache_kind="swa",
         )
         swa_indices = _sparse_indices(
             rows=rows,
@@ -1572,6 +1591,8 @@ class _SparseMlaSession(AbstractContextManager["_SparseMlaSession"]):
                 page_size=indexed_page_size,
                 device=device,
                 generator=generator,
+                cache_format=str(query["cache_format"]),
+                cache_kind="indexed",
             )
             indexed_indices = _sparse_indices(
                 rows=rows,
@@ -1639,6 +1660,7 @@ class _SparseMlaSession(AbstractContextManager["_SparseMlaSession"]):
                     max_batch=rows,
                     page_size=int(query["swa_page_size"]),
                     layout=str(query["layout"]),
+                    cache_format=str(query["cache_format"]),
                     mode=str(query["mode"]),
                     swa_width=int(query["swa_width"]),
                     indexed_width=int(query["indexed_width"]),
@@ -1788,6 +1810,7 @@ class _SparseMlaSession(AbstractContextManager["_SparseMlaSession"]):
                 inputs.swa_indices,
                 inputs.swa_lengths,
                 sm_scale=1.0 / math.sqrt(COMPRESSED_SPARSE_MLA_HEAD_DIM),
+                cache_format=str(query["cache_format"]),
                 extra_k_cache=inputs.indexed_cache,
                 extra_indices=inputs.indexed_indices,
                 extra_topk_lengths=inputs.indexed_lengths,

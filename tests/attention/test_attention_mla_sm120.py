@@ -608,54 +608,32 @@ def test_dsv4_compressed_decode_routes_to_sm120_and_matches_reference(
 
 @torch.inference_mode()
 @pytest.mark.parametrize("mode", ["extend", "verify", "draft_extend"])
-def test_dsv4_compressed_prefill_mode_routes_to_unified_prefill(
-    monkeypatch, mode
-) -> None:
-    """DSV4 compressed contract in a prefill-like mode routes
-    compressed_sparse_mla_decode_forward to SM120 sparse MLA.run_unified_prefill (single-pass
-    DSV4 prefill), NOT run_unified_decode."""
+def test_dsv4_compressed_prefill_mode_routes_to_unified_prefill(mode) -> None:
     device = require_b12x_sparse_mla()
-    routed = {"prefill": 0, "decode": 0}
-
-    def fake_run_unified_prefill(*, q, output=None, **kwargs):
-        del kwargs
-        routed["prefill"] += 1
-        if output is not None:
-            output.zero_()
-            out = output
-        else:
-            out = q[:, :, :_DSV4_HEAD_DIM].clone()
-        lse = torch.zeros(q.shape[0], q.shape[1], dtype=torch.float32, device=q.device)
-        return out, lse
-
-    def fake_run_unified_decode(**kwargs):
-        routed["decode"] += 1
-        raise AssertionError("prefill mode must not route to decode")
-
-    import b12x.attention._shared.mla.kernel as unified_pkg
-
-    monkeypatch.setattr(unified_pkg, "run_unified_prefill", fake_run_unified_prefill)
-    monkeypatch.setattr(unified_pkg, "run_unified_decode", fake_run_unified_decode)
-
-    topk = 64
-    q, cache, idx, lengths = _make_dsv4_compressed_case(device, topk=topk, seed=topk)
-    scratch = _make_dsv4_scratch(device, topk=topk, max_chunks=8)
-    # Mark the scratch prefill-like (the mode gate is what selects the prefill route;
-    # the materialized scratch mode is mutable).
+    topk = 512
+    q, cache, indices, lengths = _make_dsv4_compressed_case(
+        device, topk=topk, seed=topk
+    )
+    scratch = _make_dsv4_scratch(
+        device, topk=topk, max_chunks=8
+    )
     scratch.mode = mode
-
-    out = compressed_sparse_mla_decode_forward(
+    output = compressed_sparse_mla_decode_forward(
         q_all=q,
         swa_k_cache=cache,
-        swa_indices=idx,
+        swa_indices=indices,
         swa_topk_lengths=lengths,
         workspace=scratch,
         sm_scale=_DSV4_SM_SCALE,
         swa_page_size=_DSV4_PAGE,
     )
-    assert out.shape == (1, _DSV4_HEADS, _DSV4_HEAD_DIM)
-    assert routed["prefill"] == 1
-    assert routed["decode"] == 0
+    expected = compressed_sparse_mla_reference(
+        q, cache, indices, lengths, sm_scale=_DSV4_SM_SCALE,
+        swa_page_size=_DSV4_PAGE,
+    )
+    torch.testing.assert_close(output.float(), expected.float(), atol=2e-2, rtol=2e-2)
+
+
 
 
 @torch.inference_mode()
@@ -1116,7 +1094,9 @@ def test_unified_decode_dual_cache_matches_extra_ref(
 
 @torch.inference_mode()
 @pytest.mark.parametrize("topk", [128, 512])
-def test_unified_prefill_dual_cache_80_heads_split_tail_matches_extra_ref(topk: int) -> None:
+def test_unified_prefill_dual_cache_80_heads_split_tail_matches_extra_ref(
+    topk: int,
+) -> None:
     """DSV4 dual-cache prefill heads=80 uses the split MG path (64-head paired
     prefix + 16-head tail) and matches the PyTorch extra-cache oracle."""
     device = require_b12x_sparse_mla()
@@ -1260,7 +1240,9 @@ def test_unified_prefill_dual_cache_matches_extra_ref(
         rtol=2.0e-2,
     )
     cos = _cosine(got, expected)
-    assert cos > 0.999, f"DSV4 dual-cache prefill topk={topk} heads={num_heads} O cos={cos}"
+    assert cos > 0.999, (
+        f"DSV4 dual-cache prefill topk={topk} heads={num_heads} O cos={cos}"
+    )
     assert (got - expected).abs().max().item() < 2e-2
 
 
@@ -1754,7 +1736,9 @@ def test_unified_decode_glm_multitoken_per_token_length(num_tokens) -> None:
 
 @torch.inference_mode()
 @pytest.mark.parametrize("num_tokens", [1, 4])
-@pytest.mark.parametrize("high_page_ids", [False, True], ids=["low-pages", "high-pages"])
+@pytest.mark.parametrize(
+    "high_page_ids", [False, True], ids=["low-pages", "high-pages"]
+)
 def test_unified_decode_glm_serial_chunks_rescale_late_maximum(
     num_tokens, high_page_ids
 ) -> None:
@@ -1851,7 +1835,9 @@ def test_unified_decode_glm_serial_chunks_rescale_late_maximum(
         plan = plan_sparse_mla_scratch(caps)
         (spec,) = plan.scratch_specs()
         storage = torch.zeros(spec.shape, dtype=spec.dtype, device=device)
-        cache_seqlens = torch.full((num_tokens,), s_kv, dtype=torch.int32, device=device)
+        cache_seqlens = torch.full(
+            (num_tokens,), s_kv, dtype=torch.int32, device=device
+        )
         binding = plan.bind(
             scratch=storage,
             q=q,

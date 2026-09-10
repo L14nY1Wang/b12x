@@ -610,7 +610,7 @@ def bind(
     if _overlaps(scratch_storage, out):
         raise ValueError("mutable scratch and out must not overlap")
     if disk_table is not None:
-        disk_table._frozen = True
+        disk_table._freeze()
     return Binding(
         plan=plan,
         scratch=scratch_storage,

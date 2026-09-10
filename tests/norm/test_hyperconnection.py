@@ -1412,3 +1412,162 @@ def test_torch_compile_rejects_dynamic_input_aliasing_bound_output() -> None:
     compiled(projected_down)
     with pytest.raises(ValueError, match="bottleneck must not overlap projected_down"):
         compiled(binding.bottleneck)
+
+
+def test_stateless_swiglu_asymmetric_clamp_and_vision_rounding():
+    device = require_sm120()
+    gate = torch.tensor(
+        [-20.0, -2.0, -0.5, 0.5, 1.5, 20.0], device=device, dtype=torch.bfloat16,
+    )
+    up = torch.tensor(
+        [20.0, -20.0, 1.75, 1.75, -1.75, 20.0], device=device, dtype=torch.bfloat16,
+    )
+    gate_up = torch.cat((gate, up)).reshape(1, -1)
+    out = torch.empty(1, gate.numel(), device=device, dtype=torch.bfloat16)
+    hc.run_swiglu(gate_up, limit=2.0, out=out)
+    expected = (
+        F.silu(gate.float().clamp(max=2.0)) * up.float().clamp(-2.0, 2.0)
+    ).bfloat16().reshape_as(out)
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    # The negative gate remains -20, rather than being symmetrically clamped.
+    assert out[0, 0].abs() < 1e-6
+
+    # Sweep exactly representable BF16 values, including rounding boundaries.
+    gates = torch.linspace(-4, 4, 1024, device=device).bfloat16().reshape(1, -1)
+    ups = torch.full_like(gates, 1.75)
+    merged = torch.cat((gates, ups), dim=1)
+    shared = torch.empty_like(gates)
+    vision = torch.empty_like(gates)
+    hc.run_swiglu(merged, limit=float("inf"), out=shared)
+    hc.run_swiglu(merged, limit=float("inf"), out=vision, round_silu=True)
+    expected_shared = (F.silu(gates.float()) * ups.float()).bfloat16()
+    expected_vision = F.silu(gates) * ups
+    torch.testing.assert_close(shared, expected_shared, rtol=0, atol=0)
+    torch.testing.assert_close(vision, expected_vision, rtol=0, atol=0)
+    assert bool((expected_shared != expected_vision).any())
+
+
+@pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32])
+def test_stateless_add_retains_fp32_before_cancellation(output_dtype):
+    device = require_sm120()
+    left = torch.tensor([[256.5, -256.5, 0.00390625]], device=device)
+    right = torch.tensor([[-256.0, 256.0, 1.0]], device=device, dtype=torch.bfloat16)
+    out = torch.empty_like(left, dtype=output_dtype)
+    result = hc.run_add(left, right, out=out)
+    assert result.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out, (left + right.float()).to(output_dtype), rtol=0, atol=0)
+    assert out[0, 0] == 0.5 and out[0, 1] == -0.5
+
+
+def test_stateless_tails_frozen_live_counts_and_graph_mutation(request):
+    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+
+    device = require_sm120()
+    capacity, width = 9, 257
+    gate_up = torch.randn(capacity, 2 * width, device=device, dtype=torch.bfloat16)
+    residual = torch.randn(capacity, width, device=device, dtype=torch.bfloat16)
+    routed = torch.randn(capacity, width, device=device)
+    shared = torch.empty_like(residual)
+    vision = torch.empty_like(residual)
+    added = torch.empty_like(residual)
+    vision_added = torch.empty_like(residual)
+    confidence = torch.empty_like(routed)
+
+    def launch(rows):
+        hc.run_swiglu(gate_up[:rows], limit=2.0, out=shared[:rows])
+        hc.run_swiglu(
+            gate_up[:rows], limit=float("inf"), out=vision[:rows], round_silu=True,
+        )
+        hc.run_add(routed[:rows], shared[:rows], out=added[:rows])
+        hc.run_add(residual[:rows], vision[:rows], out=vision_added[:rows])
+        hc.run_sigmoid(routed[:rows], out=confidence[:rows])
+
+    launch(capacity)
+    torch.cuda.synchronize(device)
+    request.addfinalizer(unfreeze_kernel_resolution)
+    freeze_kernel_resolution("stateless activation/add live row reuse")
+    outputs = (shared, vision, added, vision_added, confidence)
+    pointers = tuple(t.data_ptr() for t in outputs)
+    for rows in (0, 1, 7, capacity):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            launch(rows)
+        gate_up.add_(0.125)
+        routed.add_(0.25)
+        residual.add_(0.5)
+        for tensor in outputs:
+            tensor.fill_(float("nan"))
+        allocations = torch.cuda.memory_stats(device)["allocation.all.allocated"]
+        graph.replay()
+        torch.cuda.synchronize(device)
+        assert torch.cuda.memory_stats(device)["allocation.all.allocated"] == allocations
+        assert tuple(t.data_ptr() for t in outputs) == pointers
+        gate, up = gate_up[:rows].chunk(2, dim=1)
+        shared_ref = (
+            F.silu(gate.float().clamp(max=2.0)) * up.float().clamp(-2.0, 2.0)
+        ).bfloat16()
+        vision_ref = F.silu(gate) * up
+        references = (
+            shared_ref,
+            vision_ref,
+            (routed[:rows] + shared_ref.float()).bfloat16(),
+            (residual[:rows].float() + vision_ref.float()).bfloat16(),
+            routed[:rows].sigmoid(),
+        )
+        for actual, expected in zip(outputs, references, strict=True):
+            torch.testing.assert_close(actual[:rows], expected, rtol=1e-5, atol=0.008)
+            assert bool(torch.isnan(actual[rows:]).all())
+
+
+def test_ordinary_rmsnorm_preserves_fp32_weights_and_pointer_abi(request):
+    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+
+    device = require_sm120()
+    capacity, streams, hidden = 7, 4, 256
+    width = streams * hidden
+    binding = _allocate_binding(
+        device=device, tokens=capacity, hidden_size=hidden, streams=streams, lowrank=16,
+    )
+    state = torch.linspace(-2.0, 3.0, capacity * width, device=device).reshape(
+        capacity, width,
+    ).bfloat16()
+    weights = torch.linspace(0.9931, 1.0137, width, device=device)
+    rounded = weights.bfloat16()
+    assert bool((weights != rounded.float()).any())
+
+    def launch(rows, weight):
+        live = binding.plan.bind(
+            tokens=rows, normalized=binding.normalized_capacity,
+            bottleneck=binding.bottleneck_capacity, block_input=binding.block_input_capacity,
+        )
+        return hc.run_grouped_rmsnorm(
+            state[:rows], weight, eps=1e-6, binding=live, zero_centered=False,
+        )
+
+    # Warming both dtypes must produce distinct pointer-ABI specializations.
+    launch(capacity, rounded)
+    launch(capacity, weights)
+    torch.cuda.synchronize(device)
+    request.addfinalizer(unfreeze_kernel_resolution)
+    freeze_kernel_resolution("ordinary RMSNorm BF16/FP32 weight ABI")
+    for rows in (1, 3, capacity):
+        for weight in (rounded, weights):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                output = launch(rows, weight)
+            state.add_(0.03125)
+            weight.add_(0.0003)
+            graph.replay()
+            grouped = state[:rows].float().reshape(rows, streams, hidden)
+            normalized = (
+                grouped * torch.rsqrt(grouped.square().mean(-1, keepdim=True) + 1e-6)
+            ).reshape(rows, width)
+            expected = (normalized * weight.float()).bfloat16()
+            torch.testing.assert_close(output, expected, rtol=0, atol=0.0001)
+            if weight.dtype == torch.float32:
+                rounded_expected = (normalized * weight.bfloat16().float()).bfloat16()
+                assert bool((output != rounded_expected).any())
+    with pytest.raises(ValueError, match="dtype"):
+        hc.run_grouped_rmsnorm(
+            state, weights, eps=1e-6, binding=binding, zero_centered=True,
+        )

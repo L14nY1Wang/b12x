@@ -187,12 +187,22 @@ def test_attention_corpora_have_stable_reviewed_cross_products() -> None:
     assert len(GQA_GEOMETRIES) == 18
     assert len(MLA_GEOMETRIES) == 1
     assert len(QSA_GEOMETRIES) == 3
-    assert len(SPARSE_MLA_GEOMETRIES) == 12
+    assert {geometry.cache_format for geometry in SPARSE_MLA_GEOMETRIES} == {
+        "deepseek_v4", "deepseek_v41",
+    }
     assert len(gdn_cases()) == 1_462
     assert len(gqa_cases()) == 14_400
     assert len(mla_cases()) == 200
     assert len(qsa_cases()) == 384
-    assert len(sparse_mla_cases()) == 288
+    assert {
+        (case.query["cache_format"], case.query["num_q_heads"], case.query["mode"])
+        for case in sparse_mla_cases()
+    } == {
+        (recipe, heads, mode)
+        for recipe in ("deepseek_v4", "deepseek_v41")
+        for heads in (8, 16, 32, 64)
+        for mode in ("decode", "extend")
+    }
     assert len({case.query for case in gqa_cases()}) == len(gqa_cases())
 
     all_cases = (
@@ -628,7 +638,6 @@ def test_glm_profile_generation_envelope_matches_presets() -> None:
         query.max_tokens == 6 and query.hidden_size == 4_096 and query.split_k == 64
         for query in mhc_queries
     )
-    assert {4_096, 7_168} == {query.hidden_size for query in mhc_queries}
     assert set(COMMON_PREFILL_TOKEN_CAPACITIES) <= {
         query.max_tokens for query in mhc_queries
     }

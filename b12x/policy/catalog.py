@@ -14,11 +14,13 @@ from .components import (
     COMPRESSED_SPARSE_MLA_ATTENTION,
     DSA_INDEXER,
     EP_MOE,
+    ENGRAM,
     GDN_ATTENTION,
     GQA_ATTENTION,
     HYPERCONNECTION,
     MHC,
     MLA_ATTENTION,
+    MLA_COMPRESS,
     MOE_DECODE,
     MTP_FEEDBACK,
     NVFP4_QUANTIZATION,
@@ -153,6 +155,13 @@ PLANNING_COMPONENTS = (
         ),
     ),
     PlanningComponentRegistration(
+        op_qualname="attention.mla_compress",
+        mode=PlanningPolicyMode.PROFILED,
+        component_id=MLA_COMPRESS,
+        policy_ref="b12x.attention.mla_compress._policy:MLA_COMPRESS_POLICY",
+        generator_ref="b12x.attention.mla_compress._generator:MlaCompressGenerator",
+    ),
+    PlanningComponentRegistration(
         op_qualname="attention.paged",
         mode=PlanningPolicyMode.PROFILED,
         component_id=GQA_ATTENTION,
@@ -263,6 +272,13 @@ PLANNING_COMPONENTS = (
             "b12x.policy.generation.providers.tunable:"
             "Nvfp4QuantizationGenerator"
         ),
+    ),
+    PlanningComponentRegistration(
+        op_qualname="sequence.engram",
+        mode=PlanningPolicyMode.PROFILED,
+        component_id=ENGRAM,
+        policy_ref="b12x.sequence.engram._policy:ENGRAM_POLICY",
+        generator_ref="b12x.policy.generation.providers.engram:EngramGenerator",
     ),
     PlanningComponentRegistration(
         op_qualname="sequence.gdn_decode",

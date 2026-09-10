@@ -407,6 +407,7 @@ class CompressedSparseMlaAttentionGenerator(_AttentionGenerator):
             component_id=COMPRESSED_SPARSE_MLA_ATTENTION,
             query_fields=(
                 "layout",
+                "cache_format",
                 "mode",
                 "q_dtype",
                 "kv_dtype",
@@ -424,6 +425,8 @@ class CompressedSparseMlaAttentionGenerator(_AttentionGenerator):
             corpus_name="sparse_mla",
             geometry_count=len(SPARSE_MLA_GEOMETRIES),
             benchmark_factory=benchmark_factory or SparseMlaBenchmarkFactory(),
+            query_schema_version=2,
+            candidate_contract_version=2,
         )
 
 

@@ -7,6 +7,8 @@
 - ``gdn_prefill``: chunked scalar-gated GDN prefill over the state pool.
 - ``kda_prefill``: chunked lower-bounded KDA prefill over the state pool.
 - ``mtp_feedback``: MTP token/multi-stream feedback fusion.
+- ``engram``: compressed-token n-gram hashes and row-sharded FP8 table lookup.
+- ``embedding``: exact unquantized token-row lookup with caller-owned output.
 """
 
 from __future__ import annotations
@@ -22,6 +24,8 @@ _OP_MODULES = (
     "kda_prefill",
     "gdn_prefill",
     "mtp_feedback",
+    "engram",
+    "embedding",
 )
 
 

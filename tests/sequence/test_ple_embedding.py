@@ -865,7 +865,7 @@ def test_disk_preparation_matches_resident_and_graph_consumes_only_output(
         raise AssertionError("consumer graph must not issue disk I/O")
 
     with monkeypatch.context() as patch:
-        patch.setattr(table._native, "ple_reader_run", forbidden_read)
+        patch.setattr(table._cache._native, "ple_reader_run", forbidden_read)
         graph.replay()
         torch.testing.assert_close(consumed, expected * 2, rtol=0, atol=0)
         # Reject before making any CUDA calls that could invalidate capture.
@@ -904,14 +904,6 @@ def test_disk_compact_rows_preserve_duplicates_and_tp_shard_boundaries(
     )
     binding.num_tokens.fill_(4)
     binding._ids.copy_(ids)
-    table.ids_host.copy_(ids)
-    table._native.ple_reader_run(
-        table._reader,
-        table._ids_buffer,
-        table._weight_buffer,
-        table._scale_buffer,
-        ids.numel(),
-    )
     from b12x.sequence.ple_embedding._kernels import (
         _launch_bf16_lookup,
         _launch_fp8_lookup,
@@ -930,18 +922,20 @@ def test_disk_compact_rows_preserve_duplicates_and_tp_shard_boundaries(
         plan.shard_start,
         plan.shard_end,
     )
-    if quant_mode == "bf16":
-        _launch_bf16_lookup(table.weight, *args, compact_rows=True)
-    elif quant_mode == "fp8_e4m3_per_tensor":
-        _launch_fp8_lookup(table.weight, binding.weight_scale, *args, compact_rows=True)
-    else:
-        _launch_nvfp4_lookup(
-            table.weight,
-            table.weight_scale,
-            binding.weight_scale_2,
-            *args,
-            compact_rows=True,
-        )
+    with table._cache.transaction():
+        table._cache.read_rows(binding._ids, ids.numel())
+        if quant_mode == "bf16":
+            _launch_bf16_lookup(table.weight, *args, compact_rows=True)
+        elif quant_mode == "fp8_e4m3_per_tensor":
+            _launch_fp8_lookup(table.weight, binding.weight_scale, *args, compact_rows=True)
+        else:
+            _launch_nvfp4_lookup(
+                table.weight,
+                table.weight_scale,
+                binding.weight_scale_2,
+                *args,
+                compact_rows=True,
+            )
     expected = reference.lookup(
         oracle.weight,
         oracle.weight_scale,
@@ -956,7 +950,7 @@ def test_disk_compact_rows_preserve_duplicates_and_tp_shard_boundaries(
     stats = table.stats()
     assert stats["lookups"] == ids.numel()
     assert stats["cache_bytes"] == ids.numel() * (
-        table.weight_row_bytes + table.scale_row_bytes
+        table._cache.weight_row_bytes + table._cache.scale_row_bytes
     )
     # Multiple IDs within a shard share file blocks; unique reads must not
     # degenerate to one read per duplicate row.

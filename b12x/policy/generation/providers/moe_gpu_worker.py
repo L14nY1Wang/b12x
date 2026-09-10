@@ -150,6 +150,7 @@ def _packed_weights(
             mode=_activation_mode(geometry.recipe.quant_mode),
             nonlinearity=geometry.activation,
             io_dtype=torch.bfloat16,
+            numerical_recipe=geometry.recipe.numerical_recipe,
         ),
         geometry=fused_moe.MoEGeometry(
             num_experts=geometry.num_experts,
@@ -557,6 +558,17 @@ def _uniform_w4a8_mx_reference(
         checkpoint_input[..., 0::2].sum(dim=-1)
         - checkpoint_input[..., 1::2].sum(dim=-1)
     ) * effective_weight
+    if geometry.recipe.numerical_recipe == "deepseek_v41":
+        fc1 = fc1.to(torch.bfloat16).float()
+        gate = fc1.clamp(max=10.0)
+        up = fc1.clamp(-10.0, 10.0)
+        intermediate = (torch.nn.functional.silu(gate) * up)[:, None] * topk_weights.float()
+        intermediate = intermediate.to(torch.bfloat16).float()
+        scale = torch.exp2(torch.ceil(torch.log2(intermediate.abs().clamp_min(1.0e-4) / 448.0)))
+        intermediate = (intermediate / scale).to(torch.float8_e4m3fn).float() * scale
+        down = (intermediate * geometry.intermediate_size * effective_weight).to(torch.bfloat16).float()
+        down = torch.where((topk_ids >= 0) & (topk_ids < geometry.num_experts), down, 0.0)
+        return down.sum(dim=-1)[:, None].expand(-1, geometry.hidden_size).to(torch.bfloat16).contiguous()
     if is_gated_moe_activation(activation):
         intermediate = _apply_gated_activation(
             fc1,
@@ -720,6 +732,12 @@ def _candidates_for_geometry(
     sm_count: int,
 ) -> tuple[MoeCandidate, ...]:
     recipe = geometry.recipe
+    if recipe.numerical_recipe == "deepseek_v41":
+        return (MoeCandidate.create({
+            "backend": "dynamic", "dynamic_route_mode": "grouped",
+            "dynamic_tile_m": 64, "route_planner": "internal",
+            "max_active_clusters": None, "w4a16_route_mode": None,
+        }),)
     if recipe.quant_mode == "nvfp4_auto":
         from dataclasses import replace
         return tuple(

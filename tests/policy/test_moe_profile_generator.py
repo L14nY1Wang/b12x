@@ -116,13 +116,14 @@ def test_embedded_moe_profiles_and_heuristics_cover_corpus_queries(
             if query["quant_mode"] == "w4a16" and query["source_format"] == "modelopt_nvfp4":
                 # Native-layout measurements cannot qualify uniform MMA-packed A16.
                 assert hit is None, (profile.profile_id, query)
-                resolution = context.resolve(
-                    MOE_DECODE_POLICY, MoeDecodeQuery(**query),
-                )
+            resolution = context.resolve(
+                MOE_DECODE_POLICY, MoeDecodeQuery(**query),
+            )
+            if hit is None:
                 assert resolution.source is PolicySource.HEURISTIC
                 assert _config_covers_query(query, asdict(resolution.config))
                 continue
-            assert hit is not None, (profile.profile_id, query)
+            assert resolution.source is PolicySource.PREPLANNED
             assert _config_covers_query(query, hit.config), (
                 profile.profile_id,
                 query,
@@ -215,6 +216,7 @@ def test_profile_coverage_rejects_cross_family_backends(
 ) -> None:
     query = {
         "quant_mode": quant_mode,
+        "numerical_recipe": "default",
         "source_format": "modelopt_nvfp4",
         "activation": "silu",
         "num_experts": 256,
@@ -659,6 +661,7 @@ def test_w4a8_tuner_enumerates_micro_and_dynamic_tiles(
         geometry
         for geometry in expand_physical_geometries()
         if geometry.recipe.quant_mode == quant_mode
+        and geometry.recipe.numerical_recipe == "default"
     )
 
     configs = tuple(
@@ -732,6 +735,7 @@ def test_w4a8_tuner_filters_dynamic_specializations_by_real_support(
         geometry
         for geometry in expand_physical_geometries()
         if geometry.recipe.quant_mode == quant_mode
+        and geometry.recipe.numerical_recipe == "default"
         and geometry.activation == "silu"
     )
     cases = expand_sweep_cases(geometries=(geometry,))
@@ -1082,6 +1086,7 @@ def test_staged_moe_generator_keeps_regional_winners_and_resumes(tmp_path) -> No
     assert component is not None
     base_query = {
         "quant_mode": "nvfp4",
+        "numerical_recipe": "default",
         "source_format": "modelopt_nvfp4",
         "activation": "silu",
         "num_experts": 16,
@@ -1170,6 +1175,7 @@ def test_correctness_screen_uses_an_eligible_anchor_per_candidate(tmp_path) -> N
         component.lookup(
             {
                 "quant_mode": "nvfp4",
+                "numerical_recipe": "default",
                 "source_format": "modelopt_nvfp4",
                 "activation": "silu",
                 "num_experts": 16,
@@ -1257,6 +1263,7 @@ def test_prefill_capacities_are_measured_for_each_top_k(
             hit = component.lookup(
                 {
                     "quant_mode": "nvfp4",
+                    "numerical_recipe": "default",
                     "source_format": "modelopt_nvfp4",
                     "activation": "silu",
                     "num_experts": 16,
@@ -1274,6 +1281,7 @@ def test_prefill_capacities_are_measured_for_each_top_k(
 def test_sparse_token_capacity_coverage_matches_dense_reference(top_k: int) -> None:
     base_query = {
         "quant_mode": "nvfp4",
+        "numerical_recipe": "default",
         "source_format": "modelopt_nvfp4",
         "activation": "silu",
         "num_experts": 16,
@@ -1361,7 +1369,7 @@ def test_sparse_token_capacity_coverage_matches_dense_reference(top_k: int) -> N
                 "components": [
                     {
                         "component_id": "moe.decode",
-                        "query_schema_version": 4,
+                        "query_schema_version": 5,
                         "config_schema_version": 3,
                         "planner": decision_node_to_dict(planner),
                     }
@@ -1386,6 +1394,7 @@ def test_sparse_token_capacity_coverage_matches_dense_reference(top_k: int) -> N
 def test_sparse_token_coverage_preserves_dynamic_direct_boundary(top_k: int) -> None:
     base_query = {
         "quant_mode": "nvfp4",
+        "numerical_recipe": "default",
         "source_format": "modelopt_nvfp4",
         "activation": "silu",
         "num_experts": 256,

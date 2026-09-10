@@ -42,6 +42,7 @@ class _MXFP8RowsQuantLaunch:
         subgroup_width: int,
         threads: int,
         trellis_native_mma_order: bool,
+        min_amax: float,
     ) -> None:
         self._k = int(k)
         self._groups_k = self._k // 32
@@ -50,6 +51,7 @@ class _MXFP8RowsQuantLaunch:
         self._threads = int(threads)
         self._warps_per_cta = self._threads // 32
         self._trellis_native_mma_order = bool(trellis_native_mma_order)
+        self._min_amax = float(min_amax)
 
     @cute.jit
     def __call__(
@@ -125,6 +127,8 @@ class _MXFP8RowsQuantLaunch:
                             cute.arch.shuffle_sync_bfly(max_abs, offset=1 << shift),
                         )
 
+                    if cutlass.const_expr(self._min_amax > 0.0):
+                        max_abs = fmax_f32(max_abs, cutlass.Float32(self._min_amax))
                     _, scale_byte = pow2_ceil_ue8m0(
                         max_abs * cutlass.Float32(1.0 / FLOAT8_E4M3_MAX)
                     )
@@ -204,6 +208,8 @@ class _MXFP8RowsQuantLaunch:
                             cute.arch.shuffle_sync_bfly(max_abs, offset=1 << shift),
                         )
 
+                    if cutlass.const_expr(self._min_amax > 0.0):
+                        max_abs = fmax_f32(max_abs, cutlass.Float32(self._min_amax))
                     _, scale_byte = pow2_ceil_ue8m0(
                         max_abs * cutlass.Float32(1.0 / FLOAT8_E4M3_MAX)
                     )
@@ -233,6 +239,8 @@ class _MXFP8RowsQuantLaunch:
                     values[elem] = cutlass.Float32(source[row, k0 + Int32(elem)])
 
                 max_abs = max_abs_32(values)
+                if cutlass.const_expr(self._min_amax > 0.0):
+                    max_abs = fmax_f32(max_abs, cutlass.Float32(self._min_amax))
                 payload, scale_byte = quantize_block_fp8_mx(values, max_abs)
                 if max_abs == cutlass.Float32(0.0):
                     scale_byte = Uint32(127)
@@ -276,6 +284,7 @@ def _get_compiled_mxfp8_rows_quant(
     subgroup_width: int,
     threads: int,
     value_order: str,
+    min_amax: float = 0.0,
 ) -> Callable:
     k = int(k)
     if k <= 0 or k % 32 != 0:
@@ -307,12 +316,15 @@ def _get_compiled_mxfp8_rows_quant(
         raise ValueError(
             "trellis_native_mma MXFP8 ordering requires subgroup_width=8"
         )
+    if min_amax not in (0.0, 1e-4):
+        raise ValueError("MXFP8 min_amax must be 0.0 or 1e-4")
     launch = _MXFP8RowsQuantLaunch(
         k,
         source_type,
         subgroup_width,
         threads,
         value_order == "trellis_native_mma",
+        min_amax,
     )
     cache_key = (
         k,
@@ -320,6 +332,7 @@ def _get_compiled_mxfp8_rows_quant(
         int(subgroup_width),
         int(threads),
         value_order,
+        min_amax,
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile",
@@ -337,7 +350,7 @@ def _get_compiled_mxfp8_rows_quant(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "gemm.mxfp8_quant_cute",
-            3,
+            4,
             cache_key,
         ),
     )
@@ -403,6 +416,7 @@ def quantize_mxfp8_rows_cute(
     *,
     value_order: str = "linear",
     expected_m: int | None = None,
+    min_amax: float = 0.0,
 ) -> None:
     """Quantize contiguous BF16 rows into dense-GEMM MXFP8 layouts.
 
@@ -411,6 +425,7 @@ def quantize_mxfp8_rows_cute(
     scale groups and avoids a separate activation transpose kernel.
 
     expected_m fixes the row bound used for lane-layout specialization.
+    min_amax=1e-4 selects the DeepSeek V4.1 activation scale floor.
     """
 
     if source.dtype not in (torch.bfloat16, torch.float16):
@@ -434,6 +449,7 @@ def quantize_mxfp8_rows_cute(
         subgroup_width,
         threads,
         value_order,
+        min_amax,
     )(
         source,
         values,

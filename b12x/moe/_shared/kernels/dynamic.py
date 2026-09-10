@@ -713,8 +713,19 @@ class MoEDynamicKernelBackend:
         trellis_bits: int | None = None,
         trellis_coupled: bool = False,
         trellis_direct_lut: bool = False,
+        numerical_recipe: str = "default",
     ):
         activation = normalize_moe_activation(activation)
+        self.deepseek_v41 = numerical_recipe == "deepseek_v41"
+        if numerical_recipe not in {"default", "deepseek_v41"}:
+            raise ValueError(f"unsupported numerical_recipe {numerical_recipe!r}")
+        if self.deepseek_v41 and not (
+            quant_recipe == "w4a8_mx" and activation == "silu"
+            and w4a8_repacked and materialize_intermediate
+            and deterministic_output and mma_tiler_mn == (64, 128)
+            and share_input_across_experts and not direct_routing
+        ):
+            raise ValueError("deepseek_v41 requires the planned materialized M64 W4A8 pipeline")
         if quant_recipe not in {
             "nvfp4",
             "w4a8_mx",
@@ -927,6 +938,7 @@ class MoEDynamicKernelBackend:
         else:
             self.materialized_phase1_kernel = W4A8MaterializedPhase1Kernel(
                 fast_math=self.fast_math,
+                numerical_recipe=numerical_recipe,
                 source_tile_m=materialized_source_tile_m,
                 deterministic_output=bool(deterministic_output),
                 num_topk=self.num_topk,
@@ -952,6 +964,7 @@ class MoEDynamicKernelBackend:
             )
             self.materialized_phase2_kernel = W4A8MaterializedPhase2Kernel(
                 source_tile_m=materialized_source_tile_m,
+                numerical_recipe=numerical_recipe,
                 deterministic_output=bool(deterministic_output),
                 trellis_bits=(
                     trellis_bits
@@ -1069,9 +1082,8 @@ class MoEDynamicKernelBackend:
             )
         self.dynamic_down_scale = dynamic_down_scale
         self.share_input_across_experts = share_input_across_experts
-        # Small repacked W4A8 has six route warps.  Split them into three
-        # two-warp token groups: this matches the pair-owned producer's useful
-        # warp/CTA concurrency while every K/32 block is quantized once.
+        # Pair route warps per input token. M16/M32 have three pairs; M64
+        # and M128 have five. Every pair needs an independent rendezvous.
         self.input_warps_per_token = (
             2 if self.is_w4a8 and share_input_across_experts else 1
         )
@@ -1203,6 +1215,16 @@ class MoEDynamicKernelBackend:
         )
         self.input_pair_barrier_2 = pipeline.NamedBarrier(
             barrier_id=6,
+            num_threads=self.input_warps_per_token * self.num_threads_per_warp,
+        )
+        # IDs 7-10 belong to the later QMMA staging pipeline. The two extra
+        # M64/M128 input pairs must not collide with pair 2 on barrier 6.
+        self.input_pair_barrier_3 = pipeline.NamedBarrier(
+            barrier_id=11,
+            num_threads=self.input_warps_per_token * self.num_threads_per_warp,
+        )
+        self.input_pair_barrier_4 = pipeline.NamedBarrier(
+            barrier_id=12,
             num_threads=self.input_warps_per_token * self.num_threads_per_warp,
         )
         w4a8_stage_threads = (self.num_mma_warps + 1) * self.num_threads_per_warp
@@ -1593,6 +1615,12 @@ class MoEDynamicKernelBackend:
         )
 
     @cute.jit
+    def _quantize_mx(self, values: cute.Tensor, max_abs: cutlass.Float32):
+        if cutlass.const_expr(self.deepseek_v41):
+            max_abs = cutlass.max(max_abs, cutlass.Float32(1.0e-4))
+        return quantize_block_fp8_mx(values, max_abs)
+
+    @cute.jit
     def _gated_activation_value(self, gate: cutlass.Float32, up: cutlass.Float32):
         if cutlass.const_expr(self.has_swiglu_limit):
             limit = cutlass.Float32(self.swiglu_limit)
@@ -1652,8 +1680,12 @@ class MoEDynamicKernelBackend:
             self.input_pair_barrier_0.arrive_and_wait()
         elif pair_idx == Int32(1):
             self.input_pair_barrier_1.arrive_and_wait()
-        else:
+        elif pair_idx == Int32(2):
             self.input_pair_barrier_2.arrive_and_wait()
+        elif pair_idx == Int32(3):
+            self.input_pair_barrier_3.arrive_and_wait()
+        else:
+            self.input_pair_barrier_4.arrive_and_wait()
 
     @cute.jit
     def _sync_w4a8_stage_ready(self, stage: Int32):
@@ -2673,6 +2705,7 @@ class MoEDynamicKernelBackend:
                     w13_sfb_rp,
                     intermediate_u32,
                     token_map,
+                    token_weights,
                     task_expert,
                     task_valid_rows,
                     expert_tile_base,
@@ -3141,7 +3174,7 @@ class MoEDynamicKernelBackend:
         # routed scratch therefore needs no 4x-output clear; poison/replay
         # coverage verifies that phase 2 really overwrites the full domain.
         if cutlass.const_expr(
-            not (self.deterministic_output and self.external_materialized_fc2)
+            self.deepseek_v41 or not (self.deterministic_output and self.external_materialized_fc2)
         ):
             scatter_rows = Int32(scatter_output.shape[0])
             scatter_total_u32 = scatter_rows * cols_u32
@@ -3215,15 +3248,11 @@ class MoEDynamicKernelBackend:
                         m1_block_start,
                     )
                     if cutlass.const_expr(self.w4a8_trellis):
-                        m1_payload, m1_mx_scale_byte = quantize_block_fp8_mx(
-                            _w4a8_trellis_permute_k32(m1_values),
-                            m1_block_max,
-                        )
+                        m1_payload, m1_mx_scale_byte = self._quantize_mx(_w4a8_trellis_permute_k32(m1_values),
+                        m1_block_max,)
                     else:
-                        m1_payload, m1_mx_scale_byte = quantize_block_fp8_mx(
-                            m1_values,
-                            m1_block_max,
-                        )
+                        m1_payload, m1_mx_scale_byte = self._quantize_mx(m1_values,
+                        m1_block_max,)
                     for m1_payload_pair in cutlass.range_constexpr(4):
                         m1_packed64 = (
                             Uint64(m1_payload[m1_payload_pair * 2 + 1]) << Uint64(32)
@@ -3460,18 +3489,14 @@ class MoEDynamicKernelBackend:
                                         )
                                         if cutlass.const_expr(self.w4a8_trellis):
                                             payload, mx_scale_byte = (
-                                                quantize_block_fp8_mx(
-                                                    _w4a8_trellis_permute_k32(
-                                                        values
-                                                    ),
-                                                    block_max,
-                                                )
+                                                self._quantize_mx(_w4a8_trellis_permute_k32(
+                                                    values
+                                                ),
+                                                block_max,)
                                             )
                                         else:
                                             payload, mx_scale_byte = (
-                                                quantize_block_fp8_mx(
-                                                    values, block_max
-                                                )
+                                                self._quantize_mx(values, block_max)
                                             )
                                         for payload_pair in cutlass.range_constexpr(4):
                                             packed64 = (
@@ -3547,18 +3572,14 @@ class MoEDynamicKernelBackend:
                                         )
                                         if cutlass.const_expr(self.w4a8_trellis):
                                             payload, mx_scale_byte = (
-                                                quantize_block_fp8_mx(
-                                                    _w4a8_trellis_permute_k32(
-                                                        values
-                                                    ),
-                                                    block_max,
-                                                )
+                                                self._quantize_mx(_w4a8_trellis_permute_k32(
+                                                    values
+                                                ),
+                                                block_max,)
                                             )
                                         else:
                                             payload, mx_scale_byte = (
-                                                quantize_block_fp8_mx(
-                                                    values, block_max
-                                                )
+                                                self._quantize_mx(values, block_max)
                                             )
                                         for payload_pair in cutlass.range_constexpr(4):
                                             packed64 = (
@@ -3897,18 +3918,14 @@ class MoEDynamicKernelBackend:
                                             block_max = fmax_f32(block_max, fabs_f32(value))
                                         if cutlass.const_expr(self.w4a8_trellis):
                                             payload, mx_scale_byte = (
-                                                quantize_block_fp8_mx(
-                                                    _w4a8_trellis_permute_k32(
-                                                        values
-                                                    ),
-                                                    block_max,
-                                                )
+                                                self._quantize_mx(_w4a8_trellis_permute_k32(
+                                                    values
+                                                ),
+                                                block_max,)
                                             )
                                         else:
                                             payload, mx_scale_byte = (
-                                                quantize_block_fp8_mx(
-                                                    values, block_max
-                                                )
+                                                self._quantize_mx(values, block_max)
                                             )
                                         output_offset = (
                                             phys_row * output_bytes_per_row + block_start
@@ -6543,14 +6560,10 @@ class MoEDynamicKernelBackend:
                                     values[elem_idx] = value
                                     block_max = fmax_f32(block_max, fabs_f32(value))
                                 if cutlass.const_expr(self.w4a8_trellis):
-                                    payload, mx_scale_byte = quantize_block_fp8_mx(
-                                        _w4a8_trellis_permute_k32(values),
-                                        block_max,
-                                    )
+                                    payload, mx_scale_byte = self._quantize_mx(_w4a8_trellis_permute_k32(values),
+                                    block_max,)
                                 else:
-                                    payload, mx_scale_byte = quantize_block_fp8_mx(
-                                        values, block_max
-                                    )
+                                    payload, mx_scale_byte = self._quantize_mx(values, block_max)
                                 pay_addr = (
                                     sa_flat_addr
                                     + row * Int32(self.tile_shape_mnk[2])

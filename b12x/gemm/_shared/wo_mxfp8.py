@@ -890,14 +890,17 @@ def _expand_block_scales_to_mxfp8_rows(
     m: int,
     k: int,
     num_groups: int,
+    block_size: tuple[int, int] = (128, 128),
 ) -> torch.Tensor:
     _check_gpu_tensor("scale", scale)
     if m <= 0 or k <= 0 or num_groups <= 0:
         raise ValueError("m, k, and num_groups must be positive")
     _check_mxfp8_k(k)
 
-    m_tiles = math.ceil(m / MXFP8_SCALE_ROW_TILE)
-    k_tiles = math.ceil((k // MXFP8_SCALE_VEC_SIZE) / MXFP8_SCALE_K_TILE)
+    block_n, block_k = block_size
+    m_tiles = math.ceil(m / block_n)
+    k_tiles = math.ceil(k / block_k)
+    scales_per_block_k = block_k // MXFP8_SCALE_VEC_SIZE
     expected_2d = (num_groups * m_tiles, k_tiles)
     expected_3d = (num_groups, m_tiles, k_tiles)
     if scale.shape == expected_2d:
@@ -916,11 +919,11 @@ def _expand_block_scales_to_mxfp8_rows(
 
     scale_rows_u8 = (
         block_u8[:, :, None, :, None]
-        .expand(num_groups, m_tiles, MXFP8_SCALE_ROW_TILE, k_tiles, MXFP8_SCALE_K_TILE)
+        .expand(num_groups, m_tiles, block_n, k_tiles, scales_per_block_k)
         .reshape(
             num_groups,
-            m_tiles * MXFP8_SCALE_ROW_TILE,
-            k_tiles * MXFP8_SCALE_K_TILE,
+            m_tiles * block_n,
+            k_tiles * scales_per_block_k,
         )[:, :m, : k // MXFP8_SCALE_VEC_SIZE]
         .contiguous()
     )
@@ -1116,10 +1119,12 @@ def pack_fp8_block_scaled_weight_mxfp8(
     m: int,
     k: int,
     num_groups: int = 1,
+    block_size: tuple[int, int] = (128, 128),
 ) -> MXFP8Rows:
     """Pack checkpoint FP8 block-scaled weights for native MXFP8 dense GEMM.
 
-    `weight` is FP8 E4M3 and `scale` is the DSV4-style 128x128 block scale.
+    `weight` is FP8 E4M3. `block_size` selects 128x128 DSV4 scales or
+    native 32x32 UE8M0 DSV4.1 scales; the latter never requantize weights.
 
     When `scale` is an *arbitrary* fp32 block scale (the DeepSeek
     `weight_scale_inv` checkpoint format), the weight is **re-quantized** onto an
@@ -1135,13 +1140,18 @@ def pack_fp8_block_scaled_weight_mxfp8(
     if m <= 0 or k <= 0 or num_groups <= 0:
         raise ValueError("m, k, and num_groups must be positive")
     _check_mxfp8_k(k)
+    block_size = tuple(block_size)
+    if block_size not in ((128, 128), (32, 32)):
+        raise ValueError(f"unsupported FP8 weight block_size {block_size}")
+    if block_size == (32, 32) and not _scale_is_exact_ue8m0(scale):
+        raise ValueError("32x32 weight scales must be exact UE8M0")
 
     # Arbitrary fp32 checkpoint scales (e.g. DeepSeek `weight_scale_inv`) are not
     # powers of two; re-quantize onto exact UE8M0 instead of rounding the scale
     # and leaving the FP8 values stale (which costs ~2.7x more error). Scales
     # that are already exact UE8M0 (e8m0/uint8, or a float tensor holding only
     # powers of two) keep their FP8 values verbatim.
-    if not _scale_is_exact_ue8m0(scale):
+    if block_size == (128, 128) and not _scale_is_exact_ue8m0(scale):
         _check_gpu_tensor("scale", scale)
         weight, scale = _requantize_block_fp8_to_ue8m0(
             weight, scale, m=m, k=k, num_groups=num_groups
@@ -1170,6 +1180,7 @@ def pack_fp8_block_scaled_weight_mxfp8(
         m=m,
         k=k,
         num_groups=num_groups,
+        block_size=block_size,
     )
     scale_mma = pack_mxfp8_scales_for_dense_gemm(
         scale_rows,

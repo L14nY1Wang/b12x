@@ -37,6 +37,7 @@ from b12x._lib.utils import (
 from cutlass.cutlass_dsl import Int32
 from b12x.moe._shared.routing import (
     route_topk as triton_route_topk,
+    _validate_score_options,
 )
 from b12x.moe._shared.kernels.relu2 import (
     MoEDynamicKernelRelu2,
@@ -832,6 +833,7 @@ class TPMoEPlan:
     swiglu_limit: float | None = None
     swiglu_alpha: float = 1.0
     swiglu_beta: float = 0.0
+    numerical_recipe: str = "default"
     state_E: int
     weight_E: int
     routed_rows: int
@@ -872,6 +874,10 @@ class TPMoEScratchCaps:
     policy_context: PolicyContext | None = None
     frozen: bool = True
 
+    @property
+    def numerical_recipe(self) -> str:
+        return self.weight_plan.numerical_recipe
+
     def __post_init__(self) -> None:
         object.__setattr__(self, "max_tokens", max(int(self.max_tokens), 1))
         object.__setattr__(self, "num_topk", max(int(self.num_topk), 1))
@@ -892,6 +898,13 @@ class TPMoEScratchCaps:
                 f"quant_mode={quant_mode!r} is absent from the weight plan"
             )
         object.__setattr__(self, "quant_mode", quant_mode)
+        if self.numerical_recipe == "deepseek_v41":
+            if self.apply_router_weight_on_input or self.deterministic_output is False:
+                raise ValueError("deepseek_v41 weights routes before FC2 and requires FP32 route reduction")
+            if self.swiglu_limit not in (None, 10.0):
+                raise ValueError("deepseek_v41 requires swiglu_limit=10")
+            object.__setattr__(self, "swiglu_limit", 10.0)
+            object.__setattr__(self, "deterministic_output", True)
         if self.core_token_counts is not None:
             object.__setattr__(
                 self,
@@ -1204,6 +1217,11 @@ class TPMoERouteBinding:
     gate_bias: torch.Tensor | None = None
     router_logits: torch.Tensor | None = None
     renormalize: bool = True
+    score_func: str = "softmax"
+    correction_bias: torch.Tensor | None = None
+    image_correction_bias: torch.Tensor | None = None
+    image_mask: torch.Tensor | None = None
+    routed_scaling_factor: float = 1.0
 
     def run(self) -> B12XTopKRouting:
         return b12x_route_experts_fast(binding=self)
@@ -1220,6 +1238,10 @@ class TPMoESparseFP4Binding:
     gate_bias: torch.Tensor | None = None
     router_logits: torch.Tensor | None = None
     renormalize_topk: bool = True
+    score_func: str = "softmax"
+    correction_bias: torch.Tensor | None = None
+    image_correction_bias: torch.Tensor | None = None
+    image_mask: torch.Tensor | None = None
     routed_scaling_factor: float = 1.0
     output: torch.Tensor | None = None
     return_routing: bool = False
@@ -2704,6 +2726,11 @@ def _heuristic_moe_decode_config(
     query: MoeDecodeQuery,
     device: DeviceIdentity | None,
 ) -> MoeDecodeConfig:
+    if query.numerical_recipe == "deepseek_v41":
+        return MoeDecodeConfig(
+            backend="dynamic", route_planner="internal", max_active_clusters=None,
+            dynamic_tile_m=64, dynamic_route_mode="grouped",
+        )
     if query.quant_mode == "nvfp4_auto":
         if (
             device is not None
@@ -2792,6 +2819,7 @@ def _resolve_moe_decode_policy(
     quant_mode: str,
     source_format: str = "modelopt_nvfp4",
     context: PolicyContext | None = None,
+    numerical_recipe: str = "default",
 ) -> PolicyResolution[MoeDecodeConfig]:
     query = MoeDecodeQuery(
         quant_mode=_normalize_quant_mode(quant_mode),
@@ -2803,6 +2831,7 @@ def _resolve_moe_decode_policy(
         top_k=int(num_topk),
         num_tokens=int(num_tokens),
         routed_rows=int(num_tokens) * int(num_topk),
+        numerical_recipe=numerical_recipe,
     )
     context = context or _current_moe_policy_context()
     if "B12X_MICRO_DYNAMIC_CUTOVER_PAIRS" in os.environ:
@@ -3008,6 +3037,12 @@ def _build_tp_moe_fp4_binding_from_views(
             f"scratch plan quant_mode={plan.quant_mode!r} cannot bind "
             f"quant_mode={quant_mode!r}"
         )
+    if experts.plan.numerical_recipe != execution_plan.numerical_recipe:
+        raise ValueError("expert and execution numerical recipes differ")
+    if execution_plan.numerical_recipe == "deepseek_v41":
+        if apply_router_weight_on_input:
+            raise ValueError("deepseek_v41 applies route weights before FC2, not FC1")
+        swiglu_limit = 10.0
     plan_activation = activation
     if quant_mode != "w4a16":
         plan_activation = _get_activation_kernel_spec(
@@ -6110,6 +6145,7 @@ def plan_b12x_fp4_moe_weights(
     trellis_rate_granularity: str | None = None,
     trellis_pair_kinds: Sequence[str] | frozenset[str] | None = None,
     coupled_hadamard_blocks: tuple[int, int] | None = None,
+    numerical_recipe: str = "default",
 ) -> MoEWeightPreparationPlan:
     """Plan the one canonical weight allocation used by selected recipes."""
 
@@ -6129,7 +6165,7 @@ def plan_b12x_fp4_moe_weights(
         )
         for mode in modes
     )
-    return plan_moe_weight_preparation(
+    result = plan_moe_weight_preparation(
         specs,
         num_experts=num_experts,
         hidden_size=hidden_size,
@@ -6143,6 +6179,7 @@ def plan_b12x_fp4_moe_weights(
         trellis_pair_kinds=trellis_pair_kinds,
         coupled_hadamard_blocks=coupled_hadamard_blocks,
     )
+    return replace(result, numerical_recipe=numerical_recipe)
 
 
 def prepare_b12x_fp4_moe_weights(
@@ -6758,6 +6795,16 @@ def plan_tp_moe_execution(
     source_format = weight_plan.source_format
     activation = weight_plan.activation
     w13_layout = weight_plan.w13_layout
+    numerical_recipe = weight_plan.numerical_recipe
+    if numerical_recipe == "deepseek_v41":
+        if apply_router_weight_on_input or deterministic_output is False:
+            raise ValueError("deepseek_v41 requires pre-FC2 routing weights and FP32 route reduction")
+        if swiglu_limit not in (None, 10.0) or swiglu_alpha not in (None, 1.0) or swiglu_beta not in (None, 0.0):
+            raise ValueError("deepseek_v41 fixes clamp=10, alpha=1 and beta=0")
+        swiglu_limit = 10.0
+        deterministic_output = True
+        if _dynamic_work_source() == "ready_queue":
+            raise ValueError("deepseek_v41 requires a materialized work source")
     swiglu_limit, swiglu_alpha, swiglu_beta = _normalize_swiglu_params(
         activation,
         swiglu_limit,
@@ -6782,6 +6829,7 @@ def plan_tp_moe_execution(
         quant_mode=quant_mode,
         source_format=source_format,
         context=policy_context,
+        numerical_recipe=numerical_recipe,
     )
     implementation, state_E, max_rows = _resolve_workspace_layout(
         num_tokens=num_tokens,
@@ -6913,6 +6961,7 @@ def plan_tp_moe_execution(
         implementation=implementation,
         quant_mode=quant_mode,
         activation=activation,
+        numerical_recipe=numerical_recipe,
         swiglu_limit=swiglu_limit,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
@@ -9441,7 +9490,17 @@ def build_tp_moe_route_binding(
     gate_bias: torch.Tensor | None = None,
     router_logits: torch.Tensor | None = None,
     renormalize: bool = True,
+    score_func: str = "softmax",
+    correction_bias: torch.Tensor | None = None,
+    image_correction_bias: torch.Tensor | None = None,
+    image_mask: torch.Tensor | None = None,
+    routed_scaling_factor: float = 1.0,
 ) -> TPMoERouteBinding:
+    """Bind routing; score and correction options follow :func:`route_topk`.
+
+    Supply precomputed FP32 ``router_logits`` for the DeepSeek V4.1 gate.
+    ``gate_bias`` is an additive linear-layer bias, not selection correction.
+    """
     if scratch is not None and not isinstance(
         scratch,
         (TPMoEWorkspace, TPW4A16Workspace, TPMoEWorkspacePool),
@@ -9466,6 +9525,11 @@ def build_tp_moe_route_binding(
         gate_bias=gate_bias,
         router_logits=router_logits,
         renormalize=bool(renormalize),
+        score_func=score_func,
+        correction_bias=correction_bias,
+        image_correction_bias=image_correction_bias,
+        image_mask=image_mask,
+        routed_scaling_factor=float(routed_scaling_factor),
     )
 
 
@@ -9480,6 +9544,10 @@ def build_tp_moe_sparse_fp4_binding(
     gate_bias: torch.Tensor | None = None,
     router_logits: torch.Tensor | None = None,
     renormalize_topk: bool = True,
+    score_func: str = "softmax",
+    correction_bias: torch.Tensor | None = None,
+    image_correction_bias: torch.Tensor | None = None,
+    image_mask: torch.Tensor | None = None,
     routed_scaling_factor: float = 1.0,
     output: torch.Tensor | None = None,
     return_routing: bool = False,
@@ -9514,9 +9582,13 @@ def build_tp_moe_sparse_fp4_binding(
             or gate_weight is not None
             or gate_bias is not None
             or router_logits is not None
+            or score_func != "softmax"
+            or correction_bias is not None
+            or image_correction_bias is not None
+            or image_mask is not None
         ):
             raise ValueError(
-                "routing is mutually exclusive with top_k/gate_weight/gate_bias/router_logits"
+                "routing is mutually exclusive with gate, top-k, and score-selection arguments"
             )
     elif top_k is None:
         raise ValueError("top_k is required when routing is not provided")
@@ -9530,6 +9602,10 @@ def build_tp_moe_sparse_fp4_binding(
         gate_bias=gate_bias,
         router_logits=router_logits,
         renormalize_topk=bool(renormalize_topk),
+        score_func=score_func,
+        correction_bias=correction_bias,
+        image_correction_bias=image_correction_bias,
+        image_mask=image_mask,
         routed_scaling_factor=float(routed_scaling_factor),
         output=output,
         return_routing=bool(return_routing),
@@ -10379,6 +10455,7 @@ def _get_dynamic_kernel(
     trellis_bits: int = 0,
     trellis_coupled: bool = False,
     planned_tile_m: int | None = None,
+    numerical_recipe: str = "default",
 ):
     quant_mode = _normalize_quant_mode(quant_mode)
     # w6a8_mx rides the nvfp4-shaped launch ABI (no repack/residual operands)
@@ -10443,6 +10520,9 @@ def _get_dynamic_kernel(
             planned_tile_m=planned_tile_m,
         )
     )
+    if numerical_recipe == "deepseek_v41":
+        materialize_intermediate = True
+        share_input_across_experts = True
     separate_w13_halves = bool(
         quant_mode == "nvfp4"
         and activation_spec.is_gated
@@ -10473,6 +10553,7 @@ def _get_dynamic_kernel(
     global _LAST_KERNEL
     cache_key = (
         quant_mode,
+        numerical_recipe,
         "dynamic",
         E,
         k,
@@ -10536,6 +10617,8 @@ def _get_dynamic_kernel(
         dynamic_down_scale=dynamic_down_scale,
     )
     kernel_kwargs["share_input_across_experts"] = share_input_across_experts
+    if numerical_recipe != "default":
+        kernel_kwargs["numerical_recipe"] = numerical_recipe
     kernel_kwargs["deterministic_output"] = bool(deterministic_output)
     kernel_kwargs["num_topk"] = int(num_topk)
     kernel_kwargs["swap_ab"] = swap_ab
@@ -10822,7 +10905,7 @@ def _get_dynamic_kernel(
         ),
         compile_spec=KernelCompileSpec.from_key(
             "integration.tp_moe.dynamic",
-            1,
+            5,
             cache_key,
         ),
         dsl_compile_options=dsl_compile_options,
@@ -10886,7 +10969,6 @@ def _launch_dynamic_flat(
     num_topk: int,
     routed_rows: int,
     max_rows: int,
-    scatter_rows: int,
     physical_tiles_capacity: int,
     task_capacity: int,
     topk_ids_are_i32: bool,
@@ -10904,8 +10986,12 @@ def _launch_dynamic_flat(
     volatile_launch_state: bool,
     planned_tile_m: int,
     planned_direct_routing: bool,
+    numerical_recipe: str = "default",
 ) -> None:
     quant_mode = _normalize_quant_mode(quant_mode)
+    # Output rows follow the reduction contract, never an independent caller
+    # quantity: deterministic kernels write one row per route, others per token.
+    scatter_rows = routed_rows if deterministic_output else m
     # A trellis-native w4a8 binding carries the fp16 boundary rotations in
     # the sfb slot (the QMMA repack stores int32 scale words there); the
     # trellis geometry is recovered from the operand extents.
@@ -11110,6 +11196,7 @@ def _launch_dynamic_flat(
         trellis_bits=trellis_bits,
         trellis_coupled=trellis_coupled,
         planned_tile_m=planned_tile_m,
+        numerical_recipe=numerical_recipe,
     )
     if volatile_launch_state:
         barrier_count.zero_()
@@ -11348,7 +11435,6 @@ def _tp_moe_dynamic_launch_op(
     num_topk: int,
     routed_rows: int,
     max_rows: int,
-    scatter_rows: int,
     physical_tiles_capacity: int,
     task_capacity: int,
     topk_ids_are_i32: bool,
@@ -11362,6 +11448,7 @@ def _tp_moe_dynamic_launch_op(
     swiglu_alpha: float,
     swiglu_beta: float,
     launch_policy: int,
+    numerical_recipe: str = "default",
 ) -> None:
     (
         volatile_launch_state,
@@ -11421,7 +11508,6 @@ def _tp_moe_dynamic_launch_op(
         num_topk=num_topk,
         routed_rows=routed_rows,
         max_rows=max_rows,
-        scatter_rows=scatter_rows,
         physical_tiles_capacity=physical_tiles_capacity,
         task_capacity=task_capacity,
         topk_ids_are_i32=topk_ids_are_i32,
@@ -11439,6 +11525,7 @@ def _tp_moe_dynamic_launch_op(
         volatile_launch_state=volatile_launch_state,
         planned_tile_m=planned_tile_m,
         planned_direct_routing=planned_direct_routing,
+        numerical_recipe=numerical_recipe,
     )
 
 
@@ -11494,7 +11581,6 @@ def _tp_moe_dynamic_launch_fake(
     num_topk: int,
     routed_rows: int,
     max_rows: int,
-    scatter_rows: int,
     physical_tiles_capacity: int,
     task_capacity: int,
     topk_ids_are_i32: bool,
@@ -11508,6 +11594,7 @@ def _tp_moe_dynamic_launch_fake(
     swiglu_alpha: float,
     swiglu_beta: float,
     launch_policy: int,
+    numerical_recipe: str = "default",
 ) -> None:
     del launch_policy
     return None
@@ -11543,6 +11630,7 @@ def _launch_dynamic(
     policy_max_active_clusters: int = -1,
     planned_tile_m: int = 128,
     dynamic_route_mode: str = "grouped",
+    numerical_recipe: str = "default",
 ) -> None:
     del stream
     if dynamic_route_mode not in {"direct", "grouped"}:
@@ -11561,7 +11649,6 @@ def _launch_dynamic(
             f"{workspace.route_output.numel()}"
         )
     kernel_output = workspace.route_output if deterministic_output else scatter_output
-    scatter_rows = routed_rows if deterministic_output else m
     w4a8_repacked = w4a8_prepared is not None
     w13_rp = w4a8_prepared["w13_rp"] if w4a8_repacked else workspace.row_counts
     w13_sfb_rp = w4a8_prepared["w13_sfb"] if w4a8_repacked else workspace.row_counts
@@ -11646,7 +11733,6 @@ def _launch_dynamic(
         num_topk,
         routed_rows,
         max_rows,
-        scatter_rows,
         workspace.physical_tiles_capacity,
         workspace.task_capacity,
         topk_ids_dtype == torch.int32,
@@ -11660,6 +11746,7 @@ def _launch_dynamic(
         float(swiglu_alpha),
         float(swiglu_beta),
         launch_policy,
+        numerical_recipe,
     )
 
 
@@ -11681,12 +11768,13 @@ def _launch_dynamic_topk_sum(
         compile_w4a16_topk_sum,
     )
 
-    element_dtype = _w4a16_element_dtype(output.dtype)
+    element_dtype = _w4a16_element_dtype(route_output.dtype)
     compile_w4a16_topk_sum(
         m=m,
         topk=num_topk,
         hidden_size=k,
         element_dtype=element_dtype,
+        float32_output=output.dtype == torch.float32,
     )
     torch.ops.b12x.w4a16_topk_sum_launch(
         route_output,
@@ -12795,7 +12883,9 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         raise ValueError(
             f"output must have shape {(m, k)}, got {tuple(scatter_output.shape)}"
         )
-    if scatter_output.dtype != a.dtype:
+    if scatter_output.dtype != a.dtype and not (
+        plan.numerical_recipe == "deepseek_v41" and scatter_output.dtype == torch.float32
+    ):
         raise ValueError(
             f"output must have dtype {a.dtype}, got {scatter_output.dtype}"
         )
@@ -12862,6 +12952,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             stream=stream,
             activation=activation,
             quant_mode=quant_mode,
+            numerical_recipe=plan.numerical_recipe,
             w4a8_prepared=dynamic_w4a8_prepared,
             deterministic_output=deterministic_output,
             swiglu_limit=swiglu_limit,
@@ -13211,6 +13302,11 @@ def _select_experts_reference(
     gate_bias: torch.Tensor | None = None,
     router_logits: torch.Tensor | None = None,
     renormalize: bool = True,
+    score_func: str = "softmax",
+    correction_bias: torch.Tensor | None = None,
+    image_correction_bias: torch.Tensor | None = None,
+    image_mask: torch.Tensor | None = None,
+    routed_scaling_factor: float = 1.0,
 ) -> B12XTopKRouting:
     """Reference routing selection for sparse-block MoE wrappers.
 
@@ -13268,11 +13364,42 @@ def _select_experts_reference(
     if top_k > num_experts:
         raise ValueError(f"top_k={top_k} exceeds num_experts={num_experts}")
 
-    topk_logits, topk_ids = torch.topk(router_logits, k=top_k, dim=-1)
-    if renormalize:
-        topk_weights = torch.softmax(topk_logits.to(torch.float32), dim=-1)
+    _validate_score_options(
+        router_logits,
+        score_func=score_func,
+        correction_bias=correction_bias,
+        image_correction_bias=image_correction_bias,
+        image_mask=image_mask,
+    )
+    logits_f32 = router_logits.float()
+    if score_func == "sqrtsoftplus":
+        scores = F.softplus(logits_f32).sqrt()
+    elif correction_bias is not None or (
+        image_correction_bias is not None and image_mask is not None
+    ):
+        scores = logits_f32.softmax(dim=-1)
     else:
-        topk_weights = topk_logits.to(torch.float32)
+        scores = logits_f32
+    selection_scores = scores
+    if correction_bias is not None:
+        selection_scores = scores + correction_bias
+    if image_correction_bias is not None and image_mask is not None:
+        selection_scores = torch.where(
+            image_mask[:, None], scores + image_correction_bias, selection_scores
+        )
+    # Stable descending sort on reversed experts matches the native larger-ID tie rule.
+    reverse_ids = selection_scores.flip(-1).argsort(
+        dim=-1, descending=True, stable=True
+    )[:, :top_k]
+    topk_ids = num_experts - 1 - reverse_ids
+    if score_func == "sqrtsoftplus":
+        topk_weights = scores.gather(1, topk_ids)
+        if renormalize and top_k > 1:
+            topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
+    else:
+        topk_logits = logits_f32.gather(1, topk_ids)
+        topk_weights = topk_logits.softmax(dim=-1) if renormalize else topk_logits
+    topk_weights = topk_weights * routed_scaling_factor
     return B12XTopKRouting(
         topk_weights=topk_weights,
         topk_ids=topk_ids,
@@ -13296,6 +13423,11 @@ def b12x_route_experts_fast(*, binding: TPMoERouteBinding) -> B12XTopKRouting:
     gate_bias = binding.gate_bias
     router_logits = binding.router_logits
     renormalize = binding.renormalize
+    score_func = binding.score_func
+    correction_bias = binding.correction_bias
+    image_correction_bias = binding.image_correction_bias
+    image_mask = binding.image_mask
+    routed_scaling_factor = binding.routed_scaling_factor
     scratch = binding.scratch
     if hidden_states.ndim != 2:
         raise ValueError(
@@ -13357,6 +13489,11 @@ def b12x_route_experts_fast(*, binding: TPMoERouteBinding) -> B12XTopKRouting:
             gate_bias=gate_bias,
             router_logits=router_logits,
             renormalize=renormalize,
+            score_func=score_func,
+            correction_bias=correction_bias,
+            image_correction_bias=image_correction_bias,
+            image_mask=image_mask,
+            routed_scaling_factor=routed_scaling_factor,
         )
         topk_ids_i32 = selected.topk_ids.to(torch.int32)
         return B12XTopKRouting(
@@ -13402,6 +13539,11 @@ def b12x_route_experts_fast(*, binding: TPMoERouteBinding) -> B12XTopKRouting:
         route_workspace.topk_ids,
         route_workspace.topk_weights,
         renormalize=renormalize,
+        score_func=score_func,
+        correction_bias=correction_bias,
+        image_correction_bias=image_correction_bias,
+        image_mask=image_mask,
+        routed_scaling_factor=routed_scaling_factor,
     )
     topk_ids = route_workspace.topk_ids
     topk_weights = route_workspace.topk_weights
@@ -13453,9 +13595,13 @@ def b12x_sparse_moe_fp4(
             or gate_weight is not None
             or gate_bias is not None
             or router_logits is not None
+            or binding.score_func != "softmax"
+            or binding.correction_bias is not None
+            or binding.image_correction_bias is not None
+            or binding.image_mask is not None
         ):
             raise ValueError(
-                "routing is mutually exclusive with top_k/gate_weight/gate_bias/router_logits"
+                "routing is mutually exclusive with gate, top-k, and score-selection arguments"
             )
         selected = routing
     else:
@@ -13469,6 +13615,10 @@ def b12x_sparse_moe_fp4(
             gate_bias=gate_bias,
             router_logits=router_logits,
             renormalize=renormalize_topk,
+            score_func=binding.score_func,
+            correction_bias=binding.correction_bias,
+            image_correction_bias=binding.image_correction_bias,
+            image_mask=binding.image_mask,
         )
         selected = b12x_route_experts_fast(
             binding=route_binding,

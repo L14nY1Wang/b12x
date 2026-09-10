@@ -1208,6 +1208,7 @@ class UnifiedDecodeKernel:
                     packed_dsv4=self.native_dsv4_h8 or self.native_dsv4_h16,
                     overlap_footer_gather=self.native_dsv4_h16,
                     per_token_latent_scale=t.latent_scale_per_token,
+                    dsv41=t.model_type == ModelType.DSV41,
                 )
                 packed_kw = dict(
                     kv_smem_stride=staged_kv_stride,
@@ -1270,6 +1271,7 @@ class UnifiedDecodeKernel:
                                 Int32(self.pbs_extra),
                                 stride_extra_kv_block,
                                 io_lane,
+                                dsv41_swa=False,
                                 **io_kw,
                             )
                     else:
@@ -1977,7 +1979,7 @@ def _cache_block_stride_bytes(
         COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN,
     )
 
-    if is_glm_model_type(model_type):
+    if is_glm_model_type(model_type) or model_type == ModelType.DSV41:
         # GLM-family per-token contiguous record: 656B (ARBITRARY_FP32) or
         # 432B (NVFP4_E4M3). ``record_bytes`` comes from traits.kv_gmem_stride.
         rec = int(record_bytes) if record_bytes is not None else _GLM_KV_GMEM_STRIDE
@@ -2473,7 +2475,7 @@ def run_unified_decode(
             )
         if int(q_all.shape[-1]) != _DSV4_HEAD_DIM or (
             model_type_override is not None
-            and int(model_type_override) != int(ModelType.DSV4)
+            and int(model_type_override) not in (ModelType.DSV4, ModelType.DSV41)
         ):
             raise ValueError(
                 "SM120 sparse MLA decode dual-cache (extra tokens) is DSV4-only "
@@ -2553,6 +2555,8 @@ def run_unified_decode(
     # regimes, including C128's three chunks per split. This is a shape-only
     # policy decision, so capture and replay use the same kernel and workspace.
     max_chunks = int(workspace.max_chunks_per_row)
+    if model_type == ModelType.DSV41 and forced_num_splits is None:
+        forced_num_splits = int(workspace.num_chunks_value)
     # SM count read early: both the H8/H16 policy and the split plan need it.
     sm_count = None
     if q_all.is_cuda:
@@ -2678,6 +2682,9 @@ def run_unified_decode(
         extra_topk=extra_topk,
         preferred_num_splits=preferred_num_splits,
     )
+    # Binding only maps caller-owned views; initialize stream-ordered control
+    # words here so freshly bound storage is valid in eager and graph launches.
+    workspace.num_chunks_ptr.fill_(num_splits)
     # Side-channel record of the chosen split plan (benchmarks / AutoTuner read
     # LAST_DECODE_PLAN["num_splits"]). Informational only.
     native_glm_h8 = bool(
@@ -2764,6 +2771,7 @@ def run_unified_decode(
             indexed_k_cache,
             page_size=pbs_extra,
             model_type=int(model_type),
+            record_bytes=288 if model_type == ModelType.DSV41 else None,
         )
         extra_kv_flat = _cache_base_tensor(indexed_k_cache)
         extra_indices_t = indexed_indices.contiguous()

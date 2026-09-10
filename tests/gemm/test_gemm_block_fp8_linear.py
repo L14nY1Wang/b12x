@@ -22,11 +22,20 @@ from tests._reference.helpers import require_b12x
 def _make_block_fp8_weight(
     out_features: int,
     in_features: int,
+    block_size: int = 128,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     weight = (
         torch.randn((out_features, in_features), device="cuda", dtype=torch.bfloat16)
         / 8
     ).to(torch.float8_e4m3fn)
+    if block_size == 32:
+        n_blocks = (out_features + 31) // 32
+        k_blocks = in_features // 32
+        scale_u8 = (
+            (torch.arange(n_blocks, device="cuda")[:, None]
+             + 2 * torch.arange(k_blocks, device="cuda")[None, :]) % 7 + 123
+        ).to(torch.uint8)
+        return weight, scale_u8.view(torch.float8_e8m0fnu)
     scale_u8 = (
         torch.arange(
             (out_features // 128) * (in_features // 128),
@@ -43,15 +52,54 @@ def _make_block_fp8_weight(
     return weight, scale
 
 
+def _v41_dequantized_operands(x, weight, scale):
+    from tests.gemm.test_fp8_quant_deepgemm_parity import (
+        _per_token_cast_to_fp8,
+    )
+
+    values, scales = _per_token_cast_to_fp8(x, gran_k=32)
+    x_deq = values.float() * scales.repeat_interleave(32, dim=1)
+    w_deq = weight.float() * (
+        scale.float().repeat_interleave(32, dim=0)
+        .repeat_interleave(32, dim=1)[:weight.shape[0], :weight.shape[1]]
+    )
+    return x_deq, w_deq
+
+
+def _assert_v41_accumulation_matches_reference(source, weight, scale, actual):
+    x_deq, w_deq = _v41_dequantized_operands(source, weight, scale)
+    a, b = x_deq.double(), w_deq.double()
+    exact = a @ b.T
+    absolute_products = a.abs() @ b.abs().T
+    # Native MXF8 MMA and the source K32 GEMM both accumulate in FP32, not
+    # FP64. Their summation orders need not match, particularly when tiny
+    # K32 groups precede nearly cancelling larger groups. The standard dot
+    # product bound is gamma_K * sum(abs(a_i*b_i)), u = 2**-24. UE8M0
+    # scaling is an exact power-of-two operation for these finite operands.
+    k_u = source.shape[-1] * 2.0**-24
+    accumulation_error = (k_u / (1.0 - k_u)) * absolute_products
+    # Final BF16/FP16 round-to-nearest contributes at most half the local ULP.
+    actual64 = actual.double()
+    below = torch.nextafter(actual, torch.full_like(actual, -float("inf"))).double()
+    above = torch.nextafter(actual, torch.full_like(actual, float("inf"))).double()
+    rounding_error = 0.5 * torch.maximum(actual64 - below, above - actual64)
+    assert torch.isfinite(actual).all()
+    assert torch.all((actual64 - exact).abs() <= accumulation_error + rounding_error)
+
+
 def _reference_from_quantized_operands(
     x: torch.Tensor,
     weight: torch.Tensor,
     scale: torch.Tensor,
+    block_size: int = 128,
 ) -> torch.Tensor:
-    x_q = quantize_block_fp8_linear_input_mxfp8(x)
-    w_q = pack_block_fp8_linear_weight_mxfp8(weight, scale)
-    x_deq = dequantize_mxfp8_rows_torch(x_q.values, x_q.scale_rows)
-    w_deq = dequantize_mxfp8_rows_torch(w_q.weight.values, w_q.weight.scale_rows)
+    if block_size == 32:
+        x_deq, w_deq = _v41_dequantized_operands(x, weight, scale)
+    else:
+        x_q = quantize_block_fp8_linear_input_mxfp8(x)
+        w_q = pack_block_fp8_linear_weight_mxfp8(weight, scale)
+        x_deq = dequantize_mxfp8_rows_torch(x_q.values, x_q.scale_rows)
+        w_deq = dequantize_mxfp8_rows_torch(w_q.weight.values, w_q.weight.scale_rows)
     reference = x_deq.double() @ w_deq.double().T
     rounded = reference.to(x.dtype)
     # Torch's half constructors convert through FP32; correct double rounding.
@@ -481,3 +529,56 @@ def test_block_fp8_linear_expected_m_short_k_large_n_matches_reference() -> None
         rtol=0,
         atol=1 / 128,
     )
+
+
+@pytest.mark.parametrize(
+    "tokens,in_features,out_features",
+    [(1, 5120, 1280), (8, 5120, 512), (9, 256, 96),
+     (129, 256, 160), (33, 1280, 8192), (7, 1024, 5120),
+     (9, 6144, 25600)],
+)
+def test_block_fp8_linear_v41_independent_k32_n32_scales(
+    tokens: int, in_features: int, out_features: int,
+) -> None:
+    """Neither K128 replication nor N128 sharing may corrupt V4.1 scales."""
+    require_b12x()
+    torch.manual_seed(20260910)
+    source = torch.randn(
+        (tokens, in_features), device="cuda", dtype=torch.bfloat16,
+    ).mul_(0.25)
+    # Include tiny groups: unfloored legacy activation quantization differs here.
+    source[:, :32].mul_(1e-5)
+    weight, scale = _make_block_fp8_weight(out_features, in_features, 32)
+    packed = bfl.pack_weight(weight, scale, block_size=(32, 32))
+    torch.testing.assert_close(
+        packed.weight.values.view(torch.uint8), weight.view(torch.uint8),
+        rtol=0, atol=0,
+    )
+    from tests.gemm.test_fp8_quant_deepgemm_parity import (
+        _per_token_cast_to_fp8, _sf_fp32_to_e8m0_u8,
+    )
+
+    x_values, x_scales = _per_token_cast_to_fp8(source, 32)
+    x_q = bfl.quantize_input(source, block_size=(32, 32))
+    torch.testing.assert_close(
+        x_q.values.view(torch.uint8), x_values.view(torch.uint8), rtol=0, atol=0,
+    )
+    torch.testing.assert_close(
+        x_q.scale_rows.view(torch.uint8)[0], _sf_fp32_to_e8m0_u8(x_scales),
+        rtol=0, atol=0,
+    )
+    torch.testing.assert_close(
+        packed.weight.scale_rows.view(torch.uint8)[0],
+        scale.view(torch.uint8).repeat_interleave(32, dim=0)[:out_features],
+        rtol=0, atol=0,
+    )
+    actual = bfl.run(source, packed, expected_m=tokens)
+    _assert_v41_accumulation_matches_reference(source, weight, scale, actual)
+
+
+def test_block_fp8_linear_v41_rejects_lossy_weight_scale_repacking() -> None:
+    require_b12x()
+    weight = torch.ones((64, 128), device="cuda").to(torch.float8_e4m3fn)
+    scales = torch.full((2, 4), 0.3, device="cuda")
+    with pytest.raises(ValueError, match="exact UE8M0"):
+        bfl.pack_weight(weight, scales, block_size=(32, 32))

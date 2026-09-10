@@ -7956,6 +7956,7 @@ class W4A16TopKSumKernel:
         route_num_experts: int = 0,
         use_expert_map: bool = False,
         broadcast_svh: bool = False,
+        float32_output: bool = False,
     ):
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
@@ -7973,6 +7974,7 @@ class W4A16TopKSumKernel:
         # svh_table holds a single row shared by every expert (kquant
         # shared-su artifacts); index it with a zero expert stride.
         self.broadcast_svh = bool(broadcast_svh)
+        self.float32_output = bool(float32_output)
         if self.use_expert_map:
             if self.route_num_experts <= 0:
                 raise ValueError("expert-map top-k sum requires route_num_experts > 0")
@@ -7999,6 +8001,8 @@ class W4A16TopKSumKernel:
 
     @cute.jit
     def _cast_elem(self, x: cutlass.Float32):
+        if cutlass.const_expr(self.float32_output):
+            return x
         if cutlass.const_expr(self.is_fp16):
             return cutlass.Float16(x)
         return cutlass.BFloat16(x)
@@ -8421,7 +8425,7 @@ class W4A16TopKSumKernel:
                     if expert < Int32(0) or expert >= weight_num_experts:
                         valid_route = Int32(0)
                 if valid_route != Int32(0):
-                    route_value = fc2_flat[row * Int32(self.hidden_size) + col].to(
+                    route_value = fc2_flat[Int64(row) * Int64(self.hidden_size) + Int64(col)].to(
                         cutlass.Float32
                     )
                     acc += _materialize_w4a16_topk_route_f32(route_value)
@@ -9864,6 +9868,7 @@ def compile_w4a16_topk_sum(
     route_ids_dtype: torch.dtype = torch.int32,
     use_expert_map: bool = False,
     broadcast_svh: bool = False,
+    float32_output: bool = False,
 ) -> W4A16TopKSumCompileResult:
     cutlass_dtype = _cutlass_element_dtype(element_dtype)
     if route_ids_dtype not in (torch.int32, torch.int64):
@@ -9883,6 +9888,7 @@ def compile_w4a16_topk_sum(
         str(route_ids_dtype),
         bool(use_expert_map),
         bool(broadcast_svh),
+        bool(float32_output),
     )
     cached = _SUM_CACHE.get(cache_key)
     if cached is not None:
@@ -9893,7 +9899,7 @@ def compile_w4a16_topk_sum(
         )
 
     fc2_fake = make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
-    output_dtype = cutlass.Float32 if full_rotation else cutlass_dtype
+    output_dtype = cutlass.Float32 if full_rotation or float32_output else cutlass_dtype
     output_fake = make_ptr(output_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     topk_weights_fake = make_ptr(
         cutlass.Float32, 4, cute.AddressSpace.gmem, assumed_align=4
@@ -9919,6 +9925,7 @@ def compile_w4a16_topk_sum(
         route_num_experts=route_num_experts,
         use_expert_map=use_expert_map,
         broadcast_svh=broadcast_svh,
+        float32_output=float32_output,
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=kernel, cache_key=cache_key
@@ -9937,7 +9944,7 @@ def compile_w4a16_topk_sum(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "moe.w4a16.topk_sum",
-            3,
+            4,
             cache_key,
         ),
     )
@@ -10994,6 +11001,7 @@ def _w4a16_topk_sum_launch_flat(
         route_ids_dtype=route_ids_dtype,
         use_expert_map=expert_map is not None,
         broadcast_svh=broadcast_svh,
+        float32_output=output.dtype == torch.float32,
     )
     dummy_addr = output.data_ptr()
     weights_addr = dummy_addr if topk_weights is None else topk_weights.data_ptr()
@@ -11014,7 +11022,7 @@ def _w4a16_topk_sum_launch_flat(
             assumed_align=16,
         ),
         make_ptr(
-            cutlass.Float32 if full_rotation else _cutlass_element_dtype(element_dtype),
+            cutlass.Float32 if full_rotation or output.dtype == torch.float32 else _cutlass_element_dtype(element_dtype),
             output.data_ptr(),
             cute.AddressSpace.gmem,
             assumed_align=16,

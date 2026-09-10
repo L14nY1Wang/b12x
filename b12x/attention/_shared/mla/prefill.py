@@ -56,7 +56,7 @@ def _cache_block_stride_bytes(
         COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN,
     )
 
-    if is_glm_model_type(model_type):
+    if is_glm_model_type(model_type) or model_type == ModelType.DSV41:
         # GLM-family per-token contiguous record: 656B (ARBITRARY_FP32) or
         # 432B (NVFP4_E4M3). ``record_bytes`` comes from traits.kv_gmem_stride.
         rec = int(record_bytes) if record_bytes is not None else _GLM_KV_GMEM_STRIDE
@@ -250,7 +250,7 @@ def run_unified_prefill(
                 "extra_indices, and extra_page_block_size together (partial extra "
                 "trio is unsupported, matching upstream sparse_mla_sm120.cu:171-174)"
             )
-        if model_type != ModelType.DSV4:
+        if model_type not in (ModelType.DSV4, ModelType.DSV41):
             raise ValueError(
                 "SM120 sparse MLA prefill dual-cache (extra tokens) is DSV4-only "
                 "(q_head_dim==512); GLM/DSV3.2 has no extra cache"
@@ -306,6 +306,10 @@ def run_unified_prefill(
         from .prefill_mg import run_unified_prefill_mg
 
         partitions = _mg_head_partitions(heads, hpb)
+        if model_type == ModelType.DSV41:
+            # The heterogeneous double-buffered 544-byte records leave room
+            # for one BF16 query group, not two, in the SM120 shared carveout.
+            partitions = ((1, heads, 0),)
         if not partitions:
             raise ValueError(
                 f"SM120 sparse MLA prefill requires heads divisible by {hpb // 2}, got {heads}"
@@ -343,6 +347,18 @@ def run_unified_prefill(
                 kwargs.update(active_heads=active_heads, head_offset=head_offset)
             run_unified_prefill_mg(**kwargs)
         return output, lse_out
+
+    if model_type == ModelType.DSV41:
+        return _run_partitioned_mg(
+            compute_mode=ComputeMode.BF16,
+            model_type=model_type,
+            scale_format=ScaleFormat.NVFP4_E4M3,
+            extra_kv_cache=extra_kv_cache,
+            extra_indices=extra_indices,
+            extra_topk_length=extra_topk_length,
+            extra_page_block_size=extra_page_block_size,
+            stride_extra_kv_block=stride_extra_kv_block,
+        )
 
     # ── MG (multi-head-group) gate ────────────────────────────────────────────
     # DSV4 main-cache. The MG kernel is parameterized by the head-group count
