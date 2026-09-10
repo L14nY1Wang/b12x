@@ -80,6 +80,21 @@ def main() -> None:
       f"qualified shapes: "
       f"{summ['geomean_speedup_split_over_mono'] and round(summ['geomean_speedup_split_over_mono'], 3)}x**")
     a("")
+    a("## Scope")
+    a("")
+    a("This receipt covers the split's target regime only: the large-M "
+      "M128-tile prefill band (routed rows 4096–65536) where the split "
+      "specialization engages. Small-M tiles fall back to the monolithic kernel "
+      "and are intentionally not measured here, so the geomean is a "
+      "target-regime figure, not a whole-workload average. The measured 2.21x "
+      "is higher than the 1.31x geomean / 1.41x max the PR description quotes "
+      "because those figures average over a wider engaged-shape mix that "
+      "includes smaller-M shapes; the per-shape ordering and direction agree. "
+      "The oracle is the repo's `moe_reference_nvfp4` on synthetic quantized "
+      "weights, not a checkpoint decode; treat this as kernel-path evidence for "
+      "the dispatch decision, and re-measure on the target checkpoint before "
+      "quoting a serving number.")
+    a("")
     a("## Source artifact hashes (SHA-256)")
     a("")
     for path, h in sorted(r["source_sha256"].items()):
