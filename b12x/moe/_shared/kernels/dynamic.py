@@ -918,6 +918,7 @@ class MoEDynamicKernelBackend:
                 # for nvfp4 splits, so self.activation is always the kernel's
                 # supported specialization here.
                 activation=self.activation,
+                swiglu_limit=swiglu_limit,
             )
             self.materialized_phase2_kernel = Nvfp4MaterializedPhase2Kernel(
                 source_tile_m=materialized_source_tile_m,

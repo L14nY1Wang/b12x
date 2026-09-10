@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render the NVFP4 split-materialized evidence README from the JSON receipt."""
+"""Render production-graph NVFP4 receipts without promoting failed timings."""
 from __future__ import annotations
 
 import json
@@ -8,139 +8,165 @@ import sys
 from pathlib import Path
 
 
+def _qualified(receipt, case):
+    return bool(
+        receipt.get("version", 0) >= 2
+        and case.get("qualified")
+        and case.get("arm_identity_passed")
+        and case.get("split_engaged")
+        and case.get("correctness", {}).get("passed")
+        and case.get("graph_check", {}).get("passed")
+        and case.get("post_timing_correctness", {}).get("passed")
+        and case.get("timing_allocation_stable")
+        and case.get("timing_addresses_stable")
+    )
+
+
 def main() -> None:
     src = Path(sys.argv[1])
     dst = Path(sys.argv[2])
     r = json.loads(src.read_text())
-    lines: list[str] = []
+    lines = []
     a = lines.append
-
-    snap = r.get("gpu_snapshot", {})
-    # Prefer the first engaged case that actually carries an active-snapshot
-    # reading; cases[0] may be a skipped shape or a correctness-failed case
-    # whose timings (and therefore the under-load snapshot) were withheld.
-    active = next(
-        (
-            c["gpu_mode_active"]
-            for c in r["cases"]
-            if c.get("split_engaged") and c.get("gpu_mode_active", {}).get("fields")
-        ),
-        {},
-    )
-    af = active.get("fields", {})
     a("# NVFP4 split-materialized prefill — evidence")
     a("")
     a(f"- **Date (UTC):** {r['generated_utc']}")
-    a(f"- **Commit:** `{r['commit']}` (short `{r['commit_short']}`, branch `{r['branch']}`)")
-    worktree = "; ".join(
-        ln.strip() for ln in (r.get("worktree_status") or "clean").splitlines()
-    ) or "clean"
-    a(f"- **Worktree (at launch):** `{worktree}`")
-    a(f"- **GPU:** {r['gpu_name']}")
-    a(f"- **Active GPU mode (P-state / SM / mem clock / temp):** "
-      f"{af.get('pstate')} / {af.get('clocks.current.sm')} MHz / "
-      f"{af.get('clocks.current.memory')} MHz / {af.get('temperature.gpu')} °C "
-      f"(sampled under sustained launch)")
-    a(f"- **Idle snapshot:** pstate={snap.get('fields', {}).get('pstate')} "
-      f"(clocks not locked; not root)")
-    a(f"- **Package versions:** {json.dumps(r['package_versions'])}")
-    a(f"- **`B12X_NVFP4_DYNAMIC_MATERIALIZED`:** {r['env'].get('B12X_NVFP4_DYNAMIC_MATERIALIZED')!r} "
-      f"(unset → auto-enable for matching shapes)")
-    a(f"- **Per-arm samples:** {r['iters']} iterations × {r['rounds']} interleaved rounds, "
-      f"{r['warmup']} warmup; CUDA-event timing; medians reported.")
+    a(f"- **Commit:** `{r['commit']}` (branch `{r['branch']}`)")
+    a(f"- **Actual worktree path:** `{r.get('worktree_path', 'not recorded')}`")
+    worktree = "; ".join((r.get("worktree_status") or "clean").splitlines())
+    a(f"- **Worktree status at launch:** `{worktree}`")
+    a(f"- **Command working directory:** `{r.get('command_cwd', 'not recorded')}`")
+    a(f"- **Invocation working directory:** `{r.get('invocation_cwd', 'not recorded')}`")
+    a(f"- **GPU:** {r['gpu_name']}; device identity: `{json.dumps(r.get('gpu_device', {}))}`")
+    a(f"- **Initial physical GPU/mode snapshot:** `{json.dumps(r.get('gpu_snapshot', {}))}`")
+    a(f"- **Package versions:** `{json.dumps(r['package_versions'])}`")
+    a(f"- **Initial process settings:** `{json.dumps(r.get('env', {}), sort_keys=True)}`")
+    a(f"- **Explicit per-arm settings:** `{json.dumps(r.get('arm_settings', {}), sort_keys=True)}`")
+    a(f"- **Fast math (both arms):** `{r.get('fast_math', 'not recorded')}`")
+    a(f"- **Samples per arm:** {r['iters']} iterations × {r['rounds']} rounds, "
+      f"{r['warmup']} warmup replays per round; alternating lead arm, CUDA events.")
+    a("- **Aggregation:** median of per-round medians; ratio = monolithic_us / split_us "
+      "(>1 means split is faster). Raw per-replay samples and round order remain in JSON.")
     a(f"- **Command:** `{r['command']}`")
-    if r.get("argv"):
-        a(f"- **argv:** `{json.dumps(r['argv'])}`")
+    a(f"- **argv:** `{json.dumps(r.get('argv', []))}`")
     a("")
-    a("## Path")
+    a("## Measured path and scope")
     a("")
-    a("Both arms drive one traced call through the production `@cute.jit` host "
-      "adapter `_DynamicMoELaunch` (the adapter `b12x_moe_fp4` reaches for the "
-      "dynamic recipe). The monolithic arm compiles the cooperative fused kernel; "
-      "the split arm compiles the route/pack front-end plus the external "
-      "`Nvfp4MaterializedPhase1Kernel` / `Nvfp4MaterializedPhase2Kernel`. Identical "
-      "expert payloads, routed inputs, and `moe_reference_nvfp4` oracle; they differ "
-      "only by `materialize_intermediate`. The split specialization engages only in "
-      "the `mma_tiler_mn == (128, 128)` regime.")
+    if r.get("version", 0) >= 2:
+        a("Both arms use canonical `fused_moe.plan_weights/prepare_weights` and "
+          "`plan_execution/prewarm/bind/run`, with shared synthetic NVFP4 weights, "
+          "input, routing and scalar input scale. Each arm owns fixed-capacity "
+          "scratch and output. One production CUDA graph is captured per arm with "
+          "`B12X_NVFP4_DYNAMIC_MATERIALIZED=0` (monolithic) or `1` (split); the "
+          "environment and its cache are restored afterward. Only graph replay is "
+          "timed, with no Python policy/environment resolution or tensor allocation "
+          "in the replay path. Tile and active-cluster values come from production, "
+          "not a test launcher or a benchmark override.")
+        a("")
+        a("Engagement is verified on the actual dynamic launch resolved during "
+          "capture: pass-through observers associate its compiled object with the "
+          "backend supplied to the production compiler. The receipt records the "
+          "backend's split flag, selected tile and actual active-cluster count. "
+          "An unobserved cache identity, unengaged split, or misidentified monolithic "
+          "arm cannot qualify a ratio. Observers are removed before replay/timing.")
+    else:
+        a("**Legacy receipt: not production-plan evidence.** This receipt predates "
+          "the production graph benchmark. Its forced test-launcher geometry and "
+          "separately constructed engagement probe cannot establish production "
+          "dispatch or occupancy. No legacy timing is promoted to a qualified result here.")
     a("")
-    a("## Correctness gate")
+    a("These measurements do not establish equivalence to earlier forced, "
+      "underoccupied test-launcher results, reproduce the PR's historical speedups, "
+      "or justify reconciling those speedups by shape mix. Only freshly measured, "
+      "qualified production-graph rows below support performance statements. This "
+      "is synthetic kernel-path evidence, not a checkpoint/serving benchmark or "
+      "a whole-workload average. Unengaged cases remain visible.")
     a("")
-    a("Per shape, all of the following must hold before any timing is recorded: "
-      "split and monolithic outputs are finite and nonzero; split and monolithic "
-      "cosine > 0.9999 versus the `moe_reference_nvfp4` oracle; split-vs-monolithic "
-      "cosine > 0.9999 and split-vs-monolithic RMSE within the bound; and each arm's "
-      "global RMSE ≤ `max(8e-4, 3 · 2⁻⁸ · max|oracle|)`. The bound is computed by "
-      "`_bf16_output_bound` in "
-      "`tests/moe/test_nvfp4_phase_kernels.py`; the per-shape value is recorded as "
-      "`bound_abs` in the companion JSON. The per-element `max_abs` is recorded as a "
-      "diagnostic only: FP4 intermediate requantization noise grows with routed-row "
-      "count on the single worst BF16 element, so a hard `max_abs` gate would reject "
-      "valid large-M prefill (the monolithic production arm trips it too). A shape "
-      "that fails this gate is shown as FAIL with no timings and is excluded from "
-      "the headline speedup.")
+    a("## Qualification")
     a("")
-    a("## Results (ratio = monolithic_us / split_us; >1.0 means split is faster)")
+    a("Before timing, each output must be finite and nonzero, cosine > 0.9999 "
+      "against the independent torch `moe_reference_nvfp4` oracle, and global "
+      "RMSE ≤ `max(8e-4, 3 · 2⁻⁸ · max|oracle|)`. The same cosine/RMSE gates "
+      "apply split versus monolithic. The oracle uses direct-division NVFP4 "
+      "quantization. `_bf16_output_bound` supplies the numerical bound; "
+      "`max_abs` remains a diagnostic, not an acceptance gate. This does not "
+      "claim that any max-absolute discrepancy is harmless.")
     a("")
-    a("| E | K | n | top_k | M | routed rows | split med (us) | mono med (us) | speedup | correct |")
-    a("|---|---|---|-------|---|-------------|----------------|---------------|---------|---------|")
+    a("Both graph outputs are poisoned with NaN and rewritten twice, alternating "
+      "the replay order, and rechecked against the oracle and each other. Live "
+      "allocated bytes, cumulative allocation counts around replay, and bound "
+      "tensor/scratch addresses must remain stable. Outputs, allocation counts "
+      "and addresses are checked again after timing. Initial failures have no "
+      "timing samples; post-timing failures retain raw samples as unqualified "
+      "diagnostics only. No failed case gets headline latency or ratio.")
+    a("")
+    a("## Qualified results")
+    a("")
+    a("| E | K | n | top_k | M | split median (us) | mono median (us) | mono / split | status |")
+    a("|---|---|---|---|---|---|---|---|---|")
+    ratios = []
     for c in r["cases"]:
         s = c["shape"]
+        qualified = _qualified(r, c)
         med = c.get("median_us") or {}
-        sp = c.get("speedup_split_over_mono")
-        passed = c.get("correctness", {}).get("passed")
-        if not c.get("split_engaged"):
-            a(f"| {s['E']} | {s['K']} | {s['n']} | {s['top_k']} | {s['M']} | "
-              f"{c['routed_rows']} | — | — | — | split not engaged |")
-            continue
-        split_us = f"{med['split']:.1f}" if "split" in med else "—"
-        mono_us = f"{med['monolithic']:.1f}" if "monolithic" in med else "—"
-        ratio = f"{sp:.2f}x" if sp else "—"
-        a(f"| {s['E']} | {s['K']} | {s['n']} | {s['top_k']} | {s['M']} | "
-          f"{c['routed_rows']} | {split_us} | {mono_us} | {ratio} | "
-          f"{'PASS' if passed else 'FAIL'} |")
+        if qualified:
+            ratio = med["monolithic"] / med["split"]
+            ratios.append(ratio)
+            values = f"{med['split']:.2f} | {med['monolithic']:.2f} | {ratio:.3f}x"
+        else:
+            values = "— | — | —"
+        status = "QUALIFIED" if qualified else c.get("status", "legacy/unqualified")
+        a(f"| {s['E']} | {s['K']} | {s['n']} | {s['top_k']} | {s['M']} | {values} | {status} |")
     a("")
-    summ = r["summary"]
-    n_qual = summ["qualified_speedups"]
-    geomean = summ["geomean_speedup_split_over_mono"]
-    a(f"**Geomean split-over-monolithic speedup over {n_qual} qualified "
-      f"shape{'s' if n_qual != 1 else ''}: "
-      f"{round(geomean, 3) if geomean is not None else 'n/a'}x**")
+    if ratios:
+        a(f"**Geomean mono/split ratio across {len(ratios)} qualified shapes: "
+          f"{statistics.geometric_mean(ratios):.3f}x.**")
+    else:
+        a("**No qualified timing result.**")
     a("")
-    a("## Scope and reconciliation with the PR objective")
-    a("")
-    a("This receipt measures only the split's target regime: the large-M "
-      "M128-tile prefill band (routed rows 4096–65536, M 2048–8192) where the "
-      "split specialization engages. Small-M tiles fall back to the monolithic "
-      "kernel and are intentionally not measured, so the geomean is a "
-      "target-regime figure, not a whole-workload average.")
-    a("")
-    a("The pull-request objective reports roughly 1.24–1.41x per shape and a "
-      "~1.31x geomean for the same feature on the RTX 5090. The two results do "
-      "not conflict: the PR-objective band averages a wider engaged-shape mix "
-      "that includes smaller-M shapes, where the split's advantage over the "
-      "monolithic kernel is smaller, while this receipt isolates the large-M "
-      "end of that band. The measurements that support the dispatch decision "
-      "for the covered band are this receipt's per-shape, correctness-gated "
-      "ratios; the PR-objective figure is not reproducible from this receipt "
-      "and is quoted only as the objective it reconciles against.")
-    a("")
-    a("The oracle is the repo's `moe_reference_nvfp4` on synthetic quantized "
-      "weights, not a checkpoint decode; treat this as kernel-path evidence and "
-      "re-measure on the target checkpoint before quoting a serving number.")
+    a("## Per-case identities and raw qualification diagnostics")
+    for c in r["cases"]:
+        s = c["shape"]
+        a("")
+        a(f"### E={s['E']}, K={s['K']}, n={s['n']}, top_k={s['top_k']}, M={s['M']}")
+        a("")
+        a(f"- Status: `{c.get('status', 'legacy/unqualified')}`; "
+          f"split engaged: `{c.get('split_engaged')}`; qualified: `{_qualified(r, c)}`.")
+        if c.get("error"):
+            a(f"- Error: `{c['error']}`")
+        for name, arm in c.get("arms", {}).items():
+            a(f"- {name} identity/settings: `{json.dumps(arm, sort_keys=True)}`")
+        a(f"- Initial correctness (raw metrics): `{json.dumps(c.get('correctness', {}), sort_keys=True)}`")
+        graph = c.get("graph_check", {})
+        a(f"- Graph poison/rewrite and stability: "
+          f"`{json.dumps({key: value for key, value in graph.items() if key != 'addresses'}, sort_keys=True)}`")
+        a(f"- Post-timing correctness: `{json.dumps(c.get('post_timing_correctness', {}), sort_keys=True)}`")
+        a(f"- Post-timing allocation/address stability: "
+          f"`{c.get('timing_allocation_stable')}` / `{c.get('timing_addresses_stable')}`.")
+        samples = c.get("samples_us", {})
+        counts = {name: sum(len(batch) for batch in rounds) for name, rounds in samples.items()}
+        a(f"- Raw timing sample counts: `{json.dumps(counts)}`; "
+          f"{'qualified' if _qualified(r, c) else 'not headline evidence'}.")
+        a(f"- Per-arm active physical GPU/mode snapshots: "
+          f"`{json.dumps(c.get('gpu_mode_active', {}), sort_keys=True)}`")
     a("")
     a("## Source artifact hashes (SHA-256)")
     a("")
-    a("Measured kernels, host adapter, and this benchmark orchestrator. "
-      "Validation tests are intentionally excluded: refining a test does not "
-      "invalidate a recorded measurement.")
+    a(r.get("source_hash_scope", "Legacy source list is incomplete for imported input/oracle helpers."))
+    if r.get("version", 0) >= 2:
+        a("Hashes are collected again when saving, after lazy imports, so local input, "
+          "oracle, preparation, planning, launch and compiler helpers are included.")
     a("")
-    for path, h in sorted(r["source_sha256"].items()):
-        a(f"- `{path}`: {h}")
+    for path, digest in sorted(r.get("source_sha256", {}).items()):
+        a(f"- `{path}`: {digest}")
     a("")
     a("## Raw data")
     a("")
-    a(f"Per-shape raw timing samples (all {r['rounds']} rounds × {r['iters']} iters) "
-      "and full correctness metrics are in the companion JSON next to this file.")
+    a(f"Receipt: `{src.name}`. Consult the JSON for raw samples and available "
+      "correctness, identity and provenance fields. Version 2 also records round "
+      "order, fixed addresses and actual capture identities; legacy receipts do "
+      "not establish those facts. Failed or unengaged rows are diagnostics, "
+      "not speedup claims.")
     dst.write_text("\n".join(lines) + "\n")
     print(f"wrote {dst}")
 
