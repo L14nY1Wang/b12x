@@ -3829,18 +3829,27 @@ def _plan_core_workspace(
     # NVFP4 split-materialized storage: payload plane
     # [phys_row][(n//128)*16] u32 + scale plane [(n//128)][rows_capacity][2] u32.
     # Total bytes = rows_padded * (n//128) * 72.
-    # Check the env flag directly (plan time does not have share_input_across_experts
-    # yet; the conservative over-allocation is harmless since monolithic uses less).
+    # This must share the auto-on default with the launch-side gate
+    # (_nvfp4_dynamic_materialized_enabled) so a default-select split shape
+    # does not under-allocate its intermediate scratch.  Plan time has no
+    # share_input_across_experts yet, so the conservative dense-candidate
+    # (without that half of the conjunction) drives allocation; oversizing is
+    # harmless because the monolithic path consumes less than this.
     materialized_intermediate_bytes = 16
     if _is_w4a8_quant_mode(quant_mode):
         materialized_intermediate_bytes = max(
             16,
             dynamic_rows_padded * (dynamic_kernel_n + dynamic_kernel_n // 32),
         )
-    elif (
-        quant_mode == "nvfp4"
-        and _env_flag(_DYNAMIC_NVFP4_MATERIALIZED_ENV, default=False)
-    ):
+    elif quant_mode == "nvfp4" and _nvfp4_dynamic_dense_candidate(
+        quant_mode=quant_mode,
+        activation=activation,
+        routed_rows=routed_rows,
+        num_experts=weight_E,
+        k=k,
+        n=n,
+        deterministic_output=deterministic_output,
+    ) and _env_flag(_DYNAMIC_NVFP4_MATERIALIZED_ENV, default=True):
         materialized_intermediate_bytes = max(
             16,
             dynamic_rows_padded * (int(n) // 128) * 72,

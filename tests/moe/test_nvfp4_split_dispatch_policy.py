@@ -127,7 +127,11 @@ class TestNvfp4SplitWorkspace:
             os.environ[_DYNAMIC_NVFP4_MATERIALIZED_ENV] = saved
 
     def test_intermediate_bytes_sufficient(self):
-        os.environ[_DYNAMIC_NVFP4_MATERIALIZED_ENV] = "1"
+        # Domain large enough that the tile planner selects (128,128), matching
+        # the split predicate (real prefill shapes are far above this).  Env
+        # unset → auto-on (default True), so the plan allocates the NVFP4
+        # intermediate scratch.
+        os.environ.pop(_DYNAMIC_NVFP4_MATERIALIZED_ENV, None)
         plan = _plan_core_workspace(
             implementation="b12x",
             quant_mode="nvfp4",
@@ -138,13 +142,14 @@ class TestNvfp4SplitWorkspace:
             num_topk=2,
             device=torch.device("cuda"),
             dtype=torch.bfloat16,
-            routed_rows=256,
-            max_rows=512,
+            routed_rows=2048,
+            max_rows=8192,
         )
         # The plan sets dynamic_physical_tiles and dynamic_tile_m.
         tile_m = plan.dynamic_tile_m
         phys_tiles = plan.dynamic_physical_tiles
         assert phys_tiles is not None and tile_m is not None
+        assert tile_m in {64, 128}, tile_m  # split predicate requires 64/128
         rows_padded = phys_tiles * tile_m
         needed = rows_padded * (plan.n // 128) * 72
         for spec in plan.tensor_specs:
