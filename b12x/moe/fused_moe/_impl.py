@@ -143,6 +143,39 @@ _W4A16_ROUTE_PACK_PREWARMED: set[tuple[object, ...]] = set()
 _DYNAMIC_W4A8_REPACKED_ENV = "B12X_DYNAMIC_W4A8_REPACKED"
 _DYNAMIC_W4A8_SHARE_INPUT_ENV = "B12X_DYNAMIC_W4A8_SHARE_INPUT"
 _DYNAMIC_W4A8_MATERIALIZED_ENV = "B12X_DYNAMIC_W4A8_MATERIALIZED"
+# NVFP4 split-materialized gate.  Set to "0" to force the monolithic nvfp4
+# path; any other value (including unset or the empty string) evaluates to the
+# structural predicate for the queried shape.  Accepted false values ("", "0",
+# "false", "False") are defined in ``_env_flag``.
+_DYNAMIC_NVFP4_MATERIALIZED_ENV = "B12X_NVFP4_DYNAMIC_MATERIALIZED"
+# Cache the env var at module level so ``_nvfp4_dynamic_materialized_enabled``
+# never re-reads it on the launch path.  The env cannot change at runtime in
+# production; the ``_nvfp4_materialized_env_refresh`` helper lets tests
+# invalidate the cache after changing the environment.
+_NVFP4_MATERIALIZED_ENV_RAW: str | None = None
+_NVFP4_MATERIALIZED_ENV_EXPLICIT = False
+_NVFP4_MATERIALIZED_ENV_IS_TRUE = False
+
+
+def _nvfp4_materialized_env_refresh() -> None:
+    """Re-read ``B12X_NVFP4_DYNAMIC_MATERIALIZED`` into the module-level cache.
+
+    Called once at import and again by tests that change the environment
+    variable at runtime.
+    """
+    global _NVFP4_MATERIALIZED_ENV_RAW, _NVFP4_MATERIALIZED_ENV_EXPLICIT, _NVFP4_MATERIALIZED_ENV_IS_TRUE
+    _NVFP4_MATERIALIZED_ENV_RAW = raw = os.environ.get(
+        _DYNAMIC_NVFP4_MATERIALIZED_ENV
+    )
+    _NVFP4_MATERIALIZED_ENV_EXPLICIT = raw is not None
+    _NVFP4_MATERIALIZED_ENV_IS_TRUE = (
+        raw not in ("", "0", "false", "False")
+        if raw is not None
+        else False
+    )
+
+
+_nvfp4_materialized_env_refresh()
 _W4A8_CONVERT_SCRATCH_MB_ENV = "B12X_W4A8_CONVERT_SCRATCH_MB"
 _W4A8_CONVERT_SCRATCH_MB_DEFAULT = 64
 # The source-format vocabulary is owned by b12x.moe._shared.execution;
@@ -1744,6 +1777,55 @@ def _w4a8_dynamic_dense_candidate(
     )
 
 
+def _nvfp4_dynamic_dense_candidate(
+    *,
+    quant_mode: str,
+    activation: str,
+    routed_rows: int,
+    num_experts: int,
+    k: int,
+    n: int,
+    deterministic_output: bool,
+    planned_tile_m: int | None = None,
+) -> bool:
+    """Whether the NVFP4 split-materialized regime is structurally possible.
+
+    This is a structural predicate, separate from the feature env flag.
+    The split regime requires:
+    - quant_mode == "nvfp4" (excludes w4a8/w6a8 recipes)
+    - activation == "silu" (relu2, situ, etc. not yet wired in the phase kernels)
+    - k % 128 == 0 (phase kernel K-tile geometry)
+    - n % 128 == 0 (phase kernel N-tile geometry)
+    - mma_tiler_mn == (128, 128).  The M64 source tile is excluded: the phase
+      kernels' 64-row multi-tile specialization is not yet validated and is
+      known-wrong on multi-tile experts, so those shapes keep the monolithic
+      path.
+    - work_source != "ready_queue" (streaming work source not yet supported)
+    - not deterministic_output (the deterministic reduction is not yet wired)
+    - no dynamic down-scaling or forced swapped FC1 operands
+    """
+
+    return bool(
+        _normalize_quant_mode(quant_mode) == "nvfp4"
+        and activation in {"silu"}  # relu2 etc. excluded; situ not yet wired
+        and not deterministic_output  # deterministic reduction not yet wired
+        and not _dynamic_down_scale_enabled()
+        and _DYNAMIC_SWAP_AB_OVERRIDE in (None, "0")
+        and k % 128 == 0
+        and n % 128 == 0
+        and _select_dynamic_tile_mn(
+            routed_rows,
+            n,
+            quant_mode,
+            num_experts=num_experts,
+            activation=activation,
+            planned_tile_m=planned_tile_m,
+        )
+        == (128, 128)
+        and _dynamic_work_source() != "ready_queue"
+    )
+
+
 def _w4a8_dynamic_decode_candidate(
     *,
     quant_mode: str,
@@ -2000,6 +2082,55 @@ def _w4a8_dynamic_materialized_enabled(
     )
 
 
+def _nvfp4_dynamic_materialized_enabled(
+    *,
+    quant_mode: str,
+    activation: str,
+    routed_rows: int,
+    num_experts: int,
+    k: int,
+    n: int,
+    share_input_across_experts: bool,
+    deterministic_output: bool,
+    planned_tile_m: int | None = None,
+) -> bool:
+    """Resolve the NVFP4 split-materialized specialization as one decision.
+
+    The env flag ``B12X_NVFP4_DYNAMIC_MATERIALIZED`` is cached at module
+    level (read once at import) so the launch path never re-reads it.
+    When the env is unset, the structural+shared-input predicate determines
+    enablement so matching shapes auto-select the split path.
+    Set ``B12X_NVFP4_DYNAMIC_MATERIALIZED=0`` (or any false value: the empty
+    string, ``"0"``, ``"false"``, ``"False"``) to force the monolithic nvfp4
+    kernel for troubleshooting.
+    """
+
+    dense_candidate = _nvfp4_dynamic_dense_candidate(
+        quant_mode=quant_mode,
+        activation=activation,
+        routed_rows=routed_rows,
+        num_experts=num_experts,
+        k=k,
+        n=n,
+        deterministic_output=deterministic_output,
+        planned_tile_m=planned_tile_m,
+    )
+    full_candidate = dense_candidate and share_input_across_experts
+    if _NVFP4_MATERIALIZED_ENV_EXPLICIT:
+        return _NVFP4_MATERIALIZED_ENV_IS_TRUE and full_candidate
+    # Env unset: auto-on for matching shapes.
+    return bool(full_candidate)
+
+
+def _dynamic_materialized_intermediate_bytes(
+    *, quant_mode: str, rows_padded: int, n: int
+) -> int:
+    """Return the byte extent of the materialized payload and scale planes."""
+    if quant_mode == "nvfp4":
+        return rows_padded * (n // 128) * 72
+    return rows_padded * (n + n // 32)
+
+
 _WEIGHT_CACHE: Dict[Tuple[int, int, int], _WeightViews] = {}
 _MICRO_KERNEL_CACHE: Dict[Tuple, object] = {}
 _DYNAMIC_KERNEL_CACHE: Dict[Tuple, object] = {}
@@ -2017,6 +2148,7 @@ _DIRECT_ROUTING_MAX_ROUTED_ROWS = 32
 _MICRO_DYNAMIC_CUTOVER_PAIRS_CACHE: Dict[str, int] = {}
 _DYNAMIC_MULTICTA_CACHE: bool | None = None
 _DYNAMIC_DOWN_SCALE_CACHE: bool | None = None
+_DYNAMIC_SWAP_AB_OVERRIDE = os.environ.get("B12X_DYNAMIC_SWAP_AB")
 _LAST_WEIGHTS: Tuple = (None, None)  # (cache_key, views)
 _LAST_KERNEL: Tuple = (None, None)  # (cache_key, (compiled, mac))
 _MICRO_DIRECT_LAUNCH_CAP_CACHE: Dict[Tuple[int, int], bool] = {}
@@ -2059,6 +2191,7 @@ def clear_tp_moe_caches() -> None:
     global _MICRO_DYNAMIC_CUTOVER_PAIRS_CACHE
     global _DYNAMIC_MULTICTA_CACHE
     global _DYNAMIC_DOWN_SCALE_CACHE
+    global _DYNAMIC_SWAP_AB_OVERRIDE
     _WEIGHT_CACHE.clear()
     clear_w4a16_kernel_cache()
     _MICRO_KERNEL_CACHE.clear()
@@ -2068,6 +2201,7 @@ def clear_tp_moe_caches() -> None:
     _MICRO_DYNAMIC_CUTOVER_PAIRS_CACHE.clear()
     _DYNAMIC_MULTICTA_CACHE = None
     _DYNAMIC_DOWN_SCALE_CACHE = None
+    _DYNAMIC_SWAP_AB_OVERRIDE = os.environ.get("B12X_DYNAMIC_SWAP_AB")
     _LAST_WEIGHTS = (None, None)
     _LAST_KERNEL = (None, None)
 
@@ -3725,12 +3859,43 @@ def _plan_core_workspace(
     # UE8M0 byte per K32 block.  This storage must not alias route_output:
     # deterministic phase 2 writes one BF16 row per token-major route there
     # before the fixed-order top-k reduction.  Keep a small aligned sentinel
-    # for non-W4A8 dynamic plans so every binding has an invariant ABI.
+    # for unsupported recipes and geometry so every binding has an invariant ABI.
+    # The selected plan exposes NVFP4 payload and scales through its scratch
+    # specifications. The caller allocates that extent before binding; bind and
+    # run only map/use the supplied storage.
+    # Layout: [physical_row][n//128 * 16] payload u32, followed by
+    # [n//128][rows_capacity][2] scale u32: rows_padded * (n//128) * 72 bytes.
     materialized_intermediate_bytes = 16
     if _is_w4a8_quant_mode(quant_mode):
         materialized_intermediate_bytes = max(
             16,
-            dynamic_rows_padded * (dynamic_kernel_n + dynamic_kernel_n // 32),
+            _dynamic_materialized_intermediate_bytes(
+                quant_mode=quant_mode,
+                rows_padded=dynamic_rows_padded,
+                n=dynamic_kernel_n,
+            ),
+        )
+    elif quant_mode == "nvfp4" and _nvfp4_dynamic_dense_candidate(
+        quant_mode=quant_mode,
+        activation=activation,
+        routed_rows=routed_rows,
+        num_experts=weight_E,
+        k=k,
+        n=n,
+        deterministic_output=deterministic_output,
+        planned_tile_m=dynamic_tile_m,
+    ) and (
+        _NVFP4_MATERIALIZED_ENV_IS_TRUE
+        if _NVFP4_MATERIALIZED_ENV_EXPLICIT
+        else True
+    ):
+        materialized_intermediate_bytes = max(
+            16,
+            _dynamic_materialized_intermediate_bytes(
+                quant_mode=quant_mode,
+                rows_padded=dynamic_rows_padded,
+                n=int(n),
+            ),
         )
     materialized_intermediate_rows = max(
         1,
@@ -9686,9 +9851,23 @@ class _DynamicMoELaunch:
             scale_storage_ptr,
             layout=cute.make_layout((rows_padded * self._cols_pad_k,), stride=(1,)),
         )
-        intermediate_u32 = cute.make_tensor(
-            intermediate_ptr, layout=cute.make_layout((1,), stride=(1,))
-        )
+        if cutlass.const_expr(self._kernel.nvfp4_split_materialized):
+            intermediate_tiles = self._n // 128
+            words_per_row = intermediate_tiles * 16
+            intermediate_u32 = cute.make_tensor(
+                intermediate_ptr,
+                layout=cute.make_layout(
+                    (
+                        rows_padded * words_per_row
+                        + intermediate_tiles * rows_padded * 2,
+                    ),
+                    stride=(1,),
+                ),
+            )
+        else:
+            intermediate_u32 = cute.make_tensor(
+                intermediate_ptr, layout=cute.make_layout((1,), stride=(1,))
+            )
         token_map = cute.make_tensor(
             token_map_ptr, layout=cute.make_layout((rows_padded,), stride=(1,))
         )
@@ -10183,18 +10362,31 @@ def _get_dynamic_kernel(
         activation=activation_spec.activation,
         planned_tile_m=planned_tile_m,
     )
-    materialize_intermediate = _w4a8_dynamic_materialized_enabled(
-        quant_mode=quant_mode,
-        activation=activation_spec.activation,
-        num_tokens=m,
-        routed_rows=m * num_topk,
-        num_experts=E,
-        k=k,
-        n=n,
-        w4a8_repacked=w4a8_repacked,
-        share_input_across_experts=share_input_across_experts,
-        deterministic_output=deterministic_output,
-        planned_tile_m=planned_tile_m,
+    materialize_intermediate = (
+        _w4a8_dynamic_materialized_enabled(
+            quant_mode=quant_mode,
+            activation=activation_spec.activation,
+            num_tokens=m,
+            routed_rows=m * num_topk,
+            num_experts=E,
+            k=k,
+            n=n,
+            w4a8_repacked=w4a8_repacked,
+            share_input_across_experts=share_input_across_experts,
+            deterministic_output=deterministic_output,
+            planned_tile_m=planned_tile_m,
+        )
+        or _nvfp4_dynamic_materialized_enabled(
+            quant_mode=quant_mode,
+            activation=activation_spec.activation,
+            routed_rows=m * num_topk,
+            num_experts=E,
+            k=k,
+            n=n,
+            share_input_across_experts=share_input_across_experts,
+            deterministic_output=deterministic_output,
+            planned_tile_m=planned_tile_m,
+        )
     )
     separate_w13_halves = bool(
         quant_mode == "nvfp4"
@@ -10209,7 +10401,7 @@ def _get_dynamic_kernel(
         and int(n) % 128 != 0
         and int(n) % 32 == 0
     )
-    _swap_env = os.environ.get("B12X_DYNAMIC_SWAP_AB")
+    _swap_env = _DYNAMIC_SWAP_AB_OVERRIDE
     if _swap_env is not None:
         swap_ab = _swap_env != "0"
     if is_w4a8 or is_w6a8:
@@ -10732,18 +10924,31 @@ def _launch_dynamic_flat(
         activation=activation,
         planned_tile_m=planned_tile_m,
     )[0]
-    materialize_intermediate = _w4a8_dynamic_materialized_enabled(
-        quant_mode=quant_mode,
-        activation=activation,
-        num_tokens=m,
-        routed_rows=routed_rows,
-        num_experts=E,
-        k=k,
-        n=n,
-        w4a8_repacked=w4a8_repacked,
-        share_input_across_experts=share_input_across_experts,
-        deterministic_output=deterministic_output,
-        planned_tile_m=planned_tile_m,
+    materialize_intermediate = (
+        _w4a8_dynamic_materialized_enabled(
+            quant_mode=quant_mode,
+            activation=activation,
+            num_tokens=m,
+            routed_rows=routed_rows,
+            num_experts=E,
+            k=k,
+            n=n,
+            w4a8_repacked=w4a8_repacked,
+            share_input_across_experts=share_input_across_experts,
+            deterministic_output=deterministic_output,
+            planned_tile_m=planned_tile_m,
+        )
+        or _nvfp4_dynamic_materialized_enabled(
+            quant_mode=quant_mode,
+            activation=activation,
+            routed_rows=routed_rows,
+            num_experts=E,
+            k=k,
+            n=n,
+            share_input_across_experts=share_input_across_experts,
+            deterministic_output=deterministic_output,
+            planned_tile_m=planned_tile_m,
+        )
     )
     external_route_plan_supported = _dynamic_external_route_plan_supported(
         quant_mode=quant_mode,
@@ -10761,16 +10966,18 @@ def _launch_dynamic_flat(
         )
     )
     if materialize_intermediate:
-        required_intermediate_bytes = (
-            physical_tiles_capacity * selected_tile_m * (n + n // 32)
+        required_intermediate_bytes = _dynamic_materialized_intermediate_bytes(
+            quant_mode=quant_mode,
+            rows_padded=physical_tiles_capacity * selected_tile_m,
+            n=n,
         )
         available_intermediate_bytes = (
             materialized_intermediate.numel() * materialized_intermediate.element_size()
         )
         if available_intermediate_bytes < required_intermediate_bytes:
             raise ValueError(
-                "dynamic W4A8 materialized scratch exceeds preplanned capacity: "
-                f"need {required_intermediate_bytes} bytes, have "
+                f"dynamic {quant_mode} materialized scratch exceeds preplanned "
+                f"capacity: need {required_intermediate_bytes} bytes, have "
                 f"{available_intermediate_bytes}; physical_tiles_capacity="
                 f"{physical_tiles_capacity}, selected_tile_m={selected_tile_m}, "
                 f"n={n}, routed_rows={routed_rows}, m={m}, num_topk={num_topk}"
