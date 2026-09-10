@@ -56,6 +56,7 @@ class TestNvfp4SplitPredicate:
             os.environ.pop(_DYNAMIC_NVFP4_MATERIALIZED_ENV, None)
         else:
             os.environ[_DYNAMIC_NVFP4_MATERIALIZED_ENV] = saved
+        _nvfp4_materialized_env_refresh()
 
     def test_accepted_dense(self):
         """Reference dense prefill satisfies both candidate and enabled

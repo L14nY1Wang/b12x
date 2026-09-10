@@ -143,12 +143,9 @@ def _build_arm(*, materialize: bool, domain):
     return launch, ws
 
 
-def _time_arm(launch, ws) -> tuple[torch.Tensor, list[float]]:
-    launch()
-    torch.cuda.synchronize()
-    out = ws["scatter_output"].clone()
-    samples = _time_launch(launch, warmup=ARGS.warmup, iterations=ARGS.iters)
-    return out, samples
+def _time_arm(launch) -> list[float]:
+    """Time one already-compiled arm; correctness is gated separately."""
+    return _time_launch(launch, warmup=ARGS.warmup, iterations=ARGS.iters)
 
 
 def _engaged(domain) -> bool:
@@ -251,16 +248,76 @@ def main() -> None:
             save()
             continue
 
-        # Compile each arm once, then interleave timed rounds so thermal/clock
-        # drift hits both arms equally.  The cooperative front-end re-zeros its
-        # own volatile launch state, so repeated launches on the cached closure
-        # are valid measurements.
+        # Compile each arm once.  Correctness is checked BEFORE any timed
+        # sample is recorded, so a shape that fails the gate contributes no
+        # timing to the receipt at all.
         mono_launch, mono_ws = _build_arm(materialize=False, domain=domain)
         split_launch, split_ws = _build_arm(materialize=True, domain=domain)
-        split_out = mono_out = None
-        for _r in range(ARGS.rounds):
-            mono_out, mono_samples = _time_arm(mono_launch, mono_ws)
-            split_out, split_samples = _time_arm(split_launch, split_ws)
+        mono_launch()
+        split_launch()
+        torch.cuda.synchronize()
+        mono_out = mono_ws["scatter_output"].clone()
+        split_out = split_ws["scatter_output"].clone()
+
+        bound = _bf16_output_bound(domain["oracle"])
+        mono_metrics = compare_to_reference(mono_out.float(), domain["oracle"])
+        split_metrics = compare_to_reference(split_out.float(), domain["oracle"])
+        split_vs_mono = compare_to_reference(split_out.float(), mono_out.float())
+        finite_split = bool(torch.isfinite(split_out.float()).all())
+        finite_mono = bool(torch.isfinite(mono_out.float()).all())
+        nonzero_split = int(split_out.count_nonzero()) > 0
+        nonzero_mono = int(mono_out.count_nonzero()) > 0
+        case["correctness"] = {
+            "bound_abs": bound,
+            "monolithic": asdict(mono_metrics),
+            "split": asdict(split_metrics),
+            "split_vs_monolithic": asdict(split_vs_mono),
+            "finite_split": finite_split,
+            "finite_monolithic": finite_mono,
+            "nonzero_split": nonzero_split,
+            "nonzero_monolithic": nonzero_mono,
+        }
+        # Qualification uses the global gates the repo relies on as primary for
+        # NVFP4: cosine direction and global rmse, plus explicit finite and
+        # nonzero output checks so a zero or NaN arm can never yield a speedup.
+        # The per-element max_abs is recorded as a diagnostic only: FP4
+        # intermediate requantization noise grows with routed-row count on the
+        # single worst BF16 element, so a hard max_abs gate would reject valid
+        # large-shape prefill (the monolithic production arm trips it too).
+        case["correctness"]["split_passed"] = bool(
+            finite_split
+            and nonzero_split
+            and split_metrics.cos > 0.9999
+            and split_metrics.rmse <= bound
+        )
+        case["correctness"]["monolithic_passed"] = bool(
+            finite_mono
+            and nonzero_mono
+            and mono_metrics.cos > 0.9999
+            and mono_metrics.rmse <= bound
+        )
+        case["correctness"]["passed"] = bool(
+            case["correctness"]["split_passed"]
+            and case["correctness"]["monolithic_passed"]
+            and split_vs_mono.cos > 0.9999
+            and split_vs_mono.rmse <= bound
+        )
+        if not case["correctness"]["passed"]:
+            case["median_us"] = None
+            case["speedup_split_over_mono"] = None
+            save()
+            print(f"{spec}: FAILED correctness gate; timings withheld", flush=True)
+            continue
+
+        # Interleave timed rounds, alternating which arm leads each round so
+        # neither arm is systematically advantaged by ordering or drift.
+        for r in range(ARGS.rounds):
+            if r % 2 == 0:
+                mono_samples = _time_arm(mono_launch)
+                split_samples = _time_arm(split_launch)
+            else:
+                split_samples = _time_arm(split_launch)
+                mono_samples = _time_arm(mono_launch)
             case["samples_us"]["monolithic"].append(mono_samples)
             case["samples_us"]["split"].append(split_samples)
         # Capture the operating state under sustained load: the nvidia-smi
@@ -269,41 +326,6 @@ def main() -> None:
         # launch, so the reported pstate/SM clock reflect active prefill.
         case["gpu_mode_active"] = _sample_under_load(split_launch)
 
-        # Correctness gate on the final outputs (kept separate from timing).
-        bound = _bf16_output_bound(domain["oracle"])
-        mono_metrics = compare_to_reference(mono_out.float(), domain["oracle"])
-        split_metrics = compare_to_reference(split_out.float(), domain["oracle"])
-        split_vs_mono = compare_to_reference(split_out.float(), mono_out.float())
-        case["correctness"] = {
-            "bound_abs": bound,
-            "monolithic": asdict(mono_metrics),
-            "split": asdict(split_metrics),
-            "split_vs_monolithic": asdict(split_vs_mono),
-            "nonzero_split": int(split_out.count_nonzero()) > 0,
-            "nonzero_monolithic": int(mono_out.count_nonzero()) > 0,
-        }
-        # Qualification uses the global gates the repo relies on as primary for
-        # NVFP4: cosine direction and global rmse.  The per-element max_abs is
-        # recorded as a diagnostic only: FP4 intermediate requantization noise
-        # grows with routed-row count on the single worst BF16 element, so a
-        # hard max_abs gate would reject valid large-shape prefill (the
-        # monolithic production arm trips it too).  A genuinely broken path
-        # still fails via cos, rmse, or the split-vs-monolithic agreement.
-        case["correctness"]["split_passed"] = bool(
-            split_metrics.cos > 0.9999 and split_metrics.rmse <= bound
-        )
-        case["correctness"]["monolithic_passed"] = bool(
-            mono_metrics.cos > 0.9999 and mono_metrics.rmse <= bound
-        )
-        case["correctness"]["passed"] = bool(
-            case["correctness"]["split_passed"]
-            and case["correctness"]["monolithic_passed"]
-            and split_vs_mono.cos > 0.9999
-            and split_vs_mono.rmse <= bound
-        )
-
-        # Per-case median over iterations; ratio uses medians.  A failed
-        # correctness case contributes NO ratio to the headline.
         mono_med = statistics.median(
             statistics.median(s) for s in case["samples_us"]["monolithic"]
         )
@@ -314,17 +336,13 @@ def main() -> None:
             "monolithic": mono_med,
             "split": split_med,
         }
-        if case["correctness"]["passed"]:
-            ratio = mono_med / split_med
-            case["speedup_split_over_mono"] = ratio
-            ratios.append(ratio)
-        else:
-            case["speedup_split_over_mono"] = None
+        ratio = mono_med / split_med
+        case["speedup_split_over_mono"] = ratio
+        ratios.append(ratio)
         save()
         print(
             f"{spec}: split={split_med:.1f}us mono={mono_med:.1f}us "
-            f"speedup={case['speedup_split_over_mono'] and round(case['speedup_split_over_mono'], 3)} "
-            f"correct={case['correctness']['passed']}",
+            f"speedup={round(ratio, 3)} correct={case['correctness']['passed']}",
             flush=True,
         )
 

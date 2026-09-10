@@ -16,7 +16,17 @@ def main() -> None:
     a = lines.append
 
     snap = r.get("gpu_snapshot", {})
-    active = r["cases"][0].get("gpu_mode_active", {}) if r["cases"] else {}
+    # Prefer the first engaged case that actually carries an active-snapshot
+    # reading; cases[0] may be a skipped shape or a correctness-failed case
+    # whose timings (and therefore the under-load snapshot) were withheld.
+    active = next(
+        (
+            c["gpu_mode_active"]
+            for c in r["cases"]
+            if c.get("split_engaged") and c.get("gpu_mode_active", {}).get("fields")
+        ),
+        {},
+    )
     af = active.get("fields", {})
     a("# NVFP4 split-materialized prefill — evidence")
     a("")
@@ -86,14 +96,11 @@ def main() -> None:
       "M128-tile prefill band (routed rows 4096–65536) where the split "
       "specialization engages. Small-M tiles fall back to the monolithic kernel "
       "and are intentionally not measured here, so the geomean is a "
-      "target-regime figure, not a whole-workload average. The measured 2.21x "
-      "is higher than the 1.31x geomean / 1.41x max the PR description quotes "
-      "because those figures average over a wider engaged-shape mix that "
-      "includes smaller-M shapes; the per-shape ordering and direction agree. "
-      "The oracle is the repo's `moe_reference_nvfp4` on synthetic quantized "
-      "weights, not a checkpoint decode; treat this as kernel-path evidence for "
-      "the dispatch decision, and re-measure on the target checkpoint before "
-      "quoting a serving number.")
+      "target-regime figure, not a whole-workload average. The oracle is the "
+      "repo's `moe_reference_nvfp4` on synthetic quantized weights, not a "
+      "checkpoint decode; treat this as kernel-path evidence for the dispatch "
+      "decision and re-measure on the target checkpoint before quoting a "
+      "serving number. No other receipt's figures are cited or compared here.")
     a("")
     a("## Source artifact hashes (SHA-256)")
     a("")
