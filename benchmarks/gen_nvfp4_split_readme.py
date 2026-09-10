@@ -10,7 +10,7 @@ from pathlib import Path
 
 def _qualified(receipt, case):
     return bool(
-        receipt.get("version", 0) >= 2
+        receipt.get("version", 0) >= 3
         and case.get("qualified")
         and case.get("arm_identity_passed")
         and case.get("split_engaged")
@@ -19,6 +19,7 @@ def _qualified(receipt, case):
         and case.get("post_timing_correctness", {}).get("passed")
         and case.get("timing_allocation_stable")
         and case.get("timing_addresses_stable")
+        and case.get("gpu_mode_check", {}).get("passed")
     )
 
 
@@ -43,6 +44,7 @@ def main() -> None:
     a(f"- **Initial process settings:** `{json.dumps(r.get('env', {}), sort_keys=True)}`")
     a(f"- **Explicit per-arm settings:** `{json.dumps(r.get('arm_settings', {}), sort_keys=True)}`")
     a(f"- **Fast math (both arms):** `{r.get('fast_math', 'not recorded')}`")
+    a(f"- **Declared GPU-mode policy:** `{json.dumps(r.get('gpu_mode_policy', {}), sort_keys=True)}`")
     a(f"- **Samples per arm:** {r['iters']} iterations × {r['rounds']} rounds, "
       f"{r['warmup']} warmup replays per round; alternating lead arm, CUDA events.")
     a("- **Aggregation:** median of per-round medians; ratio = monolithic_us / split_us "
@@ -100,7 +102,16 @@ def main() -> None:
       "timing samples; post-timing failures retain raw samples as unqualified "
       "diagnostics only. No failed case gets headline latency or ratio.")
     a("")
-    a("## Qualified results")
+    a("Timings are diagnostic-only, not formal release evidence. Both arms must "
+      "remain P1 on the selected physical GPU with identical memory clocks and "
+      "an SM-clock difference within the bound declared in the command and JSON, "
+      "relative to the lower arm clock. Only throttle mask 0x0 is accepted by "
+      "default. `--allow-software-power-cap` explicitly permits only 0x0/0x4 "
+      "for interleaved Max-Q diagnostics; every other throttle reason is rejected. "
+      "The observed delta and any 0x0/0x4 transition are retained per case. "
+      "Receipts predating this declared check cannot qualify a timing ratio.")
+    a("")
+    a("## Qualified diagnostic results")
     a("")
     a("| E | K | n | top_k | M | split median (us) | mono median (us) | mono / split | status |")
     a("|---|---|---|---|---|---|---|---|---|")
@@ -115,11 +126,11 @@ def main() -> None:
             values = f"{med['split']:.2f} | {med['monolithic']:.2f} | {ratio:.3f}x"
         else:
             values = "— | — | —"
-        status = "QUALIFIED" if qualified else c.get("status", "legacy/unqualified")
+        status = "DIAGNOSTIC QUALIFIED" if qualified else c.get("status", "legacy/unqualified")
         a(f"| {s['E']} | {s['K']} | {s['n']} | {s['top_k']} | {s['M']} | {values} | {status} |")
     a("")
     if ratios:
-        a(f"**Geomean mono/split ratio across {len(ratios)} qualified shapes: "
+        a(f"**Geomean mono/split ratio across {len(ratios)} qualified diagnostic shapes: "
           f"{statistics.geometric_mean(ratios):.3f}x.**")
     else:
         a("**No qualified timing result.**")
@@ -149,6 +160,7 @@ def main() -> None:
           f"{'qualified' if _qualified(r, c) else 'not headline evidence'}.")
         a(f"- Per-arm active physical GPU/mode snapshots: "
           f"`{json.dumps(c.get('gpu_mode_active', {}), sort_keys=True)}`")
+        a(f"- GPU-mode qualification: `{json.dumps(c.get('gpu_mode_check', {}), sort_keys=True)}`")
     a("")
     a("## Source artifact hashes (SHA-256)")
     a("")
@@ -163,10 +175,10 @@ def main() -> None:
     a("## Raw data")
     a("")
     a(f"Receipt: `{src.name}`. Consult the JSON for raw samples and available "
-      "correctness, identity and provenance fields. Version 2 also records round "
-      "order, fixed addresses and actual capture identities; legacy receipts do "
-      "not establish those facts. Failed or unengaged rows are diagnostics, "
-      "not speedup claims.")
+      "correctness, identity and provenance fields. Version 2 records round "
+      "order, fixed addresses and actual capture identities; version 3 adds the "
+      "declared GPU-mode check. Older receipts do not establish those facts. "
+      "Failed or unengaged rows retain raw diagnostic samples, not speedup claims.")
     dst.write_text("\n".join(lines) + "\n")
     print(f"wrote {dst}")
 

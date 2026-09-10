@@ -15,6 +15,7 @@ from dataclasses import asdict, fields
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import shlex
@@ -362,6 +363,59 @@ def _sample_under_load(launch) -> dict:
     return holder.get("snapshot", {"available": False})
 
 
+def _gpu_mode_check(
+    snapshots, *, expected_uuid, allow_software_power_cap, max_sm_clock_delta_percent
+):
+    """Qualify diagnostic timings against the declared physical-GPU conditions."""
+    allowed_masks = (0, 4) if allow_software_power_cap else (0,)
+    failures = []
+    observed = {}
+    result = {
+        "allowed_throttle_masks": [hex(mask) for mask in allowed_masks],
+        "required_pstate": "P1",
+        "max_sm_clock_delta_percent": max_sm_clock_delta_percent,
+        "sm_clock_delta_percent": None,
+        "sm_clock_delta_reference": "minimum arm SM clock",
+        "software_power_cap_transition": False,
+        "failures": failures,
+    }
+    for name in ("monolithic", "split"):
+        snapshot = snapshots.get(name, {})
+        if not snapshot.get("available"):
+            failures.append(f"{name}: GPU mode snapshot unavailable")
+            continue
+        try:
+            mode = snapshot["fields"]
+            uuid = mode["uuid"].removeprefix("GPU-")
+            sm_clock = int(mode["clocks.current.sm"])
+            memory_clock = int(mode["clocks.current.memory"])
+            throttle_mask = int(mode["clocks_throttle_reasons.active"], 0)
+            if uuid != expected_uuid.removeprefix("GPU-"):
+                failures.append(f"{name}: physical GPU identity changed")
+            if mode["pstate"] != "P1":
+                failures.append(f"{name}: GPU is not in P1")
+            if throttle_mask not in allowed_masks:
+                failures.append(f"{name}: disallowed throttle mask {hex(throttle_mask)}")
+            if sm_clock <= 0 or memory_clock <= 0:
+                failures.append(f"{name}: invalid GPU clock")
+                continue
+            observed[name] = (sm_clock, memory_clock, throttle_mask)
+        except (KeyError, TypeError, ValueError, AttributeError) as error:
+            failures.append(f"{name}: invalid GPU mode snapshot: {error}")
+    if len(observed) == 2:
+        mono_sm, mono_memory, mono_mask = observed["monolithic"]
+        split_sm, split_memory, split_mask = observed["split"]
+        if mono_memory != split_memory:
+            failures.append("memory clocks differ between arms")
+        delta = 100.0 * abs(mono_sm - split_sm) / min(mono_sm, split_sm)
+        result["sm_clock_delta_percent"] = delta
+        if delta > max_sm_clock_delta_percent:
+            failures.append("SM-clock delta exceeds the declared bound")
+        result["software_power_cap_transition"] = {mono_mask, split_mask} == {0, 4}
+    result["passed"] = len(observed) == 2 and not failures
+    return result
+
+
 def _run_case(case, args, compiled_identities):
     x, ids, route_weights, experts, oracle = _build_inputs(**case["shape"], seed=args.seed)
     with _observe_production_launches(compiled_identities) as calls:
@@ -412,14 +466,24 @@ def _run_case(case, args, compiled_identities):
     )
     case["post_timing_correctness"] = _correctness(arms, oracle)
     case["timing_addresses_stable"] = _addresses(arms) == addresses
+    case["gpu_mode_check"] = _gpu_mode_check(
+        case["gpu_mode_active"],
+        expected_uuid=str(torch.cuda.get_device_properties(torch.cuda.current_device()).uuid),
+        allow_software_power_cap=args.allow_software_power_cap,
+        max_sm_clock_delta_percent=args.max_sm_clock_delta_percent,
+    )
     case["qualified"] = bool(
         case["post_timing_correctness"]["passed"] and case["timing_allocation_stable"]
         and case["timing_addresses_stable"]
+        and case["gpu_mode_check"]["passed"]
     )
     if not case["qualified"]:
-        case["status"] = "failed_post_timing_check"
+        case["status"] = (
+            "failed_gpu_mode_check"
+            if not case["gpu_mode_check"]["passed"] else "failed_post_timing_check"
+        )
         return
-    case["status"] = "qualified"
+    case["status"] = "diagnostic_qualified"
     case["median_us"] = {
         name: statistics.median(statistics.median(s) for s in rounds)
         for name, rounds in case["samples_us"].items()
@@ -441,10 +505,19 @@ def main() -> None:
         "--fast-math", action=argparse.BooleanOptionalAction, default=False,
         help="Enable approximate math; defaults off to preserve the original A/B precision mode.",
     )
+    parser.add_argument(
+        "--allow-software-power-cap", action="store_true",
+        help="Allow only 0x0/0x4 throttle masks for interleaved Max-Q diagnostics, not release evidence.",
+    )
+    parser.add_argument("--max-sm-clock-delta-percent", type=float, default=5.0)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.iters < 1 or args.rounds < 1 or args.warmup < 0:
         parser.error("iters/rounds must be positive and warmup must be nonnegative")
+    if not math.isfinite(args.max_sm_clock_delta_percent) or args.max_sm_clock_delta_percent < 0:
+        parser.error("max-sm-clock-delta-percent must be finite and nonnegative")
+    if args.allow_software_power_cap and args.rounds < 2:
+        parser.error("software-power-cap diagnostics require at least two alternating rounds")
     shapes = args.shape or [
         "8:4096:2048:2:2048", "8:4096:2048:2:4096", "8:4096:2048:2:8192",
         "64:4096:1024:8:2048", "64:4096:1024:8:4096", "64:4096:1024:8:8192",
@@ -454,7 +527,7 @@ def main() -> None:
     argv = [sys.executable, os.path.relpath(Path(sys.argv[0]).resolve(), ROOT), *sys.argv[1:]]
     properties = torch.cuda.get_device_properties(torch.cuda.current_device())
     report = {
-        "schema": "b12x.moe.nvfp4_split_materialized.benchmark", "version": 2,
+        "schema": "b12x.moe.nvfp4_split_materialized.benchmark", "version": 3,
         "generated_utc": datetime.now(timezone.utc).isoformat(),
         "argv": argv, "command": shlex.join(argv),
         "command_cwd": str(ROOT), "invocation_cwd": str(Path.cwd().resolve()),
@@ -476,6 +549,16 @@ def main() -> None:
                 if key.startswith(("B12X_", "CUDA_", "NVIDIA_"))},
         "arm_settings": {"monolithic": {SPLIT_ENV: "0"}, "split": {SPLIT_ENV: "1"}},
         "timed_path": "one captured production fused_moe.run per graph.replay",
+        "gpu_mode_policy": {
+            "qualification": "diagnostic only; not formal release evidence",
+            "allowed_throttle_masks": ["0x0", "0x4"] if args.allow_software_power_cap else ["0x0"],
+            "required_pstate": "P1",
+            "require_same_physical_gpu": True,
+            "require_same_memory_clock": True,
+            "max_sm_clock_delta_percent": args.max_sm_clock_delta_percent,
+            "sm_clock_delta_reference": "minimum arm SM clock",
+            "arm_order": "alternating lead arm each round",
+        },
         "source_hash_scope": "all loaded local modules plus benchmark and renderer, including input/oracle helpers",
         "iters": args.iters, "warmup": args.warmup, "rounds": args.rounds, "seed": args.seed,
         "fast_math": args.fast_math,
