@@ -104,8 +104,21 @@ The V4.1 serving adapter retains checkpoint-native BF16 weight storage and
 BF16 activation/collective outputs instead of promoting them solely to match
 reference rounding. Native accumulation, normalization, routing scores and
 ratio-two softmax-pooling state remain FP32 where required. Speculative
-rejection preserves allocator-owned per-token compressor partials rather than
-overwriting one terminal carry state.
+rejection preserves per-token compressor partials in request-owned bounded
+rings rather than overwriting one terminal carry state.
+
+The adapter binds mHC and sparse-attention/indexer plan scratch to vLLM's shared
+workspace. Outputs remain separate, live-row-sized allocations rather than
+per-layer scheduler-capacity buffers reserved during model construction.
+The [startup verification record](validation/deepseek_v41/startup_workspace_fix.json)
+covers the constructor-memory repair. The subsequent
+[native KV allocation repair](validation/deepseek_v41/native_kv_allocation_fix.json)
+aligns main KV and index K on the same logical token blocks, preserves their
+packed 890-byte-per-token global footprint, and restores model-derived cache
+grouping instead of the fork's bounded GLM grouping path. TP4 SSD serving now
+initializes the full 1M context at a 4096-token batch capacity and 0.95 memory
+utilization; the record distinguishes capacity accounting from exercised
+prompt lengths and includes graph replay, rejection, and prefix-reuse checks.
 
 `comm.pcie.PCIeDmaAllReduce.prepare_eager_replay(dtype)` prepares a lossless,
 capacity-sized CUDA graph for large eager collectives. All ranks prepare it

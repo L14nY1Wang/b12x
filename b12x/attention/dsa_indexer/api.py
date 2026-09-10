@@ -62,6 +62,7 @@ class Caps:
     max_batch: int | None = None
     output_index_space: Literal["logical", "physical"] = "logical"
     cache_format: Literal["fp8", "mxfp4"] = "fp8"
+    page_size: int = PAGED_INDEX_PAGE_SIZE
     max_candidates: int = 0
     candidate_topk_blocks: int = 0
 
@@ -75,15 +76,14 @@ class Caps:
             "max_q_rows",
             "max_page_table_width",
             "topk",
+            "page_size",
         ):
             value = int(getattr(self, name))
             if value <= 0:
                 raise ValueError(f"{name} must be positive, got {value}")
             object.__setattr__(self, name, value)
         if self.mode not in ("decode", "prefill"):
-            raise ValueError(
-                f"mode must be 'decode' or 'prefill', got {self.mode!r}"
-            )
+            raise ValueError(f"mode must be 'decode' or 'prefill', got {self.mode!r}")
         if self.output_index_space not in ("logical", "physical"):
             raise ValueError(
                 "output_index_space must be 'logical' or 'physical', got "
@@ -94,13 +94,18 @@ class Caps:
             raise ValueError(f"max_batch must be positive, got {max_batch}")
         object.__setattr__(self, "max_batch", max_batch)
         object.__setattr__(self, "max_candidates", int(self.max_candidates))
-        object.__setattr__(self, "candidate_topk_blocks", int(self.candidate_topk_blocks))
+        object.__setattr__(
+            self, "candidate_topk_blocks", int(self.candidate_topk_blocks)
+        )
         if self.cache_format not in ("fp8", "mxfp4"):
             raise ValueError("cache_format must be 'fp8' or 'mxfp4'")
         if self.cache_format == "fp8":
+            if self.page_size != PAGED_INDEX_PAGE_SIZE:
+                raise ValueError("FP8 indexer requires page_size=64")
             if self.max_candidates or self.candidate_topk_blocks:
                 raise ValueError("candidate recipes require cache_format='mxfp4'")
         else:
+            index_mxfp4_page_bytes(self.page_size)
             if self.output_index_space != "logical":
                 raise ValueError("MXFP4 candidate positions are always logical")
             if self.topk != 512:
@@ -145,7 +150,7 @@ def plan(caps: Caps, *, policy: PolicyContext | None = None) -> Plan:
             topk=caps.topk,
             mode=caps.mode,
             max_batch=caps.max_batch,
-            page_size=PAGED_INDEX_PAGE_SIZE,
+            page_size=caps.page_size,
             shared_page_table=caps.mode == "prefill",
             output_physical_slots=caps.output_index_space == "physical",
             cache_format=caps.cache_format,
@@ -186,18 +191,33 @@ def bind(
         if q_fp8 is not None:
             raise ValueError("MXFP4 packed data must be passed as q_mxfp4, not q_fp8")
         return bind_mxfp4(
-            plan, scratch=scratch, q_mxfp4=q_mxfp4, q_scales=q_scales,
-            query_weights=query_weights, index_k_cache=index_k_cache,
-            page_table=page_table, cache_lengths=cache_lengths,
-            active_width=active_width, output_indices=output_indices,
-            output_scores=output_scores, candidate_indices=candidate_indices,
-            candidate_lengths=candidate_lengths, candidate_output=candidate_output,
+            plan,
+            scratch=scratch,
+            q_mxfp4=q_mxfp4,
+            q_scales=q_scales,
+            query_weights=query_weights,
+            index_k_cache=index_k_cache,
+            page_table=page_table,
+            cache_lengths=cache_lengths,
+            active_width=active_width,
+            output_indices=output_indices,
+            output_scores=output_scores,
+            candidate_indices=candidate_indices,
+            candidate_lengths=candidate_lengths,
+            candidate_output=candidate_output,
             candidate_output_lengths=candidate_output_lengths,
         )
-    if any(x is not None for x in (
-        q_mxfp4, q_scales, candidate_indices, candidate_lengths,
-        candidate_output, candidate_output_lengths,
-    )):
+    if any(
+        x is not None
+        for x in (
+            q_mxfp4,
+            q_scales,
+            candidate_indices,
+            candidate_lengths,
+            candidate_output,
+            candidate_output_lengths,
+        )
+    ):
         raise ValueError("MXFP4 tensors require an MXFP4 plan")
     if q_fp8 is None:
         raise ValueError("FP8 recipe requires q_fp8")
@@ -210,13 +230,10 @@ def bind(
         )
     if int(q_fp8.shape[0]) > caps.max_q_rows:
         raise ValueError(
-            f"q_fp8 rows {int(q_fp8.shape[0])} exceed plan capacity "
-            f"{caps.max_q_rows}"
+            f"q_fp8 rows {int(q_fp8.shape[0])} exceed plan capacity {caps.max_q_rows}"
         )
     if q_fp8.dtype != torch.float8_e4m3fn:
-        raise TypeError(
-            f"q_fp8 must have dtype torch.float8_e4m3fn, got {q_fp8.dtype}"
-        )
+        raise TypeError(f"q_fp8 must have dtype torch.float8_e4m3fn, got {q_fp8.dtype}")
     if q_fp8.device != caps.device or not q_fp8.is_contiguous():
         raise ValueError(f"q_fp8 must be contiguous on {caps.device}")
     if query_weights.ndim == 3 and int(query_weights.shape[-1]) == 1:
@@ -247,9 +264,7 @@ def bind(
             f"dtype={index_k_cache.dtype}"
         )
     if index_k_cache.device != caps.device or int(index_k_cache.stride(1)) != 1:
-        raise ValueError(
-            f"index_k_cache must have unit inner stride on {caps.device}"
-        )
+        raise ValueError(f"index_k_cache must have unit inner stride on {caps.device}")
     runtime = plan.inner.bind(
         scratch=scratch,
         real_page_table=page_table,

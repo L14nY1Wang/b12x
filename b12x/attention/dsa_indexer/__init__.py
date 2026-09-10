@@ -20,6 +20,11 @@ the integrator all-reduces that buffer in place before ``select``. The source
 recipe emits sorted block8 candidates; later indexers score only those bounded
 logical positions. ``quantize_q_mxfp4`` and ``quantize_write_index_k_mxfp4``
 consume BF16 vectors with their last 64 dimensions already RoPE-rotated.
+MXFP4 ``Caps.page_size`` counts stored index states, not uncompressed input
+tokens, and must match the cache writer's ``page_size``. This lets a serving
+allocator pack main KV and index K for the same logical token block without
+turning the indexer's former 64-state default into a separate allocation unit.
+The FP8 recipe continues to require 64-state pages.
 
 Pure-torch semantics live in ``reference.py`` and ``msa_reference.py``.
 """

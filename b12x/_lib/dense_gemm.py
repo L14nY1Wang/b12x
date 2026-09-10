@@ -8037,6 +8037,11 @@ def dense_gemm(
             f"C row stride, but N={n} and c_dtype={c_dtype!r} produce "
             f"{c_row_stride_bytes} bytes; {remedy}"
         )
+    if is_mxfp8 and _tile_k_override is None and mma_tiler_mn[0] != 128:
+        # A caller's explicit M tile can differ from the default tile that
+        # justified automatic BK64 selection. Keep its native BK128 path;
+        # an explicitly forced incompatible BK64 still fails validation below.
+        tile_k = 128
     if is_mxfp8 and swap_ab:
         # BK64 packed-scale staging requires the weight operand to remain in
         # the unswapped 128-row slot. Swapped storage therefore uses BK128.
