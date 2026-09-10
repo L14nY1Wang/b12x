@@ -401,30 +401,32 @@ def _compile_phase2(domain, *, spec_name="tests.nvfp4_phase_kernels.p2"):
 
 
 def _allocate_intermediate(domain, *, big_offset: bool):
-    """Allocate the intermediate workspace; optionally park it past 2^31."""
+    """Allocate the intermediate workspace; optionally park it past 2^31.
+
+    The phase1 kernel writes both payload and scale planes into one contiguous
+    buffer: payload [rows_capacity * (n//128) * 16] u32 followed by scale
+    [(n//128) * rows_capacity * 2] u32.  One pool covers both.
+    """
     rows_capacity = domain["rows_capacity"]
     intermediate_tiles = domain["intermediate_tiles"]
     words_per_row = intermediate_tiles * 16
+    total_elements = rows_capacity * words_per_row + intermediate_tiles * rows_capacity * 2
     if big_offset:
-        # Pool-scaled offsets must survive 2^31/stride: allocate a large
-        # (mostly untouched) pool and place the domain at its tail.
-        payload_pad = 1 << 31  # elements (u32 words)
-        payload_pool = torch.zeros(
-            payload_pad + rows_capacity * words_per_row,
+        # Pool base parked past 2^31/stride so the kernel must use Int64
+        # arithmetic to compute the correct pointer.  Kernel-computed
+        # element offsets stay well below 2^31 for this synthetic domain
+        # (rows_capacity ~ hundreds); this test covers high base addresses
+        # only, not live kernel-generated offsets past the Int32 boundary.
+        pool_pad = 1 << 31  # elements (u32 words)
+        pool = torch.zeros(
+            pool_pad + total_elements,
             dtype=torch.int32,
             device="cuda",
         )
-        sf_pad = 1 << 31
-        sf_pool = torch.zeros(
-            sf_pad + intermediate_tiles * rows_capacity * 2,
-            dtype=torch.int32,
-            device="cuda",
-        )
-        intermediate_u32 = payload_pool[payload_pad:]
-        intermediate_sf = sf_pool[sf_pad:]
-        return intermediate_u32, intermediate_sf, payload_pool, sf_pool
+        intermediate_u32 = pool[pool_pad:]
+        return intermediate_u32, intermediate_u32, pool, None
     intermediate_u32 = torch.zeros(
-        rows_capacity * words_per_row + intermediate_tiles * rows_capacity * 2,
+        total_elements,
         dtype=torch.int32,
         device="cuda",
     )
@@ -645,7 +647,15 @@ def test_nvfp4_phase_intermediate_matches_torch() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_nvfp4_phase_big_offset_int64() -> None:
-    """Pool-scaled offsets past 2^31/stride must not overflow Int32."""
+    """High base addresses past 2^31 must not overflow Int32.
+
+    The pool base is parked past the 2^31/stride boundary so address
+    arithmetic in the kernel converts to Int64.  The synthetic domain
+    (E=4, K=256, n=128, M=64) keeps kernel-computed element offsets
+    well below 2^31 (rows_capacity ~ hundreds); this test covers high
+    *base* addresses only and does not exercise kernel-generated offsets
+    past the Int32 boundary.
+    """
     require_b12x()
     domain = _build_domain(E=4, K=256, n=128, m=64, top_k=2, seed=14)
     out, _ = _run_phases(domain, big_offset=True)
@@ -660,19 +670,30 @@ def test_nvfp4_phase_frozen_resolution_two_counts() -> None:
     require_b12x()
     domain_a = _build_domain(E=8, K=256, n=128, m=64, top_k=2, seed=15)
     domain_b = _build_domain(E=8, K=256, n=128, m=256, top_k=2, seed=16)
+    # Ensure distinct live task counts despite shared compiled callables.
+    assert domain_a["phys_tiles"] != domain_b["phys_tiles"], (
+        f"domains must have different phys_tiles for a live-count test: "
+        f"{domain_a['phys_tiles']} vs {domain_b['phys_tiles']}"
+    )
     compiled_p1 = _compile_phase1(domain_a)
     compiled_p2 = _compile_phase2(domain_a)
 
     # launch A (small live counts)
-    out_a, _ = _run_phases(domain_a, compiled_p1=compiled_p1, compiled_p2=compiled_p2)
+    out_a, intermediate_a = _run_phases(domain_a, compiled_p1=compiled_p1, compiled_p2=compiled_p2)
     metrics_a = compare_to_reference(out_a.float(), domain_a["oracle"])
     assert metrics_a.cos > 0.9999, metrics_a
 
     # same compiled callables, larger live counts
-    out_b, _ = _run_phases(domain_b, compiled_p1=compiled_p1, compiled_p2=compiled_p2)
+    out_b, intermediate_b = _run_phases(domain_b, compiled_p1=compiled_p1, compiled_p2=compiled_p2)
     metrics_b = compare_to_reference(out_b.float(), domain_b["oracle"])
     assert metrics_b.cos > 0.9999, metrics_b
     assert out_b.abs().sum().item() > 0
+    # Phase tails (beyond the smaller domain's written region) must differ
+    # because domain_b writes more intermediate rows than domain_a.
+    tail_len = min(64, intermediate_a.numel(), intermediate_b.numel())
+    assert not torch.equal(intermediate_a[-tail_len:], intermediate_b[-tail_len:]), (
+        "intermediate tails should differ: domain_b writes more rows"
+    )
 
 
 if __name__ == "__main__":

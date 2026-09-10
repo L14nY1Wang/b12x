@@ -478,8 +478,11 @@ def test_nvfp4_split_backend_rejects_invalid_materialized_combos() -> None:
         ("deterministic output", {"deterministic_output": True}),
         ("dynamic down scale", {"dynamic_down_scale": True}),
     ]:
-        with pytest.raises(ValueError):
+        try:
             MoEDynamicKernelBackend(**{**base, "share_input_across_experts": True, **bad})
+            pytest.fail(f"{name}: expected ValueError but construction succeeded")
+        except ValueError:
+            pass
 
 
 if __name__ == "__main__":

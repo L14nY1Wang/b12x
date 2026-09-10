@@ -3961,8 +3961,9 @@ def nvfp4_mma_m16n8k64_f32_e2m1(
     E2M1 nibbles (eight per u32 register) -- unlike the ``mxf8f6f4`` 1X path,
     no byte-container expansion is required.
 
-    Fragment mapping (empirically pinned on SM120 against a non-periodic
-    torch reference; lane l with q = l//4, c = l%4):
+    Fragment mapping (empirically pinned on SM120 against the NVFP4 phase
+    kernel chain in ``tests/moe/test_nvfp4_phase_kernels.py``
+    (``test_nvfp4_phase_intermediate_matches_torch``); lane l with q = l//4, c = l%4):
 
     - A reg ``r`` nibble ``n`` holds ``A[q + 8*(r%2), 32*(r//2) + 8*c + n]``
       -- i.e. each u32 register covers eight consecutive k values of one

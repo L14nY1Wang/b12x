@@ -1024,7 +1024,7 @@ class MoEDynamicKernelBackend:
             raise ValueError(
                 "materialized-intermediate execution currently requires the "
                 "repacked W4A8 MX M16/M32/M64/M128 non-streaming "
-                "specialization or the shared-input SiLU NVFP4 M64/M128 "
+                "specialization or the shared-input SiLU NVFP4 M128 "
                 "split-materialized specialization"
             )
         if self.direct_routing and not (

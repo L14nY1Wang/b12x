@@ -14,6 +14,7 @@ import torch
 from b12x.moe.fused_moe._impl import (
     _nvfp4_dynamic_dense_candidate,
     _nvfp4_dynamic_materialized_enabled,
+    _nvfp4_materialized_env_refresh,
     _plan_core_workspace,
     _DYNAMIC_NVFP4_MATERIALIZED_ENV,
     _DYNAMIC_WORK_SOURCE_ENV,
@@ -112,6 +113,7 @@ class TestNvfp4SplitPredicate:
     def test_rejects_non_shared_input_even_with_env(self):
         """Without share_input_across_experts the enabled gate rejects even with env."""
         os.environ[_DYNAMIC_NVFP4_MATERIALIZED_ENV] = "1"
+        _nvfp4_materialized_env_refresh()
         # Predicate is satisfied (share_input is not a predicate check).
         assert _nvfp4_dynamic_dense_candidate(**_dense_args()) is True
         # But the enabled gate demands share_input.
@@ -121,16 +123,19 @@ class TestNvfp4SplitPredicate:
     def test_env_auto_on_for_matching(self):
         """Without any env set, predicate+share_input → auto-on (matching shapes)."""
         os.environ.pop(_DYNAMIC_NVFP4_MATERIALIZED_ENV, None)
+        _nvfp4_materialized_env_refresh()
         assert _nvfp4_dynamic_materialized_enabled(**_enabled_args()) is True
 
     def test_env_off_explicitly(self):
         os.environ[_DYNAMIC_NVFP4_MATERIALIZED_ENV] = "0"
+        _nvfp4_materialized_env_refresh()
         assert _nvfp4_dynamic_materialized_enabled(**_enabled_args()) is False
 
     def test_non_matching_defaults_false(self):
         """Non-matching shapes (no share_input) default False even without env."""
         args = _dense_args()
         os.environ.pop(_DYNAMIC_NVFP4_MATERIALIZED_ENV, None)
+        _nvfp4_materialized_env_refresh()
         assert _nvfp4_dynamic_materialized_enabled(**_enabled_args(share_input_across_experts=False)) is False
 
 
@@ -146,13 +151,16 @@ class TestNvfp4SplitWorkspace:
             os.environ.pop(_DYNAMIC_NVFP4_MATERIALIZED_ENV, None)
         else:
             os.environ[_DYNAMIC_NVFP4_MATERIALIZED_ENV] = saved
+        _nvfp4_materialized_env_refresh()
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
     def test_intermediate_bytes_sufficient(self):
         # Domain large enough that the tile planner selects (128,128), matching
         # the split predicate (real prefill shapes are far above this).  Env
         # unset → auto-on (default True), so the plan allocates the NVFP4
         # intermediate scratch.
         os.environ.pop(_DYNAMIC_NVFP4_MATERIALIZED_ENV, None)
+        _nvfp4_materialized_env_refresh()
         plan = _plan_core_workspace(
             implementation="b12x",
             quant_mode="nvfp4",

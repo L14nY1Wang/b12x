@@ -143,13 +143,39 @@ _W4A16_ROUTE_PACK_PREWARMED: set[tuple[object, ...]] = set()
 _DYNAMIC_W4A8_REPACKED_ENV = "B12X_DYNAMIC_W4A8_REPACKED"
 _DYNAMIC_W4A8_SHARE_INPUT_ENV = "B12X_DYNAMIC_W4A8_SHARE_INPUT"
 _DYNAMIC_W4A8_MATERIALIZED_ENV = "B12X_DYNAMIC_W4A8_MATERIALIZED"
-# NVFP4 split-materialized gate.  Once the measured win over the monolithic
-# kernel was confirmed in real-traffic shapes (17.6% geo-mean faster on
-# RTX5090 M≥2048), the env default was switched from explicit-opt-in to
-# auto-enable for matching shapes (the same as the W4A8 split convention).
-# Set to "0" to force the monolithic nvfp4 path; any other value (including
-# unset) evaluates to the structural predicate for the queried shape.
+# NVFP4 split-materialized gate.  Set to "0" to force the monolithic nvfp4
+# path; any other value (including unset or the empty string) evaluates to the
+# structural predicate for the queried shape.  Accepted false values ("", "0",
+# "false", "False") are defined in ``_env_flag``.
 _DYNAMIC_NVFP4_MATERIALIZED_ENV = "B12X_NVFP4_DYNAMIC_MATERIALIZED"
+# Cache the env var at module level so ``_nvfp4_dynamic_materialized_enabled``
+# never re-reads it on the launch path.  The env cannot change at runtime in
+# production; the ``_nvfp4_materialized_env_refresh`` helper lets tests
+# invalidate the cache after changing the environment.
+_NVFP4_MATERIALIZED_ENV_RAW: str | None = None
+_NVFP4_MATERIALIZED_ENV_EXPLICIT = False
+_NVFP4_MATERIALIZED_ENV_IS_TRUE = False
+
+
+def _nvfp4_materialized_env_refresh() -> None:
+    """Re-read ``B12X_NVFP4_DYNAMIC_MATERIALIZED`` into the module-level cache.
+
+    Called once at import and again by tests that change the environment
+    variable at runtime.
+    """
+    global _NVFP4_MATERIALIZED_ENV_RAW, _NVFP4_MATERIALIZED_ENV_EXPLICIT, _NVFP4_MATERIALIZED_ENV_IS_TRUE
+    _NVFP4_MATERIALIZED_ENV_RAW = raw = os.environ.get(
+        _DYNAMIC_NVFP4_MATERIALIZED_ENV
+    )
+    _NVFP4_MATERIALIZED_ENV_EXPLICIT = raw is not None
+    _NVFP4_MATERIALIZED_ENV_IS_TRUE = (
+        raw not in ("", "0", "false", "False")
+        if raw is not None
+        else False
+    )
+
+
+_nvfp4_materialized_env_refresh()
 _W4A8_CONVERT_SCRATCH_MB_ENV = "B12X_W4A8_CONVERT_SCRATCH_MB"
 _W4A8_CONVERT_SCRATCH_MB_DEFAULT = 64
 # The source-format vocabulary is owned by b12x.moe._shared.execution;
@@ -2067,11 +2093,13 @@ def _nvfp4_dynamic_materialized_enabled(
 ) -> bool:
     """Resolve the NVFP4 split-materialized specialization as one decision.
 
-    The env flag ``_DYNAMIC_NVFP4_MATERIALIZED_ENV`` defaults to the
-    structural+shared-input predicate so that matching shapes auto-select the
-    split path (no manual opt-in after the measured 17.6% geo-mean win on
-    RTX5090 prefill).  Set ``B12X_NVFP4_DYNAMIC_MATERIALIZED=0`` to force the
-    monolithic nvfp4 kernel for troubleshooting.
+    The env flag ``B12X_NVFP4_DYNAMIC_MATERIALIZED`` is cached at module
+    level (read once at import) so the launch path never re-reads it.
+    When the env is unset, the structural+shared-input predicate determines
+    enablement so matching shapes auto-select the split path.
+    Set ``B12X_NVFP4_DYNAMIC_MATERIALIZED=0`` (or any false value: the empty
+    string, ``"0"``, ``"false"``, ``"False"``) to force the monolithic nvfp4
+    kernel for troubleshooting.
     """
 
     dense_candidate = _nvfp4_dynamic_dense_candidate(
@@ -2085,17 +2113,10 @@ def _nvfp4_dynamic_materialized_enabled(
         planned_tile_m=planned_tile_m,
     )
     full_candidate = dense_candidate and share_input_across_experts
-    env_flagged = _env_flag(_DYNAMIC_NVFP4_MATERIALIZED_ENV, default=full_candidate)
-    if env_flagged and not full_candidate:
-        logger.info(
-            "NVFP4 split-materialized env flag set but predicate false — "
-            "falling back to monolithic; "
-            f"dense_candidate={dense_candidate}, "
-            f"share_input_across_experts={share_input_across_experts}, "
-            f"quant_mode={quant_mode}, activation={activation}, "
-            f"k={k}, n={n}"
-        )
-    return bool(full_candidate and env_flagged)
+    if _NVFP4_MATERIALIZED_ENV_EXPLICIT:
+        return _NVFP4_MATERIALIZED_ENV_IS_TRUE and full_candidate
+    # Env unset: auto-on for matching shapes.
+    return bool(full_candidate)
 
 
 _WEIGHT_CACHE: Dict[Tuple[int, int, int], _WeightViews] = {}
@@ -3827,9 +3848,9 @@ def _plan_core_workspace(
     # NVFP4 split-materialized storage: payload plane
     # [phys_row][(n//128)*16] u32 + scale plane [(n//128)][rows_capacity][2] u32.
     # Total bytes = rows_padded * (n//128) * 72.
-    # This must share the auto-on default with the launch-side gate
-    # (_nvfp4_dynamic_materialized_enabled) so a default-select split shape
-    # does not under-allocate its intermediate scratch.  Plan time has no
+    # This shares the auto-on default with the env-flag resolution so a
+    # default-select split shape does not under-allocate its intermediate
+    # scratch.  Plan time has no
     # share_input_across_experts yet, so the conservative dense-candidate
     # (without that half of the conjunction) drives allocation; oversizing is
     # harmless because the monolithic path consumes less than this.
@@ -3848,7 +3869,11 @@ def _plan_core_workspace(
         n=n,
         deterministic_output=deterministic_output,
         planned_tile_m=dynamic_tile_m,
-    ) and _env_flag(_DYNAMIC_NVFP4_MATERIALIZED_ENV, default=True):
+    ) and (
+        _NVFP4_MATERIALIZED_ENV_IS_TRUE
+        if _NVFP4_MATERIALIZED_ENV_EXPLICIT
+        else True
+    ):
         materialized_intermediate_bytes = max(
             16,
             dynamic_rows_padded * (int(n) // 128) * 72,
