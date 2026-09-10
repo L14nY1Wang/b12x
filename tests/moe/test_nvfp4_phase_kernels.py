@@ -143,6 +143,10 @@ def _route_domain(m, E, top_k, topk_ids, tile_base=0):
     The live rows then carry large physical row ids while only their tail of
     the pool is written, which is how the Int64 offset contract is exercised
     without allocating the untouched prefix.
+
+    Returns only the O(m*top_k) live pair rows.  The caller allocates the full
+    device ``token_map``/``token_weights`` and scatters these indices, so a
+    high-``tile_base`` domain never materializes dense host lists.
     """
     row_counts = [0] * E
     for pair in range(m * top_k):
@@ -153,19 +157,16 @@ def _route_domain(m, E, top_k, topk_ids, tile_base=0):
         expert_tile_base.append(expert_tile_base[-1] + tiles)
     phys_tiles = expert_tile_base[-1]
     rows_capacity = phys_tiles * _TILE_M
-    token_map = [0] * rows_capacity
-    token_weights = [0.0] * rows_capacity
     cursor = [0] * E
+    pair_phys = [0] * (m * top_k)
     for t in range(m):
         for k_i in range(top_k):
             eid = int(topk_ids[t, k_i])
             local = cursor[eid]
             tile = expert_tile_base[eid] + local // _TILE_M
-            phys = tile * _TILE_M + (local % _TILE_M)
-            token_map[phys] = t
-            token_weights[phys] = None  # filled by caller
+            pair_phys[t * top_k + k_i] = tile * _TILE_M + (local % _TILE_M)
             cursor[eid] += 1
-    return expert_tile_base, phys_tiles, rows_capacity, token_map, token_weights
+    return expert_tile_base, phys_tiles, rows_capacity, pair_phys
 
 
 def _build_domain(*, E: int, K: int, n: int, m: int, top_k: int, seed: int,
@@ -226,24 +227,20 @@ def _build_domain(*, E: int, K: int, n: int, m: int, top_k: int, seed: int,
         expert_tile_base,
         phys_tiles,
         rows_capacity,
-        token_map_list,
-        _,
+        pair_phys,
     ) = _route_domain(m, E, top_k, topk_ids, tile_base=tile_base)
 
-    # token weights + physical row per pair
-    token_map = torch.tensor(token_map_list, dtype=torch.int32, device=device)
+    # Device tensors sized to the full pool; only the m*top_k live pair rows
+    # are written, so a high-tile_base domain does not build host-side lists
+    # proportional to rows_capacity.
+    token_map = torch.zeros(rows_capacity, dtype=torch.int32, device=device)
     token_weights = torch.zeros(rows_capacity, dtype=torch.float32, device=device)
-    phys_of_pair = torch.zeros(m * top_k, dtype=torch.int64)
-    cursor = [0] * E
-    for t in range(m):
-        for k_i in range(top_k):
-            eid = int(topk_ids[t, k_i])
-            local = cursor[eid]
-            tile = expert_tile_base[eid] + local // _TILE_M
-            phys = tile * _TILE_M + (local % _TILE_M)
-            token_weights[phys] = topk_weights[t, k_i]
-            phys_of_pair[t * top_k + k_i] = phys
-            cursor[eid] += 1
+    phys_of_pair = torch.tensor(pair_phys, dtype=torch.int64, device=device)
+    token_of_pair = torch.arange(m, device=device, dtype=torch.int32).repeat_interleave(
+        top_k
+    )
+    token_map[phys_of_pair] = token_of_pair
+    token_weights[phys_of_pair] = topk_weights.reshape(-1)
 
     intermediate_tiles = n // _TILE_N
     task_expert = torch.zeros(phys_tiles * intermediate_tiles, dtype=torch.int32, device=device)
@@ -281,7 +278,7 @@ def _build_domain(*, E: int, K: int, n: int, m: int, top_k: int, seed: int,
     x_quantized = [_quantize_nvfp4_rows(x[t].float(), 1.0) for t in range(m)]
     for pair in range(m * top_k):
         t = pair // top_k
-        phys = int(phys_of_pair[pair])
+        phys = pair_phys[pair]
         p, _, s = x_quantized[t]
         packed_a.view(-1)[phys * (K // 2) : (phys + 1) * (K // 2)] = p
         for kb in range(K // 16):
