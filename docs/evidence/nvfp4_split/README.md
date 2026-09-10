@@ -203,31 +203,3 @@ Hashes are collected again when saving, after lazy imports, so local input, orac
 ## Raw data
 
 Receipt: `20260910-rtxpro6000-maxq-production-graphs.json`. Consult the JSON for raw samples and available correctness, identity and provenance fields. Version 2 records round order, fixed addresses and actual capture identities; version 3 adds the declared GPU-mode check; version 4 includes initial-to-active throttle transitions. Older receipts do not establish those facts. Failed or unengaged rows retain raw diagnostic samples, not speedup claims.
-
-
-## Audit notes
-
-All 67 listed source SHA-256 values were recomputed against the frozen source
-checkout and matched. The raw samples reproduce the reported per-round medians
-and diagnostic geometric mean.
-
-The initial snapshot records throttle mask `0x0`; both active arms record `0x4`
-for every shape. Each case explicitly records those initial-to-active pairs.
-The maximum active-arm SM-clock difference was **7.0647%**, above the declared
-**5%** bound: E=8, K=4096, n=2048, top_k=2, M=8192 is therefore excluded from
-headline timings, with its raw samples retained. Among the five accepted
-diagnostic rows, the maximum difference was **2.4801%**. The benchmark did not
-change GPU clocks or the power limit.
-
-The retained `20260910-rtx5090-nvfp4-split-prefill.json` is a separate
-restricted-grid receipt whose test launcher used four active clusters.
-Its 2.207x result is not production-plan evidence and is not used by this
-overview. Its source hashes identify that recorded run, not the current source.
-
-Runtime regression coverage passed **158 tests**, with one checkpoint-dependent
-test skipped because its Qwen checkpoint was unavailable. The caller-owned
-scratch regression allocates exactly the authoritative SiLU plan's specifications
-in the test harness, then checks allocation counters and storage addresses during
-b12x bind/run, the capture body, and replay at 512, 256, and 512 live rows under
-frozen kernel resolution. No runtime pool-growth path or blanket scratch
-reservation was added; allocation remains the caller's responsibility.
