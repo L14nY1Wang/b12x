@@ -364,7 +364,8 @@ def _sample_under_load(launch) -> dict:
 
 
 def _gpu_mode_check(
-    snapshots, *, expected_uuid, allow_software_power_cap, max_sm_clock_delta_percent
+    snapshots, *, initial_snapshot, expected_uuid, allow_software_power_cap,
+    max_sm_clock_delta_percent
 ):
     """Qualify diagnostic timings against the declared physical-GPU conditions."""
     allowed_masks = (0, 4) if allow_software_power_cap else (0,)
@@ -376,9 +377,29 @@ def _gpu_mode_check(
         "max_sm_clock_delta_percent": max_sm_clock_delta_percent,
         "sm_clock_delta_percent": None,
         "sm_clock_delta_reference": "minimum arm SM clock",
+        "initial_throttle_mask": None,
+        "initial_pstate": None,
+        "active_throttle_masks": {},
+        "initial_to_active_throttle_masks": {},
+        "inter_arm_software_power_cap_transition": False,
         "software_power_cap_transition": False,
         "failures": failures,
     }
+    initial_mask = None
+    if initial_snapshot.get("available"):
+        try:
+            initial_mode = initial_snapshot["fields"]
+            initial_mask = int(initial_mode["clocks_throttle_reasons.active"], 0)
+            result["initial_throttle_mask"] = hex(initial_mask)
+            result["initial_pstate"] = initial_mode["pstate"]
+            if initial_mode["uuid"].removeprefix("GPU-") != expected_uuid.removeprefix("GPU-"):
+                failures.append("initial snapshot: physical GPU identity changed")
+            if initial_mask not in allowed_masks:
+                failures.append(f"initial snapshot: disallowed throttle mask {hex(initial_mask)}")
+        except (KeyError, TypeError, ValueError, AttributeError) as error:
+            failures.append(f"invalid initial GPU mode snapshot: {error}")
+    else:
+        failures.append("initial GPU mode snapshot unavailable")
     for name in ("monolithic", "split"):
         snapshot = snapshots.get(name, {})
         if not snapshot.get("available"):
@@ -390,6 +411,7 @@ def _gpu_mode_check(
             sm_clock = int(mode["clocks.current.sm"])
             memory_clock = int(mode["clocks.current.memory"])
             throttle_mask = int(mode["clocks_throttle_reasons.active"], 0)
+            result["active_throttle_masks"][name] = hex(throttle_mask)
             if uuid != expected_uuid.removeprefix("GPU-"):
                 failures.append(f"{name}: physical GPU identity changed")
             if mode["pstate"] != "P1":
@@ -411,12 +433,17 @@ def _gpu_mode_check(
         result["sm_clock_delta_percent"] = delta
         if delta > max_sm_clock_delta_percent:
             failures.append("SM-clock delta exceeds the declared bound")
-        result["software_power_cap_transition"] = {mono_mask, split_mask} == {0, 4}
+        result["inter_arm_software_power_cap_transition"] = {mono_mask, split_mask} == {0, 4}
+        if initial_mask is not None:
+            result["initial_to_active_throttle_masks"] = {
+                name: [hex(initial_mask), hex(values[2])] for name, values in observed.items()
+            }
+            result["software_power_cap_transition"] = {initial_mask, mono_mask, split_mask} == {0, 4}
     result["passed"] = len(observed) == 2 and not failures
     return result
 
 
-def _run_case(case, args, compiled_identities):
+def _run_case(case, args, compiled_identities, initial_snapshot):
     x, ids, route_weights, experts, oracle = _build_inputs(**case["shape"], seed=args.seed)
     with _observe_production_launches(compiled_identities) as calls:
         arms = {
@@ -468,6 +495,7 @@ def _run_case(case, args, compiled_identities):
     case["timing_addresses_stable"] = _addresses(arms) == addresses
     case["gpu_mode_check"] = _gpu_mode_check(
         case["gpu_mode_active"],
+        initial_snapshot=initial_snapshot,
         expected_uuid=str(torch.cuda.get_device_properties(torch.cuda.current_device()).uuid),
         allow_software_power_cap=args.allow_software_power_cap,
         max_sm_clock_delta_percent=args.max_sm_clock_delta_percent,
@@ -527,7 +555,7 @@ def main() -> None:
     argv = [sys.executable, os.path.relpath(Path(sys.argv[0]).resolve(), ROOT), *sys.argv[1:]]
     properties = torch.cuda.get_device_properties(torch.cuda.current_device())
     report = {
-        "schema": "b12x.moe.nvfp4_split_materialized.benchmark", "version": 3,
+        "schema": "b12x.moe.nvfp4_split_materialized.benchmark", "version": 4,
         "generated_utc": datetime.now(timezone.utc).isoformat(),
         "argv": argv, "command": shlex.join(argv),
         "command_cwd": str(ROOT), "invocation_cwd": str(Path.cwd().resolve()),
@@ -558,6 +586,8 @@ def main() -> None:
             "max_sm_clock_delta_percent": args.max_sm_clock_delta_percent,
             "sm_clock_delta_reference": "minimum arm SM clock",
             "arm_order": "alternating lead arm each round",
+            "transition_reference": "initial snapshot to each active arm, plus inter-arm comparison",
+            "clock_condition_scope": "active arms; the initial snapshot may be idle",
         },
         "source_hash_scope": "all loaded local modules plus benchmark and renderer, including input/oracle helpers",
         "iters": args.iters, "warmup": args.warmup, "rounds": args.rounds, "seed": args.seed,
@@ -596,7 +626,7 @@ def main() -> None:
         }
         report["cases"].append(case)
         try:
-            _run_case(case, args, compiled_identities)
+            _run_case(case, args, compiled_identities, report["gpu_snapshot"])
         except Exception as error:
             case["status"] = "error"
             case["error"] = f"{type(error).__name__}: {error}"

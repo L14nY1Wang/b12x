@@ -10,7 +10,7 @@ from pathlib import Path
 
 def _qualified(receipt, case):
     return bool(
-        receipt.get("version", 0) >= 3
+        receipt.get("version", 0) >= 4
         and case.get("qualified")
         and case.get("arm_identity_passed")
         and case.get("split_engaged")
@@ -108,8 +108,10 @@ def main() -> None:
       "relative to the lower arm clock. Only throttle mask 0x0 is accepted by "
       "default. `--allow-software-power-cap` explicitly permits only 0x0/0x4 "
       "for interleaved Max-Q diagnostics; every other throttle reason is rejected. "
-      "The observed delta and any 0x0/0x4 transition are retained per case. "
-      "Receipts predating this declared check cannot qualify a timing ratio.")
+      "The observed delta, initial-to-active throttle-mask pairs, and inter-arm "
+      "0x0/0x4 transitions are retained per case. The initial snapshot may be idle; "
+      "P1 and clock-comparison requirements apply to the active arms. "
+      "Receipts predating this complete check cannot qualify a timing ratio.")
     a("")
     a("## Qualified diagnostic results")
     a("")
@@ -177,7 +179,8 @@ def main() -> None:
     a(f"Receipt: `{src.name}`. Consult the JSON for raw samples and available "
       "correctness, identity and provenance fields. Version 2 records round "
       "order, fixed addresses and actual capture identities; version 3 adds the "
-      "declared GPU-mode check. Older receipts do not establish those facts. "
+      "declared GPU-mode check; version 4 includes initial-to-active throttle "
+      "transitions. Older receipts do not establish those facts. "
       "Failed or unengaged rows retain raw diagnostic samples, not speedup claims.")
     dst.write_text("\n".join(lines) + "\n")
     print(f"wrote {dst}")
